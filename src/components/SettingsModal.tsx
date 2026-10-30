@@ -11,7 +11,7 @@ const kAccents = ["", "#2eb8a6", "#88c0d0", "#f26b38", "#a78bfa", "#f472b6", "#f
 export default function SettingsModal() {
   const ui = useUi();
   const conn = useConn();
-  const check = useUpdate((s) => s.check);
+  const upd = useUpdate();
   const ai = ui.ai;
   const setAi = (p: Partial<typeof ai>) => ui.set({ ai: { ...ai, ...p } });
   const close = () => ui.set({ settingsOpen: false });
@@ -90,12 +90,39 @@ export default function SettingsModal() {
             <div className="label">Updates</div>
             <div className="settings-row">
               <span>Auto-update</span>
-              <label className="row"><input type="checkbox" checked={ui.autoUpdate} onChange={(e) => ui.set({ autoUpdate: e.target.checked })} /> install updates on startup</label>
+              <label className="row"><input type="checkbox" checked={ui.autoUpdate} onChange={(e) => ui.set({ autoUpdate: e.target.checked })} /> download updates in the background (checks at startup and every 30 min)</label>
             </div>
-            <div className="settings-row"><span>Version</span><div className="row"><span className="mono">v{conn.appVersion}</span><button className="btn" onClick={() => void check(true)}>Check now</button></div></div>
+            <div className="settings-row">
+              <span>Version</span>
+              <div className="row">
+                <span className="mono">v{conn.appVersion}</span>
+                {upd.phase === "ready" ? (
+                  <button className="btn primary" onClick={() => void upd.restart()}>Restart to update to v{upd.version}</button>
+                ) : upd.phase === "available" ? (
+                  <button className="btn primary" onClick={() => void upd.download()}>Download v{upd.version}</button>
+                ) : (
+                  <button className="btn" disabled={upd.phase === "checking" || upd.phase === "downloading" || upd.phase === "installing"} onClick={() => void upd.check({ manual: true })}>Check for updates</button>
+                )}
+              </div>
+            </div>
+            <div className="settings-row"><span>Status</span><span className="faint">{updateSummary(upd)}</span></div>
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+function updateSummary(u: ReturnType<typeof useUpdate.getState>): string {
+  const when = u.lastChecked ? `last checked ${new Date(u.lastChecked).toLocaleTimeString()}` : "not checked yet";
+  switch (u.phase) {
+    case "checking": return "checking…";
+    case "available": return `v${u.version} available · ${when}`;
+    case "downloading": return `downloading v${u.version}${u.progress !== null ? ` ${Math.round(u.progress * 100)}%` : "…"}`;
+    case "ready": return `v${u.version} ready, it installs on restart (or automatically at next launch)`;
+    case "installing": return "installing…";
+    case "uptodate": return `up to date · ${when}`;
+    case "error": return `error: ${u.error}`;
+    default: return u.error ? `error: ${u.error}` : `up to date · ${when}`;
+  }
 }

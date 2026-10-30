@@ -43,7 +43,7 @@ function Menu({ label, items }: { label: string; items: Item[] }) {
 
 export default function TopBar() {
   const ui = useUi();
-  const check = useUpdate((s) => s.check);
+  const upd = useUpdate();
   const target = useConn((s) => s.target);
   const version = useConn((s) => s.appVersion);
   return (
@@ -62,7 +62,9 @@ export default function TopBar() {
       <Menu
         label="Help"
         items={[
-          { label: "Check for updates", run: () => void check(true) },
+          upd.phase === "ready"
+            ? { label: `Restart to update (v${upd.version})`, run: () => void upd.restart() }
+            : { label: "Check for updates…", run: () => void upd.check({ manual: true }) },
           { label: "Releases", run: () => void openUrl(`${kRepo}/releases`) },
           { label: "Protocol reference", run: () => void openUrl(`${kRepo}/blob/main/PROTOCOL.md`) },
           { label: "Echo API docs", run: () => void openUrl("https://echo-23.gitbook.io/angel") },

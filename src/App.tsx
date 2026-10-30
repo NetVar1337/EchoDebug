@@ -17,7 +17,7 @@ import { installAgent, isTauri } from "@/lib/tauri";
 import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
 import { useUi } from "@/store/ui";
-import { useUpdate } from "@/store/update";
+import { startUpdateLoop } from "@/store/update";
 import { Boundary } from "@/components/ui";
 
 const kLeft = { targets: TargetsPanel, modules: ModulesPanel, watch: WatchPanel, ai: AiPanel };
@@ -33,8 +33,8 @@ export default function App() {
       void installAgent()
         .then((r) => r && log("info", "agent", `echo_debug.as ${r.changed ? "installed/updated" : "up to date"} at ${r.path}`))
         .catch((e) => log("error", "agent", `install failed: ${e}`));
-      if (useUi.getState().autoUpdate) void useUpdate.getState().check();
     }
+    return startUpdateLoop(() => useUi.getState().autoUpdate);
   }, []);
 
   useEffect(() => {
