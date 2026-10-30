@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "updater:default",
+    "process:default",
+    "process:allow-restart",
+    "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "$CONFIG/scripts" }, { "path": "$CONFIG/scripts/**" }]
+    }
+  ]
+}

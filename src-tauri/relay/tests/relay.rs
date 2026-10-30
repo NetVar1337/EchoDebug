@@ -1,0 +1,386 @@
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use echo_debug_relay::{bind, router, run, Relay};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tower::ServiceExt;
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+async fn start() -> (SocketAddr, Relay) {
+    let relay = Relay::new("1.2.3", Duration::from_secs(5));
+    let listener = bind(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(listener, relay.clone()));
+    (addr, relay)
+}
+
+async fn connect(addr: SocketAddr, path: &str) -> Ws {
+    connect_async(format!("ws://{addr}{path}")).await.unwrap().0
+}
+
+async fn send(ws: &mut Ws, v: Value) {
+    ws.send(Message::text(v.to_string())).await.unwrap();
+}
+
+/// Next text frame matching `pred`, skipping others (status broadcasts etc.).
+async fn recv_until(ws: &mut Ws, pred: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(t) = ws.next().await.unwrap().unwrap() {
+                let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                if pred(&v) {
+                    return v;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for frame")
+}
+
+/// Client socket whose initial status shows the wanted upstream state (avoids racing upstream registration).
+async fn client_when(addr: SocketAddr, agent: bool, ext: bool) -> Ws {
+    for _ in 0..50 {
+        let mut c = connect(addr, "/client").await;
+        let s = recv_until(&mut c, |v| v["type"] == "status").await;
+        if s["agent"] == agent && s["ext"] == ext {
+            return c;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("upstreams never reached agent={agent} ext={ext}");
+}
+
+#[tokio::test]
+async fn routes_native_and_ext_with_id_rewrite() {
+    let (addr, _) = start().await;
+    let mut agent = connect(addr, "/agent").await;
+    let mut ext = connect(addr, "/ext").await;
+    let mut client = client_when(addr, true, true).await;
+
+    send(
+        &mut client,
+        json!({ "type": "read", "id": "abc", "address": "0x1000", "size": 4 }),
+    )
+    .await;
+    let req = recv_until(&mut agent, |_| true).await;
+    assert_eq!(req["type"], "read");
+    assert_eq!(req["address"], "0x1000");
+    assert!(req["id"].is_u64(), "relay id is an integer: {req}");
+    send(
+        &mut agent,
+        json!({ "type": "read_result", "id": req["id"], "success": true, "data": "deadbeef" }),
+    )
+    .await;
+    let reply = recv_until(&mut client, |v| v["type"] == "read_result").await;
+    assert_eq!(reply["id"], "abc");
+    assert_eq!(reply["data"], "deadbeef");
+
+    // Ext verb, missing id defaults to 0.
+    send(&mut client, json!({ "type": "regions" })).await;
+    let req = recv_until(&mut ext, |_| true).await;
+    assert_eq!(req["type"], "regions");
+    send(
+        &mut ext,
+        json!({ "type": "regions_result", "id": req["id"], "success": true, "regions": [] }),
+    )
+    .await;
+    let reply = recv_until(&mut client, |v| v["type"] == "regions_result").await;
+    assert_eq!(reply["id"], 0);
+}
+
+#[tokio::test]
+async fn missing_upstreams_fail_immediately() {
+    let (addr, _) = start().await;
+    let mut client = connect(addr, "/client").await;
+    send(&mut client, json!({ "type": "modules", "id": 1 })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 1).await;
+    assert_eq!(
+        (r["type"].as_str(), r["code"].as_u64()),
+        (Some("error"), Some(2001))
+    );
+    send(
+        &mut client,
+        json!({ "type": "attach", "id": [2], "name": "x.exe" }),
+    )
+    .await;
+    let r = recv_until(&mut client, |v| v["id"] == json!([2])).await;
+    assert_eq!(r["code"], 2002);
+}
+
+#[tokio::test]
+async fn upstream_disconnect_fails_in_flight() {
+    let (addr, _) = start().await;
+    let mut agent = connect(addr, "/agent").await;
+    let mut client = client_when(addr, true, false).await;
+    send(&mut client, json!({ "type": "ping", "id": 7 })).await;
+    recv_until(&mut agent, |v| v["type"] == "ping").await;
+    agent.close(None).await.unwrap();
+    let r = recv_until(&mut client, |v| v["id"] == 7).await;
+    assert_eq!(r["code"], 2004);
+}
+
+#[tokio::test]
+async fn timeout_is_2003() {
+    let relay = Relay::new("1.2.3", Duration::from_millis(200));
+    let listener = bind(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(listener, relay));
+    let mut _ext = connect(addr, "/ext").await;
+    let mut client = client_when(addr, false, true).await;
+    send(&mut client, json!({ "type": "alive", "id": 9 })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 9).await;
+    assert_eq!(r["code"], 2003);
+}
+
+#[tokio::test]
+async fn ext_events_broadcast_and_status_tracks_hello_and_attach() {
+    let (addr, _) = start().await;
+    let mut ext = connect(addr, "/ext").await;
+    let mut client = client_when(addr, false, true).await;
+
+    send(&mut ext, json!({ "type": "event", "event": "hello", "version": "0.9.0", "protocol": 1, "attached": false })).await;
+    let hello = recv_until(&mut client, |v| v["event"] == "hello").await;
+    assert_eq!(hello["version"], "0.9.0");
+    send(
+        &mut ext,
+        json!({ "type": "event", "event": "log", "level": "info", "message": "hi" }),
+    )
+    .await;
+    let log = recv_until(&mut client, |v| v["event"] == "log").await;
+    assert_eq!(log["message"], "hi");
+
+    send(
+        &mut client,
+        json!({ "type": "attach", "id": "a", "name": "game.exe" }),
+    )
+    .await;
+    let req = recv_until(&mut ext, |v| v["type"] == "attach").await;
+    send(&mut ext, json!({ "type": "attach_result", "id": req["id"], "success": true, "pid": 42, "base": "0x140000000", "name": "game.exe" })).await;
+    let st = recv_until(&mut client, |v| {
+        v["type"] == "status" && v["target"]["pid"] == 42
+    })
+    .await;
+    assert_eq!(st["ext_version"], "0.9.0");
+    recv_until(&mut client, |v| {
+        v["type"] == "attach_result" && v["id"] == "a"
+    })
+    .await;
+
+    send(&mut client, json!({ "type": "status", "id": 5 })).await;
+    let s = recv_until(&mut client, |v| v["type"] == "status_result").await;
+    assert_eq!(s["id"], 5);
+    assert_eq!(s["success"], true);
+    assert_eq!(
+        (s["agent"].as_bool(), s["ext"].as_bool()),
+        (Some(false), Some(true))
+    );
+    assert_eq!(s["ext_version"], "0.9.0");
+    assert_eq!(s["app_version"], "1.2.3");
+    assert_eq!(s["target"]["name"], "game.exe");
+    assert!(s["target"].get("type").is_none());
+
+    send(&mut client, json!({ "type": "processes", "id": 6 })).await;
+    let p = recv_until(&mut client, |v| v["type"] == "processes_result").await;
+    let procs = p["processes"].as_array().unwrap();
+    assert!(!procs.is_empty());
+    let names: Vec<String> = procs
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_lowercase())
+        .collect();
+    assert!(names.windows(2).all(|w| w[0] <= w[1]), "sorted by name");
+}
+
+#[tokio::test]
+async fn origin_checks() {
+    let (addr, _) = start().await;
+    let reject = |path: &str, origin: &str| {
+        let mut req = format!("ws://{addr}{path}").into_client_request().unwrap();
+        req.headers_mut().insert("origin", origin.parse().unwrap());
+        async move {
+            match connect_async(req).await {
+                Err(WsError::Http(resp)) => resp.status(),
+                Ok(_) => StatusCode::SWITCHING_PROTOCOLS,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    };
+    assert_eq!(
+        reject("/client", "https://evil.example").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        reject("/client", "http://localhost:1420").await,
+        StatusCode::SWITCHING_PROTOCOLS
+    );
+    assert_eq!(
+        reject("/agent", "http://localhost:1420").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        reject("/ext", "tauri://localhost").await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+async fn mcp(relay: &Relay, body: Value, origin: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
+    if let Some(o) = origin {
+        req = req.header(header::ORIGIN, o);
+    }
+    let resp = router(relay.clone())
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn mcp_round_trip() {
+    let (addr, relay) = start().await;
+
+    let (s, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-03-26" } }), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
+    assert_eq!(r["result"]["serverInfo"]["name"], "echodebug");
+    assert_eq!(r["result"]["serverInfo"]["version"], "1.2.3");
+
+    let (s, _) = mcp(
+        &relay,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+
+    let (_, r) = mcp(
+        &relay,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        None,
+    )
+    .await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let read = tools.iter().find(|t| t["name"] == "read_memory").unwrap();
+    assert!(read["inputSchema"].is_object());
+    assert!(read.get("verb").is_none() && read.get("input_schema").is_none());
+
+    // Upstream missing → tool error, not RPC error.
+    let call = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "read_memory", "arguments": { "address": "0x10", "size": 2 } } });
+    let (_, r) = mcp(&relay, call.clone(), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("2001"));
+
+    // Real round trip through /agent.
+    let mut agent = connect(addr, "/agent").await;
+    drop(client_when(addr, true, false).await);
+    let agent_task = tokio::spawn(async move {
+        let req = recv_until(&mut agent, |v| v["type"] == "read").await;
+        assert_eq!(req["address"], "0x10");
+        send(
+            &mut agent,
+            json!({ "type": "read_result", "id": req["id"], "success": true, "data": "beef" }),
+        )
+        .await;
+        agent
+    });
+    let (_, r) = mcp(&relay, call, None).await;
+    agent_task.await.unwrap();
+    assert_eq!(r["id"], 3);
+    assert_eq!(r["result"]["isError"], false);
+    let text: Value =
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text, json!({ "success": true, "data": "beef" }));
+
+    let (_, r) = mcp(
+        &relay,
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "nope" } }),
+        None,
+    )
+    .await;
+    assert_eq!(r["error"]["code"], -32602);
+    let (_, r) = mcp(
+        &relay,
+        json!({ "jsonrpc": "2.0", "id": 5, "method": "bogus" }),
+        None,
+    )
+    .await;
+    assert_eq!(r["error"]["code"], -32601);
+
+    // Batch: ping + notification → one reply.
+    let (_, r) = mcp(&relay, json!([{ "jsonrpc": "2.0", "id": 6, "method": "ping" }, { "jsonrpc": "2.0", "method": "notifications/x" }]), None).await;
+    assert_eq!(r, json!([{ "jsonrpc": "2.0", "id": 6, "result": {} }]));
+
+    let (s, _) = mcp(
+        &relay,
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }),
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    let resp = router(relay.clone())
+        .oneshot(Request::get("/mcp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let resp = router(relay)
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({ "ok": true, "version": "1.2.3" })
+    );
+}
+
+#[tokio::test]
+async fn newer_upstream_replaces_old() {
+    let (addr, _) = start().await;
+    let mut old = connect(addr, "/agent").await;
+    let mut client = client_when(addr, true, false).await;
+    send(&mut client, json!({ "type": "ping", "id": 1 })).await;
+    recv_until(&mut old, |v| v["type"] == "ping").await;
+
+    let mut new = connect(addr, "/agent").await;
+    assert_eq!(
+        recv_until(&mut client, |v| v["id"] == 1).await["code"],
+        2004
+    );
+    send(&mut client, json!({ "type": "ping", "id": 2 })).await;
+    let req = recv_until(&mut new, |v| v["type"] == "ping").await;
+    send(
+        &mut new,
+        json!({ "type": "ping_result", "id": req["id"], "success": true }),
+    )
+    .await;
+    assert_eq!(
+        recv_until(&mut client, |v| v["id"] == 2).await["type"],
+        "ping_result"
+    );
+    // Old socket was closed by the relay.
+    assert!(matches!(
+        old.next().await,
+        Some(Ok(Message::Close(_))) | None | Some(Err(_))
+    ));
+}

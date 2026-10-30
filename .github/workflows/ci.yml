@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: Frontend (typecheck, tests, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: node --test scripts/*.test.mjs
+      - run: npm run build
+
+  agent:
+    name: Echo agent (AngelScript lint)
+    runs-on: ubuntu-latest
+    env:
+      LSP_REV: 700a15c05d4ed85559e4a40205f9260822c3b18f
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build echo-angelscript-lsp (pinned, the lint imports its internals)
+        run: |
+          git clone https://github.com/speedsunderscore/echo-angelscript-lsp.git "$RUNNER_TEMP/lsp"
+          cd "$RUNNER_TEMP/lsp" && git checkout "$LSP_REV" && npm ci --ignore-scripts && npm run compile
+      - run: node scripts/lint-agent.mjs "$RUNNER_TEMP/lsp" agent/echo_debug.as
+
+  relay:
+    name: Relay (cargo test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo test -p echo-debug-relay
+        working-directory: src-tauri
+      - run: cargo clippy -p echo-debug-relay -- -D warnings
+        working-directory: src-tauri
+
+  app:
+    name: Windows app (cargo check)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run build
+      - run: cargo check -p echo-debug
+        working-directory: src-tauri

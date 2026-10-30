@@ -1,0 +1,20 @@
+[package]
+name = "echo-debug-relay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+serde_json = "1"
+futures-util = "0.3"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "echodebug-relay"
+path = "src/main.rs"

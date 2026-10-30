@@ -1,0 +1,130 @@
+// PE parser over an in-memory image (offsets are RVAs, the loader already mapped sections)
+
+export type Section = { name: string; rva: number; vsize: number; rawSize: number; chars: number; r: boolean; w: boolean; x: boolean };
+export type DataDir = { name: string; rva: number; size: number };
+export type Export = { name: string; ordinal: number; rva: number; forwarder?: string };
+export type ImportFn = { name?: string; ordinal?: number; iatRva: number };
+export type ImportDll = { dll: string; funcs: ImportFn[] };
+export type PeInfo = {
+  is64: boolean;
+  machine: number;
+  timestamp: number;
+  entryRva: number;
+  imageBase: bigint;
+  sizeOfImage: number;
+  subsystem: number;
+  characteristics: number;
+  dllCharacteristics: number;
+  sections: Section[];
+  dirs: DataDir[];
+  exports: Export[];
+  imports: ImportDll[];
+};
+
+const kDirNames = [
+  "Export", "Import", "Resource", "Exception", "Security", "BaseReloc", "Debug", "Architecture",
+  "GlobalPtr", "TLS", "LoadConfig", "BoundImport", "IAT", "DelayImport", "CLR", "Reserved",
+];
+const kMaxNames = 100_000;
+
+function cstr(b: Uint8Array, off: number, max = 512): string {
+  let s = "";
+  for (let i = off; i < b.length && i < off + max && b[i] !== 0; i++) s += String.fromCharCode(b[i]);
+  return s;
+}
+
+export function parsePe(img: Uint8Array): PeInfo {
+  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const u16 = (o: number) => dv.getUint16(o, true);
+  const u32 = (o: number) => dv.getUint32(o, true);
+  const inRange = (o: number, n = 1) => o >= 0 && o + n <= img.length;
+
+  if (img.length < 0x40 || u16(0) !== 0x5a4d) throw new Error("no MZ header");
+  const nt = u32(0x3c);
+  if (!inRange(nt, 0x18) || u32(nt) !== 0x4550) throw new Error("no PE signature");
+  const fh = nt + 4;
+  const machine = u16(fh);
+  const nsec = u16(fh + 2);
+  const timestamp = u32(fh + 4);
+  const optSize = u16(fh + 16);
+  const characteristics = u16(fh + 18);
+  const oh = fh + 20;
+  const magic = u16(oh);
+  const is64 = magic === 0x20b;
+  if (!is64 && magic !== 0x10b) throw new Error(`bad optional header magic 0x${magic.toString(16)}`);
+  const entryRva = u32(oh + 16);
+  const imageBase = is64 ? dv.getBigUint64(oh + 24, true) : BigInt(u32(oh + 28));
+  const sizeOfImage = u32(oh + 56);
+  const subsystem = u16(oh + 68);
+  const dllCharacteristics = u16(oh + 70);
+  const ddOff = oh + (is64 ? 112 : 96);
+  const nDirs = Math.min(16, u32(oh + (is64 ? 108 : 92)));
+  const dirs: DataDir[] = [];
+  for (let i = 0; i < nDirs; i++) dirs.push({ name: kDirNames[i], rva: u32(ddOff + i * 8), size: u32(ddOff + i * 8 + 4) });
+
+  const sections: Section[] = [];
+  const st = oh + optSize;
+  for (let i = 0; i < nsec && inRange(st + i * 40, 40); i++) {
+    const o = st + i * 40;
+    const chars = u32(o + 36);
+    sections.push({
+      name: cstr(img, o, 8),
+      vsize: u32(o + 8),
+      rva: u32(o + 12),
+      rawSize: u32(o + 16),
+      chars,
+      r: (chars & 0x40000000) !== 0,
+      w: (chars & 0x80000000) !== 0,
+      x: (chars & 0x20000000) !== 0,
+    });
+  }
+
+  const exports: Export[] = [];
+  const ed = dirs[0];
+  if (ed && ed.rva && inRange(ed.rva, 40)) {
+    const ordBase = u32(ed.rva + 16);
+    const nFuncs = Math.min(u32(ed.rva + 20), kMaxNames);
+    const nNames = Math.min(u32(ed.rva + 24), kMaxNames);
+    const fAddr = u32(ed.rva + 28);
+    const nAddr = u32(ed.rva + 32);
+    const oAddr = u32(ed.rva + 36);
+    const named = new Map<number, string>();
+    for (let i = 0; i < nNames && inRange(nAddr + i * 4, 4) && inRange(oAddr + i * 2, 2); i++) {
+      named.set(u16(oAddr + i * 2), cstr(img, u32(nAddr + i * 4)));
+    }
+    for (let i = 0; i < nFuncs && inRange(fAddr + i * 4, 4); i++) {
+      const rva = u32(fAddr + i * 4);
+      if (!rva) continue;
+      const e: Export = { name: named.get(i) ?? "", ordinal: ordBase + i, rva };
+      if (rva >= ed.rva && rva < ed.rva + ed.size) e.forwarder = cstr(img, rva);
+      exports.push(e);
+    }
+  }
+
+  const imports: ImportDll[] = [];
+  const id = dirs[1];
+  if (id && id.rva) {
+    for (let d = id.rva; inRange(d, 20) && imports.length < 4096; d += 20) {
+      const oft = u32(d);
+      const nameRva = u32(d + 12);
+      const ft = u32(d + 16);
+      if (!nameRva && !ft) break;
+      const dll: ImportDll = { dll: cstr(img, nameRva), funcs: [] };
+      const thunks = oft || ft;
+      const step = is64 ? 8 : 4;
+      for (let i = 0; i < kMaxNames; i++) {
+        const t = thunks + i * step;
+        if (!inRange(t, step)) break;
+        const v = is64 ? dv.getBigUint64(t, true) : BigInt(u32(t));
+        if (v === 0n) break;
+        const byOrd = is64 ? (v >> 63n) === 1n : (v >> 31n) === 1n;
+        const iatRva = ft + i * step;
+        if (byOrd) dll.funcs.push({ ordinal: Number(v & 0xffffn), iatRva });
+        else dll.funcs.push({ name: cstr(img, Number(v & 0x7fffffffn) + 2), iatRva });
+      }
+      imports.push(dll);
+    }
+  }
+
+  return { is64, machine, timestamp, entryRva, imageBase, sizeOfImage, subsystem, characteristics, dllCharacteristics, sections, dirs, exports, imports };
+}

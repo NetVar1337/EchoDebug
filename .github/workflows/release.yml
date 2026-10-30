@@ -1,0 +1,113 @@
+name: Release
+
+# Every push to main that contains a feat/fix/perf/refactor/revert (or breaking) commit
+# bumps the version, tags it, builds the signed Windows installer and publishes a GitHub
+# release with latest.json, which the in-app updater polls.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Force a bump (leave empty to derive from commits)
+        type: choice
+        options: ["", patch, minor, major]
+        default: ""
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release)') }}
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: next
+        name: Compute next version
+        run: |
+          v=$(node scripts/next-version.mjs --notes "$RUNNER_TEMP/notes.md" ${BUMP:+--bump $BUMP})
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "next version: ${v:-<none, nothing releasable>}"
+        env:
+          BUMP: ${{ inputs.bump }}
+      - name: Bump, commit and tag
+        if: steps.next.outputs.version != ''
+        run: |
+          v=${{ steps.next.outputs.version }}
+          node scripts/set-version.mjs "$v"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v$v [skip ci]" || echo "version already at $v"
+          git tag -a "v$v" -F "$RUNNER_TEMP/notes.md"
+          git push origin HEAD:main "v$v"
+      - uses: actions/upload-artifact@v4
+        if: steps.next.outputs.version != ''
+        with:
+          name: notes
+          path: ${{ runner.temp }}/notes.md
+
+  build:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: notes
+          path: notes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - id: notes
+        shell: bash
+        run: |
+          {
+            echo "body<<__NOTES__"
+            cat notes/notes.md
+            printf '\n\n**Echo agent:** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
+            echo "__NOTES__"
+          } >> "$GITHUB_OUTPUT"
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v${{ env.VERSION }}
+          releaseName: EchoDebug v${{ env.VERSION }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+      - name: Attach Echo agent script
+        shell: bash
+        run: gh release upload "v$VERSION" agent/echo_debug.as --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

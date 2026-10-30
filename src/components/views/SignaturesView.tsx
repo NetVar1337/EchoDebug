@@ -1,0 +1,109 @@
+import { useState } from "react";
+import { Copy } from "lucide-react";
+import { request } from "@/lib/client";
+import { fmtAddr, hexToBytes, labelAddr, moduleOf, parseAddress } from "@/lib/hex";
+import { readBytes } from "@/lib/memory";
+import { makeSignature, toByteArray, toCode, toIda, trim, type Insn, type Pattern } from "@/lib/analysis/sigmaker";
+import { useConn } from "@/store/conn";
+import { attempt, log } from "@/store/output";
+import { useUi } from "@/store/ui";
+import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
+
+async function hits(pattern: string, module: string): Promise<string[]> {
+  const r = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern, module, find_all: true }, true);
+  return r.success ? r.results ?? [] : [];
+}
+
+export default function SignaturesView() {
+  const ui = useUi();
+  const modules = useConn((s) => s.modules);
+  const [mode, setMode] = useState<"code" | "raw">("code");
+  const [pattern, setPattern] = useState<Pattern>([]);
+  const [orig, setOrig] = useState<number[]>([]); // un-wildcarded bytes, so toggles can restore them
+  const [found, setFound] = useState<string[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [scanQ, setScanQ] = useState("");
+  const addr = ui.sigAt ? parseAddress(ui.sigAt, modules) : null;
+  const mod = addr !== null ? moduleOf(addr, modules) : undefined;
+
+  const generate = async () => {
+    if (addr === null || !mod) return log("warn", "sig", "pick an address inside a module");
+    setBusy(true);
+    setFound(null);
+    let insns: Insn[] = [];
+    if (mode === "code") {
+      const r = await attempt("sig", request<{ results: Insn[] }>("disassemble", { address: fmtAddr(addr), size: 0x200 }));
+      insns = r?.results ?? [];
+    } else {
+      const b = await attempt("sig", readBytes(addr, 128));
+      insns = b ? Array.from(b, (x, i) => ({ address: fmtAddr(addr + BigInt(i)), length: 1, bytes: x.toString(16).padStart(2, "0"), text: "" })) : [];
+    }
+    const r = await attempt("sig", makeSignature(insns, async (p) => (await hits(p, mod.name)).length));
+    setBusy(false);
+    if (!r) return log("warn", "sig", "no unique signature within the scanned range");
+    setPattern(r.pattern);
+    setOrig(Array.from(hexToBytes(insns.map((i) => i.bytes).join(""))));
+    setFound([fmtAddr(addr)]);
+    log("info", "sig", `unique ${r.pattern.length}-byte signature for ${labelAddr(fmtAddr(addr), modules)}`);
+  };
+
+  const test = async (p: string) => {
+    const m = mod?.name ?? modules[0]?.name;
+    if (!m) return;
+    const r = await attempt("sig", hits(p, m));
+    if (r) { setFound(r); log("info", "sig", `${r.length} hits in ${m}`); }
+  };
+
+  const ida = toIda(trim(pattern));
+  const code = toCode(trim(pattern));
+  const formats: [string, string][] = pattern.length ? [["IDA", ida], ["Bytes", code.bytes], ["Mask", code.mask], ["Array", toByteArray(trim(pattern))]] : [];
+
+  return (
+    <NeedsAgent>
+      <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
+        <div className="toolbar">
+          <CommitInput value={ui.sigAt ?? ""} placeholder="address to sign" onCommit={(v) => ui.goSig(v)} width={260} />
+          <select className="select" value={mode} onChange={(e) => setMode(e.target.value as "code" | "raw")}><option value="code">Code</option><option value="raw">Raw bytes</option></select>
+          <button className="btn primary" disabled={busy || addr === null} onClick={() => void generate()}>{busy ? "Searching…" : "Generate unique"}</button>
+          <span className="mono faint ellipsis grow">{addr !== null ? labelAddr(fmtAddr(addr), modules) : ""}</span>
+        </div>
+        <div className="vlist">
+          {pattern.length > 0 && (
+            <div className="panel-section">
+              <div className="label">Pattern · click a byte to toggle wildcard</div>
+              <div className="row wrap mono">
+                {pattern.map((b, i) => (
+                  <button key={i} className="pill" style={{ minWidth: 26, color: b === null ? "var(--text-faint)" : "var(--text)" }}
+                    onClick={() => setPattern(pattern.map((x, j) => (j === i ? (x === null ? orig[i] ?? 0 : null) : x)))}>
+                    {b === null ? "??" : b.toString(16).toUpperCase().padStart(2, "0")}
+                  </button>
+                ))}
+              </div>
+              {formats.map(([k, v]) => (
+                <div key={k} className="row">
+                  <span className="label" style={{ width: 50 }}>{k}</span>
+                  <span className="mono selectable grow ellipsis" title={v}>{v}</span>
+                  <IconButton tip={`Copy ${k}`} onClick={() => void copy(v)}><Copy size={13} /></IconButton>
+                </div>
+              ))}
+              <div className="row"><button className="btn" onClick={() => void test(ida)}>Test in {mod?.name ?? "module"}</button></div>
+            </div>
+          )}
+          <div className="panel-section">
+            <div className="label">Scan an existing pattern</div>
+            <div className="row">
+              <input className="input mono grow" placeholder="48 8B 05 ? ? ? ? 48 85 C0" value={scanQ} onChange={(e) => setScanQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void test(scanQ)} />
+              <button className="btn" onClick={() => void test(scanQ)}>Scan</button>
+            </div>
+          </div>
+          {found && (
+            <table className="table mono">
+              <thead><tr><th>{found.length} hit{found.length === 1 ? "" : "s"}</th></tr></thead>
+              <tbody>{found.map((a) => <tr key={a} onClick={() => ui.select(a)} onDoubleClick={() => ui.goDisasm(a)}><td className="link">{labelAddr(a, modules)}</td></tr>)}</tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </NeedsAgent>
+  );
+}
