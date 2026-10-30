@@ -34,6 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Latest main, not the triggering sha: runs are serialised, so a newer push may
+          # already be on main and the bump commit must fast-forward onto it
+          ref: main
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
