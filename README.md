@@ -29,8 +29,9 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 
 ## Quick start
 
-1. Install the latest `EchoDebug_x.y.z_x64-setup.exe` from
-   [Releases](https://github.com/NetVar1337/EchoDebug/releases/latest).
+1. Download an installer from [Releases](https://github.com/NetVar1337/EchoDebug/releases/latest):
+   `EchoDebug_x.y.z_x64-setup.exe` (per-user setup, no admin needed) or
+   `EchoDebug_x.y.z_x64_en-US.msi` (per-machine, for managed deployment). Both auto-update.
 2. Start EchoDebug. On every start it installs or updates the agent at `%APPDATA%\scripts\echo_debug.as`.
 3. In Echo, open the menu and load `echo_debug.as`. It connects to the app automatically and keeps
    retrying if the app isn't running yet.
@@ -56,7 +57,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint; the model drives the same tools as MCP |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 20 tools |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
-| Updates | Signed in-app auto-update from GitHub Releases; the Echo agent updates with the app |
+| Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |
 
 **Not available on the Echo backend:** the native debugger (breakpoints, stepping, VEH), Frida,
 kernel inspection, network capture/proxy, and Reverse-Slap/AiDA's decompilers and .NET explorer.
@@ -98,7 +99,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/). Every push to 
    `!`/`BREAKING CHANGE` → major; minor while < 1.0). `docs`/`chore`/`ci`/`test` alone don't release;
 3. writes the version into `package.json`, `Cargo.toml`, `Cargo.lock` and the agent, then commits `chore(release): vX.Y.Z`
    and pushes the `vX.Y.Z` tag;
-4. builds the signed NSIS installer, publishes the GitHub release with notes, `latest.json` and `echo_debug.as`.
+4. builds the signed NSIS setup and MSI installers, publishes the GitHub release with notes, `latest.json` and `echo_debug.as`.
 
 Installed apps pick up the release on their next start. You can force a release with **Actions → Release → Run workflow**.
 The updater signing key is the `TAURI_SIGNING_PRIVATE_KEY` repo secret. If it's lost, existing installs
@@ -106,9 +107,9 @@ can no longer verify updates. Dependabot keeps npm, cargo and Actions dependenci
 
 ## Credits
 
-- UI/UX after [Reverse-Slap](https://github.com/kaizer1308/reverse-slap) by kaizer1308; features after
+- UI/UX and logo from [Reverse-Slap](https://github.com/kaizer1308/reverse-slap) by kaizer1308; features after
   [AiDA Private](https://github.com/sigwl/AiDAPrivate) by sigwl. The code here is new: neither
-  project has a license, so nothing was copied from them.
+  project has a license, so no code was copied from them.
 - [Echo](https://echo-23.gitbook.io/angel) Universal API. Ideas from
   [web-mv](https://github.com/Jozkah/web-mv), [angel-menu-mcp](https://github.com/Jozkah/angel-menu-mcp),
   [echo-angelscript-lsp](https://github.com/speedsunderscore/echo-angelscript-lsp) (used for the agent lint),

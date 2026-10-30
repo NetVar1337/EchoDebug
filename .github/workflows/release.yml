@@ -91,6 +91,7 @@ jobs:
           {
             echo "body<<__NOTES__"
             cat notes/notes.md
+            printf '\n\n**Install:** run `EchoDebug_%s_x64-setup.exe` (per-user, no admin) or `EchoDebug_%s_x64_en-US.msi` (per-machine). Both update themselves.' "$VERSION" "$VERSION"
             printf '\n\n**Echo agent:** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
             echo "__NOTES__"
           } >> "$GITHUB_OUTPUT"
@@ -106,6 +107,8 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # NSIS installs update through NSIS, MSI installs through MSI (latest.json carries both)
+          updaterJsonPreferNsis: true
       - name: Attach Echo agent script
         shell: bash
         run: gh release upload "v$VERSION" agent/echo_debug.as --clobber
