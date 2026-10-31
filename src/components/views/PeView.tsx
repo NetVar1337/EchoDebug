@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search } from "lucide-react";
-import { fmtAddr, toBig } from "@/lib/hex";
+import { fmtAddr, labelAddr, toBig } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
 import { parsePe, type PeInfo } from "@/lib/analysis/pe";
 import { detectPacker, sectionEntropies, type PackerVerdict, type SectionEntropy } from "@/lib/analysis/entropy";
-import { buildIat, type IatMap } from "@/lib/analysis/iat";
+import { buildIat, type IatMap, type IatEntry } from "@/lib/analysis/iat";
+import { xrefsTo, type LiveXref } from "@/lib/live";
+import { useConn } from "@/store/conn";
 import { attempt } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress, Tabs } from "../ui";
@@ -16,6 +18,7 @@ const hx = (n: number | bigint) => "0x" + n.toString(16).toUpperCase();
 
 export default function PeView() {
   const ui = useUi();
+  const modules = useConn((s) => s.modules);
   const m = useFocusedModule();
   const [pe, setPe] = useState<PeInfo | null>(null);
   const [err, setErr] = useState("");
@@ -25,6 +28,8 @@ export default function PeView() {
   const [entropy, setEntropy] = useState<SectionEntropy[]>([]);
   const [packer, setPacker] = useState<PackerVerdict | null>(null);
   const [iat, setIat] = useState<IatMap | null>(null);
+  const [importRefs, setImportRefs] = useState<Record<string, LiveXref[]>>({});
+  const [importRefsSel, setImportRefsSel] = useState<IatEntry | null>(null);
 
   useEffect(() => {
     if (!m) return;
@@ -51,6 +56,14 @@ export default function PeView() {
   const f = filter.toLowerCase();
   const exports = useMemo(() => (pe?.exports ?? []).filter((e) => !f || e.name.toLowerCase().includes(f)), [pe, f]);
   const imports = useMemo(() => (pe?.imports ?? []).map((d) => ({ ...d, funcs: d.funcs.filter((x) => !f || d.dll.toLowerCase().includes(f) || (x.name ?? "").toLowerCase().includes(f)) })).filter((d) => d.funcs.length), [pe, f]);
+
+  /** Finds every place in the module that references an import slot. */
+  const showImportRefs = async (e: IatEntry) => {
+    setImportRefsSel(e);
+    if (importRefs[e.address]) return;
+    const list = await attempt("xrefs", xrefsTo(e.address, modules));
+    if (list) setImportRefs((r) => ({ ...r, [e.address]: list }));
+  };
 
   const body = () => {
     if (!pe) return <div className="empty"><div className="empty-title">{err ? "Not a readable PE image." : "Reading image…"}</div>{err && <div className="empty-hint">{err}</div>}</div>;
@@ -109,19 +122,44 @@ export default function PeView() {
       );
     if (sub === "iat")
       return (
-        <table className="table mono">
-          <colgroup><col style={{ width: 160 }} /><col /><col style={{ width: 120 }} /></colgroup>
-          <thead><tr><th>DLL</th><th>Function</th><th>Slot</th></tr></thead>
-          <tbody>
-            {(iat?.entries ?? []).slice(0, kLimit).map((e) => (
-              <tr key={e.address} onClick={() => ui.select(e.address)} onDoubleClick={() => ui.goMemory(e.address)}>
-                <td className="faint ellipsis">{e.dll}</td>
-                <td className="link">{e.name}</td>
-                <td className="dim">{hx(e.rva)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <>
+          <table className="table mono">
+            <colgroup><col style={{ width: 160 }} /><col /><col style={{ width: 120 }} /><col style={{ width: 70 }} /></colgroup>
+            <thead><tr><th>DLL</th><th>Function</th><th>Slot</th><th>Refs</th></tr></thead>
+            <tbody>
+              {(iat?.entries ?? []).slice(0, kLimit).map((e) => (
+                <tr key={e.address} onClick={() => ui.select(e.address)} onDoubleClick={() => void showImportRefs(e)}>
+                  <td className="faint ellipsis">{e.dll}</td>
+                  <td className="link">{e.name}</td>
+                  <td className="dim">{hx(e.rva)}</td>
+                  <td className="dim">{importRefs[e.address]?.length ?? ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {importRefsSel && (
+            <div style={{ borderTop: "1px solid var(--border-soft)" }}>
+              <div className="toolbar">
+                <span className="panel-title">Callsites of {importRefsSel.name}</span>
+                <span className="grow" />
+                <button className="row-action" onClick={() => setImportRefsSel(null)}>close</button>
+              </div>
+              <table className="table mono">
+                <tbody>
+                  {(importRefs[importRefsSel.address] ?? []).map((x) => (
+                    <tr key={x.address} onClick={() => ui.goDisasm("0x" + x.address.toString(16))}>
+                      <td className="link">{labelAddr("0x" + x.address.toString(16), modules)}</td>
+                      <td className="faint">{x.kind}</td>
+                    </tr>
+                  ))}
+                  {(importRefs[importRefsSel.address] ?? []).length === 0 && (
+                    <tr><td className="faint">No references found in the module image.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       );
     return (
       <div className="panel-section">

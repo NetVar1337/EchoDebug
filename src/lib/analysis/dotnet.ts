@@ -300,11 +300,11 @@ function colWidth(kind: ColKind, counts: number[], heapSizes: number): number {
 // heap index widths, so the widths reach a fixed point immediately.
 function computeWidths(counts: number[], heapSizes: number): Record<number, number[]> {
   const widths: Record<number, number[]> = {};
-for (const sch of kSchemaList) widths[sch.id] = sch.cols.map(([, k]) => colWidth(k, counts, heapSizes));
+  for (const sch of kSchemaList) widths[sch.id] = sch.cols.map(([, k]) => colWidth(k, counts, heapSizes));
   return widths;
 }
 
-function parseTableStream(buf: Uint8Array): { rows: Map<number, Row[]>; heapSizes: number } | null {
+function parseTableStream(buf: Uint8Array): Map<number, Row[]> | null {
   if (buf.length < 24) return null;
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const heapSizes = dv.getUint8(6);
@@ -341,7 +341,7 @@ function parseTableStream(buf: Uint8Array): { rows: Map<number, Row[]>; heapSize
     }
     rows.set(t, list);
   }
-  return { rows, heapSizes };
+  return rows;
 }
 
 function splitCoded(coded: string, value: number): { table: number; row: number } | null {
@@ -566,15 +566,15 @@ function parseDotnetSafe(img: Uint8Array): DotnetInfo | null {
 
   const tblBuf = sliceAt(dv, cli.metaRva + tblStream.off, tblStream.size);
   if (!tblBuf) return null;
-  const decoded = parseTableStream(tblBuf);
-  if (!decoded) return null;
+  const decodedRows = parseTableStream(tblBuf);
+  if (!decodedRows) return null;
 
   const empty = new Uint8Array(0);
   const meta: Meta = {
     strings: (stringsStream && sliceAt(dv, cli.metaRva + stringsStream.off, stringsStream.size)) || empty,
     blob: (blobStream && sliceAt(dv, cli.metaRva + blobStream.off, blobStream.size)) || empty,
     guid: (guidStream && sliceAt(dv, cli.metaRva + guidStream.off, guidStream.size)) || empty,
-    rows: decoded.rows,
+    rows: decodedRows,
   };
   return buildInfo(meta, cli, root);
 }
