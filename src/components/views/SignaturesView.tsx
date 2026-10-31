@@ -115,8 +115,8 @@ export default function SignaturesView() {
 
   const pickFlirt = async () => {
     if (isTauri()) {
-      const bytes = await pickBinaryFile(["sig"], "FLIRT signature file");
-      if (bytes) await loadFlirt(bytes, "signature set");
+      const picked = await pickBinaryFile(["sig"], "FLIRT signature file");
+      if (picked) await loadFlirt(picked.bytes, picked.name);
       return;
     }
     // Browser fallback: a file input.
