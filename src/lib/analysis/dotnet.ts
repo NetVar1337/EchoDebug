@@ -385,9 +385,14 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
     if (visiting.has(row1)) return { ns: "", name: "" };
     visiting.add(row1);
     const own = readStr(td.TypeName);
-    const ns = readStr(td.TypeNamespace);
+    let ns = readStr(td.TypeNamespace);
+    let name = own;
     const enc = enclosing.get(row1);
-    const name = enc ? `${typeParts(enc).name}+${own}` : own;
+    if (enc) {
+      const outer = typeParts(enc);
+      name = `${outer.name}+${own}`;
+      if (!ns) ns = outer.ns; // nested types carry no namespace of their own
+    }
     visiting.delete(row1);
     const res = { ns, name };
     parts.set(row1, res);
@@ -404,6 +409,22 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
     const ns = readStr(tr.TypeNamespace);
     return ns ? `${ns}.${n}` : n;
   }
+
+  // method / field row ranges per type (the *List columns are 1 based start
+  // markers, a type owns every row up to the next type's marker)
+  const ranges = typeDefs.map((td, i) => {
+    const next = typeDefs[i + 1];
+    return {
+      mStart: td.MethodList ?? 0,
+      mEnd: next ? (next.MethodList ?? 0) : methodRows.length + 1,
+      fStart: td.FieldList ?? 0,
+      fEnd: next ? (next.FieldList ?? 0) : fieldRows.length + 1,
+    };
+  });
+  const methodOwner = new Map<number, number>();
+  ranges.forEach((r, i) => {
+    for (let row = r.mStart; row < r.mEnd && row <= methodRows.length; row++) methodOwner.set(row, i + 1);
+  });
 
   // custom attributes (the exported DotnetType shape carries no attribute list,
   // so attributes are surfaced on methods and fields only)
@@ -428,9 +449,14 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
       }
       if (!full) full = readStr(mr.Name);
     } else if (s.table === T.MethodDef) {
-      const md = methodRows[s.row - 1];
-      if (!md) return "";
-      full = readStr(md.Name);
+      // the attribute constructor lives on the attribute type itself
+      const owner = methodOwner.get(s.row);
+      if (owner) full = typeFullName(owner);
+      else {
+        const md = methodRows[s.row - 1];
+        if (!md) return "";
+        full = readStr(md.Name);
+      }
     }
     const dot = full.lastIndexOf(".");
     return dot >= 0 ? full.slice(dot + 1) : full;
@@ -458,12 +484,11 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
   for (let i = 0; i < typeDefs.length; i++) {
     const td = typeDefs[i];
     const p = typeParts(i + 1);
+    const range = ranges[i];
 
-    const mStart = td.MethodList ?? 0;
-    const mEnd = i + 1 < typeDefs.length ? (typeDefs[i + 1].MethodList ?? 0) : methodRows.length + 1;
     const methods: DotnetMethod[] = [];
-    if (mStart > 0) {
-      for (let r = mStart; r < mEnd && r <= methodRows.length; r++) {
+    if (range.mStart > 0) {
+      for (let r = range.mStart; r < range.mEnd && r <= methodRows.length; r++) {
         const md = methodRows[r - 1];
         if (!md) continue;
         methods.push({
@@ -475,11 +500,9 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
       }
     }
 
-    const fStart = td.FieldList ?? 0;
-    const fEnd = i + 1 < typeDefs.length ? (typeDefs[i + 1].FieldList ?? 0) : fieldRows.length + 1;
     const fields: DotnetField[] = [];
-    if (fStart > 0) {
-      for (let r = fStart; r < fEnd && r <= fieldRows.length; r++) {
+    if (range.fStart > 0) {
+      for (let r = range.fStart; r < range.fEnd && r <= fieldRows.length; r++) {
         const fd = fieldRows[r - 1];
         if (!fd) continue;
         fields.push({ name: readStr(fd.Name), flags: fd.Flags ?? 0, attributes: fieldAttrs.get(r) ?? [] });

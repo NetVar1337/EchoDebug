@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, Map as MapIcon, Pause, Play } from "lucide-react";
+import { ChevronDown, ChevronUp, Map as MapIcon, Pause, Play, Search } from "lucide-react";
 import { request } from "@/lib/client";
 import { fmtAddr, labelAddr, parseAddress, showAddr, toBig } from "@/lib/hex";
 import { readBytes } from "@/lib/memory";
@@ -14,25 +14,42 @@ const kWindow = 0x800;
 function Regions({ onPick }: { onPick: (a: string) => void }) {
   const { modules, ext } = useConn();
   const [regions, setRegions] = useState<Region[]>([]);
+  const [filter, setFilter] = useState("");
   useEffect(() => {
     if (!ext) return;
     void attempt("regions", request<{ regions: Region[]; truncated: boolean }>("regions", { max: 20000 })).then((r) => r && setRegions(r.regions));
   }, [ext]);
   if (!ext) return <div className="panel-section faint">Region map needs the EchoDebug agent.</div>;
+  const f = filter.toLowerCase();
+  const shown = regions.filter((r) => {
+    if (!f) return true;
+    if (r.base.toLowerCase().includes(f)) return true;
+    const m = modules.find((x) => {
+      const b = toBig(x.base);
+      const a = toBig(r.base);
+      return a >= b && a < b + BigInt(x.size);
+    });
+    return m ? m.name.toLowerCase().includes(f) : false;
+  });
   return (
-    <table className="table">
-      <colgroup><col /><col style={{ width: 70 }} /><col style={{ width: 40 }} /></colgroup>
-      <thead><tr><th>Base</th><th>Size</th><th>Prot</th></tr></thead>
-      <tbody>
-        {regions.map((r) => (
-          <tr key={r.base} onClick={() => onPick(r.base)} title={labelAddr(r.base, modules)}>
-            <td className="mono">{showAddr(r.base).replace(/^0{4}/, "")}</td>
-            <td className="mono faint">{r.size >= 1048576 ? `${(r.size / 1048576).toFixed(1)}M` : `${(r.size / 1024).toFixed(0)}K`}</td>
-            <td className="mono dim">{r.writable ? "RW" : "R-"}{r.executable ? "X" : "-"}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <>
+      <div className="toolbar">
+        <label className="search grow"><Search size={13} /><input placeholder="Filter regions…" value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
+      </div>
+      <table className="table">
+        <colgroup><col /><col style={{ width: 70 }} /><col style={{ width: 40 }} /></colgroup>
+        <thead><tr><th>Base</th><th>Size</th><th>Prot</th></tr></thead>
+        <tbody>
+          {shown.map((r) => (
+            <tr key={r.base} onClick={() => onPick(r.base)} title={labelAddr(r.base, modules)}>
+              <td className="mono">{showAddr(r.base).replace(/^0{4}/, "")}</td>
+              <td className="mono faint">{r.size >= 1048576 ? `${(r.size / 1048576).toFixed(1)}M` : `${(r.size / 1024).toFixed(0)}K`}</td>
+              <td className="mono dim">{r.writable ? "RW" : "R-"}{r.executable ? "X" : "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
   );
 }
 

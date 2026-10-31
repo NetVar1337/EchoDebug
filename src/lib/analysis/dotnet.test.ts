@@ -53,7 +53,7 @@ function buildBlobs(entries: number[][]): { data: number[]; at: number[] } {
 
 type TableDef = { id: number; widths: number[]; rows: number[][] };
 
-function buildTables(tables: TableDef[]): number[] {
+function buildTables(tables: TableDef[], heapSizes: number): number[] {
   const out: number[] = [];
   const push = (b: number[]) => {
     for (const x of b) out.push(x);
@@ -61,8 +61,8 @@ function buildTables(tables: TableDef[]): number[] {
   push(le32(0)); // reserved
   push(le8(2)); // major version
   push(le8(0)); // minor version
-  push(le8(0)); // heap sizes: 2 byte string/guid/blob indices
-  push(le8(0)); // reserved
+  push(le8(heapSizes)); // heap index widths
+  push(le8(1)); // reserved
   let valid = 0n;
   for (const t of tables) valid |= 1n << BigInt(t.id);
   push(le64(valid)); // valid mask
@@ -170,7 +170,9 @@ function buildPe(meta: Uint8Array, opts: { numDirs?: number; clrRva?: number } =
 /* Field/MethodDef/MemberRef/CustomAttribute/NestedClass rows         */
 /* ------------------------------------------------------------------ */
 
-function buildManagedImage(): Uint8Array {
+// `wide` selects 4 byte heap indexes (heapSizes 0x05) instead of the 2 byte
+// default, the way real assemblies with big heaps encode their rows.
+function buildManagedImage(wide = false): Uint8Array {
   const strs = buildStrings([
     ".ctor", "Compute", "Helper", "m_count", "m_value", "Nested", "ObsoleteAttribute",
     "Object", "Sample", "System", "Test.dll", "ToString", "Widget",
@@ -187,6 +189,9 @@ function buildManagedImage(): Uint8Array {
     if (idx === undefined) throw new Error(`unknown string ${n}`);
     return idx;
   };
+  const strW = wide ? 4 : 2;
+  const blobW = wide ? 4 : 2;
+  const guidW = 2;
 
   // Module: Generation, Name, Mvid, EncId, EncBaseId
   const moduleRow = [0, s("Test.dll"), 1, 0, 0];
@@ -226,18 +231,18 @@ function buildManagedImage(): Uint8Array {
   const nestedClassRows = [[2, 1]];
 
   const tables: TableDef[] = [
-    { id: 0, widths: [2, 2, 2, 2, 2], rows: [moduleRow] },
-    { id: 1, widths: [2, 2, 2], rows: typeRefRows },
-    { id: 2, widths: [4, 2, 2, 2, 2, 2], rows: typeDefRows },
-    { id: 4, widths: [2, 2, 2], rows: fieldRows },
-    { id: 6, widths: [4, 2, 2, 2, 2, 2], rows: methodDefRows },
-    { id: 10, widths: [2, 2, 2], rows: memberRefRows },
-    { id: 12, widths: [2, 2, 2], rows: customAttributeRows },
+    { id: 0, widths: [2, strW, guidW, guidW, guidW], rows: [moduleRow] },
+    { id: 1, widths: [2, strW, strW], rows: typeRefRows },
+    { id: 2, widths: [4, strW, strW, 2, 2, 2], rows: typeDefRows },
+    { id: 4, widths: [2, strW, blobW], rows: fieldRows },
+    { id: 6, widths: [4, 2, 2, strW, blobW, 2], rows: methodDefRows },
+    { id: 10, widths: [2, strW, blobW], rows: memberRefRows },
+    { id: 12, widths: [2, 2, blobW], rows: customAttributeRows },
     { id: 41, widths: [2, 2], rows: nestedClassRows },
   ];
 
   const meta = buildMetadata([
-    { name: "#~", data: buildTables(tables) },
+    { name: "#~", data: buildTables(tables, wide ? 0x05 : 0x00) },
     { name: "#Strings", data: strs.data },
     { name: "#Blob", data: blobs.data },
   ]);
@@ -258,7 +263,7 @@ describe("dotnet", () => {
     expect(info.metadataVersion).toBe("v4.0.30319");
     expect(info.entryPointToken).toBe(0x06000001);
 
-    expect(info.types.map((t) => t.fullName)).toEqual(["Sample.Widget", "Widget+Nested"]);
+    expect(info.types.map((t) => t.fullName)).toEqual(["Sample.Widget", "Sample.Widget+Nested"]);
 
     const widget = info.types[0];
     expect(widget.namespace).toBe("Sample");
@@ -279,7 +284,7 @@ describe("dotnet", () => {
     expect(widget.fields[1].attributes).toEqual([]);
 
     const nested = info.types[1];
-    expect(nested.namespace).toBe("");
+    expect(nested.namespace).toBe("Sample");
     expect(nested.name).toBe("Widget+Nested");
     expect(nested.flags).toBe(2);
     expect(nested.baseType).toBe("Sample.Widget");
@@ -288,9 +293,15 @@ describe("dotnet", () => {
     expect(nested.fields).toEqual([]);
   });
 
+  it("decodes the same metadata with 4 byte heap indexes", () => {
+    const narrow = parseDotnet(buildManagedImage(false));
+    const wide = parseDotnet(buildManagedImage(true));
+    expect(wide).toEqual(narrow);
+    expect(wide?.types.map((t) => t.fullName)).toEqual(["Sample.Widget", "Sample.Widget+Nested"]);
+  });
+
   it("returns null without a CLR data directory", () => {
     const img = buildManagedImage();
-    // strip directory 14
     const dv = new DataView(img.buffer);
     const oh = 0x84 + 20;
     dv.setUint32(oh + 108, 14, true); // only 14 directories -> no "CLR" entry
@@ -317,5 +328,9 @@ describe("dotnet", () => {
     const broken2 = buildManagedImage();
     new DataView(broken2.buffer).setUint32(kMetaRva + 12, 0xfffffff0, true); // bogus version length
     expect(parseDotnet(broken2)).toBeNull();
+
+    const broken3 = buildManagedImage();
+    new DataView(broken3.buffer).setUint32(kCliRva + 8, 0xffffff00, true); // metadata rva out of range
+    expect(parseDotnet(broken3)).toBeNull();
   });
 });

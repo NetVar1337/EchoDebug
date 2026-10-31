@@ -44,6 +44,20 @@ export default function CommandPalette() {
       { id: "memory", label: "Show selection in memory", group: "Navigate", run: () => ui.selected && ui.goMemory(ui.selected) },
       { id: "struct", label: "Show selection in struct view", group: "Navigate", run: () => ui.selected && ui.goStruct(ui.selected) },
       { id: "sig", label: "Make signature at selection", group: "Navigate", run: () => ui.selected && ui.goSig(ui.selected) },
+    );
+    // Every loaded module is a jump target.
+    for (const m of conn.modules) {
+      out.push({
+        id: `mod:${m.base}`,
+        label: `Module: ${m.name}`,
+        group: "Module",
+        run: () => {
+          ui.set({ module: m.name });
+          ui.goDisasm(m.base);
+        },
+      });
+    }
+    out.push(
       { id: "attach", label: "Attach to a process", group: "Target", run: () => ui.setRail("targets") },
       { id: "detach", label: "Detach from target", group: "Target", run: () => void conn.detach() },
       { id: "modules", label: "Refresh module list", group: "Target", run: () => void conn.refreshModules() },

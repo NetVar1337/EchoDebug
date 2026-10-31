@@ -203,6 +203,13 @@ export const kCryptoSignatures: readonly {
     confidence: 0.91,
   },
   {
+    kind: "xtea-key",
+    name: "XTEA negative delta",
+    bytes: Uint8Array.from([0x47, 0x86, 0xc8, 0x61]),
+    note: "0x61C88647, the two's-complement (-0x9E3779B9) TEA/XTEA delta form.",
+    confidence: 0.85,
+  },
+  {
     kind: "rc4-state",
     name: "RC4 state initialization",
     bytes: Uint8Array.from([0x00, 0x01, 0x02, 0x03]),
