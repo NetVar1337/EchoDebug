@@ -55,7 +55,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | PE browser | Headers, sections, data directories, imports (with IAT slots), exports, **Analysis tab** with per-section entropy and packer/protector heuristics |
 | Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array / x64dbg / YARA output, saved to a catalog |
 | Pointers | Live pointer-chain resolver, bounded pointer scan whose results load straight into the resolver |
-| Call graph | The function under the cursor with its direct callees (from Echo's own disassembly) and the call sites that reference it |
+| Call graph | The function under the cursor with its direct callees (from Echo's own disassembly) and the call sites that reference it; a module mode that draws the whole binary at once |
 | Xrefs | The whole reference graph of a module indexed in one pass: who points here, what this points at, and the most referenced addresses in the binary |
 | .NET explorer | ECMA-335 metadata parsed straight out of the loaded module: namespaces, types, methods, fields, base types |
 | Crypto scanner | Finds known constant tables (AES S-box, SHA-256 K/H, MD5 T, CRC-32, Blowfish, ChaCha/Salsa sigma, TEA delta, Base64 alphabet, Rijndael mix) |
@@ -64,6 +64,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Binary map | Module section layout as a proportional bar plus the live region map with protection flags |
 | Patches | Every write EchoDebug makes is journalled with the bytes that were there before, and can be reverted with one click |
 | Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
+| Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
 | AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Mistral, DeepSeek, Ollama, LM Studio); the model drives the same 29 tools as MCP, sees the current target/module/selection, and asks before running a mutating tool |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 29 tools |
