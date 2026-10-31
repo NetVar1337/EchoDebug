@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Search } from "lucide-react";
 import { labelAddr, toBig } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
-import { findCodeCaves, type CodeCave } from "@/lib/analysis/code-caves";
+import { findCodeCaves, type CodeCave } from "@/lib/analysis/caves";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";

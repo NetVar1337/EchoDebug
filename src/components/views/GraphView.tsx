@@ -1,16 +1,22 @@
 // Call graph: the function under the cursor plus its direct callers and
 // callees, drawn as a small SVG graph. Edges come from Echo's own
 // disassembly, so they are exact.
+//
+// The module mode builds the same picture for every function of a module at
+// once, from the mapped image, which is how a whole binary is surveyed.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { request } from "@/lib/client";
 import { labelAddr, toBig } from "@/lib/hex";
 import { xrefsTo } from "@/lib/live";
+import { loadImage } from "@/lib/memory";
 import { addEdge, addNode, calleesOf, layout, type CallGraph } from "@/lib/analysis/callgraph";
+import { buildCallGraph } from "@/lib/analysis/graph";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent } from "../ui";
+import ModulePicker, { useFocusedModule } from "../ModulePicker";
 
 type Line = { address: string; length: number; bytes: string; text: string };
 
@@ -20,7 +26,9 @@ export default function GraphView() {
   const ui = useUi();
   const modules = useConn((s) => s.modules);
   const names = useNames();
+  const focused = useFocusedModule();
   const root = ui.disasmAt ?? ui.selected;
+  const [mode, setMode] = useState<"function" | "module">("function");
   const [graph, setGraph] = useState<CallGraph>({ nodes: [], edges: [], visited: [] });
   const [busy, setBusy] = useState(false);
 
@@ -59,9 +67,32 @@ export default function GraphView() {
     log("info", "graph", `${callees.length} callees, ${callRefs.length} callers of ${labelAddr(root, modules)}`);
   }, [root, modules, names]);
 
+  /** The whole module at once: every function, with the calls between them. */
+  const buildModule = useCallback(async () => {
+    if (!focused) return;
+    setBusy(true);
+    const fns = await attempt("graph", request<{ results: { address: string; size: number }[] }>("enumerate_functions", { module: focused.name }));
+    if (!fns) { setBusy(false); return; }
+    const img = await attempt("graph", loadImage(focused));
+    if (!img) { setBusy(false); return; }
+    const built = buildCallGraph(img, fns.results, toBig(focused.base), { maxDepth: 2, maxNodes: 900 });
+    const g: CallGraph = { nodes: [], edges: [], visited: [] };
+    for (const n of built.nodes) {
+      addNode(g, n.address, names.nameOf(n.address) || n.label, n.kind === "function" ? "function" : "unknown", n.depth);
+    }
+    for (const e of built.edges) {
+      if (e.kind === "rip") continue;
+      addEdge(g, e.from, e.to, e.kind);
+    }
+    setGraph(g);
+    setBusy(false);
+    log("info", "graph", `${built.nodes.length} functions, ${built.edges.length} edges in ${focused.name}`);
+  }, [focused, names]);
+
   useEffect(() => {
-    void build();
-  }, [build]);
+    if (mode === "module") void buildModule();
+    else void build();
+  }, [mode, build, buildModule]);
 
   const pos = useMemo(() => layout(graph), [graph]);
 
@@ -76,7 +107,7 @@ export default function GraphView() {
     return max;
   }, [pos]);
 
-  if (!root) {
+  if (!root && mode === "function") {
     return (
       <NeedsAgent>
         <div className="empty">
@@ -91,8 +122,13 @@ export default function GraphView() {
     <NeedsAgent>
       <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
         <div className="toolbar">
-          <span className="mono faint ellipsis grow">{labelAddr(root, modules)} · {graph.nodes.length} nodes · {graph.edges.length} edges</span>
-          <button className="btn small" disabled={busy} onClick={() => void build()}>{busy ? "Building…" : "Rebuild"}</button>
+          <button className="btn small" data-active={mode === "function"} onClick={() => setMode("function")}>Function</button>
+          <button className="btn small" data-active={mode === "module"} onClick={() => setMode("module")}>Module</button>
+          {mode === "module" && <ModulePicker />}
+          <span className="mono faint ellipsis grow">
+            {mode === "function" ? labelAddr(root ?? "", modules) : focused?.name} · {graph.nodes.length} nodes · {graph.edges.length} edges
+          </span>
+          <button className="btn small" disabled={busy} onClick={() => void (mode === "module" ? buildModule() : build())}>{busy ? "Building…" : "Rebuild"}</button>
         </div>
         <div className="vlist" style={{ overflow: "auto" }}>
           <svg width={width} height={height} style={{ display: "block" }}>
@@ -128,14 +164,14 @@ export default function GraphView() {
             })}
           </svg>
           <div className="panel-section">
-            <div className="label">Callees</div>
-            {graph.nodes.filter((n) => n.depth === 1).length === 0 ? (
-              <div className="faint">No direct calls found in this function.</div>
+            <div className="label">{mode === "module" ? "Functions" : "Callees"}</div>
+            {graph.nodes.filter((n) => n.depth === (mode === "module" ? 0 : 1)).length === 0 ? (
+              <div className="faint">{mode === "module" ? "No functions found in this module." : "No direct calls found in this function."}</div>
             ) : (
               <table className="table mono">
                 <thead><tr><th>Target</th><th>Name</th></tr></thead>
                 <tbody>
-                  {graph.nodes.filter((n) => n.depth === 1).map((n) => (
+                  {graph.nodes.filter((n) => n.depth === (mode === "module" ? 0 : 1)).map((n) => (
                     <tr key={n.address} onClick={() => ui.goDisasm(n.address)}>
                       <td className="link">{labelAddr(n.address, modules)}</td>
                       <td className="faint">{n.label}</td>

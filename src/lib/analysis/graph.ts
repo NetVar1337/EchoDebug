@@ -11,6 +11,8 @@ export type GraphNode = {
   rva: number;
   label: string;
   kind: "function" | "import" | "unknown";
+  /** distance from the root function list; column 0 holds the roots */
+  depth: number;
 };
 
 export type GraphEdge = {
@@ -222,12 +224,16 @@ export function buildCallGraph(
   const nodes = new Map<string, GraphNode>();
   const edges = new Map<string, GraphEdge>();
 
-  const addNode = (rva: number, kind: GraphNode["kind"]): GraphNode | null => {
+  const addNode = (rva: number, kind: GraphNode["kind"], depth: number): GraphNode | null => {
     const address = formatAddress(rva, base);
     const existing = nodes.get(address);
-    if (existing) return existing;
+    if (existing) {
+      // A node reached through a shorter path keeps the smaller depth.
+      if (depth < existing.depth) existing.depth = depth;
+      return existing;
+    }
     if (nodes.size >= maxNodes) return null;
-    const node: GraphNode = { address, rva, label: labelFor(rva), kind };
+    const node: GraphNode = { address, rva, label: labelFor(rva), kind, depth };
     nodes.set(address, node);
     return node;
   };
@@ -253,7 +259,7 @@ export function buildCallGraph(
     scanned.add(fn.rva);
 
     if (nodes.size >= maxNodes) break;
-    if (!addNode(fn.rva, "function")) break;
+    if (!addNode(fn.rva, "function", level - 1)) break;
 
     const start = fn.rva;
     const end = fn.rva + fn.size;
@@ -279,7 +285,7 @@ export function buildCallGraph(
       const targetRva = next + rel;
       if (targetRva < 0 || targetRva >= img.length) continue;
       const knownFn = known.get(targetRva);
-      addNode(targetRva, knownFn ? "function" : "unknown");
+      addNode(targetRva, knownFn ? "function" : "unknown", level);
       addEdge(fn.rva, targetRva, kind);
       if (knownFn && level + 1 <= maxDepth) queue.push({ fn: knownFn, level: level + 1 });
     }
@@ -289,7 +295,7 @@ export function buildCallGraph(
       const targetRva = cand.nextInstructionRva + cand.displacement;
       if (targetRva < 0 || targetRva >= img.length) continue;
       const knownFn = known.get(targetRva);
-      addNode(targetRva, knownFn ? "function" : "unknown");
+      addNode(targetRva, knownFn ? "function" : "unknown", level);
       addEdge(fn.rva, targetRva, "rip");
     }
   }

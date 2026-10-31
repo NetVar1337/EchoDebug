@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findCodeCaves } from "./code-caves";
+import { findCodeCaves } from "./caves";
 import { branchTarget, calleesOf, layout, addEdge, addNode, type CallGraph } from "./callgraph";
 import { shannonEntropy, sectionEntropies, detectPacker } from "./entropy";
 import { scanCrypto } from "./crypto";
