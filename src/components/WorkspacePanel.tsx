@@ -16,6 +16,7 @@ import SnapshotsView from "./views/SnapshotsView";
 import BinaryMapView from "./views/BinaryMapView";
 import PatchesView from "./views/PatchesView";
 import TriageView from "./views/TriageView";
+import RttiView from "./views/RttiView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -34,6 +35,7 @@ const kViews: Record<TabId, () => JSX.Element> = {
   map: BinaryMapView,
   patches: PatchesView,
   triage: TriageView,
+  rtti: RttiView,
 };
 
 export default function WorkspacePanel() {

@@ -5,7 +5,7 @@ import { persist } from "zustand/middleware";
 export type RailView = "targets" | "modules" | "watch" | "names" | "ai";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
-  | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage";
+  | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 export type AiProvider = "anthropic" | "openai";
 
@@ -28,6 +28,7 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "map", label: "Binary Map" },
   { id: "patches", label: "Patches" },
   { id: "triage", label: "Triage" },
+  { id: "rtti", label: "RTTI" },
 ];
 
 type UiStore = {
