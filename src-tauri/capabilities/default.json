@@ -9,6 +9,15 @@
     "process:default",
     "process:allow-restart",
     "opener:default",
+    "dialog:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     {
       "identifier": "opener:allow-open-path",
       "allow": [{ "path": "$CONFIG/scripts" }, { "path": "$CONFIG/scripts/**" }]

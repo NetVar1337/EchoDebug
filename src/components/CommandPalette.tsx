@@ -1,0 +1,142 @@
+// Ctrl+Shift+P command palette: one searchable list of every action in the app.
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useUi, kTabs, type Theme } from "@/store/ui";
+import { useConn } from "@/store/conn";
+import { useUpdate } from "@/store/update";
+import { openUrl } from "@/lib/tauri";
+
+type Cmd = { id: string; label: string; group: string; hint?: string; run: () => void };
+
+const kThemes: [Theme, string][] = [["obsidian", "Obsidian"], ["nord", "Nord"], ["blood-orange", "Blood Orange"]];
+
+/** Subsequence match: "gsx" matches "Go to Signature". Returns a score, or -1. */
+function fuzzy(needle: string, hay: string): number {
+  if (!needle) return 0;
+  const n = needle.toLowerCase();
+  const h = hay.toLowerCase();
+  let hi = 0;
+  let score = 0;
+  let streak = 0;
+  for (const ch of n) {
+    const at = h.indexOf(ch, hi);
+    if (at < 0) return -1;
+    score += at === hi ? 3 + streak : 1;
+    streak = at === hi ? streak + 1 : 0;
+    hi = at + 1;
+  }
+  return score + (h.startsWith(n) ? 20 : 0);
+}
+
+export default function CommandPalette() {
+  const ui = useUi();
+  const conn = useConn();
+  const upd = useUpdate();
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const cmds = useMemo<Cmd[]>(() => {
+    const out: Cmd[] = [];
+    for (const t of kTabs) out.push({ id: `tab:${t.id}`, label: t.label, group: "View", run: () => ui.setTab(t.id) });
+    out.push(
+      { id: "goto", label: "Go to address", group: "Navigate", hint: "Ctrl+G", run: () => ui.set({ gotoOpen: true }) },
+      { id: "disasm", label: "Disassemble selection", group: "Navigate", run: () => ui.selected && ui.goDisasm(ui.selected) },
+      { id: "memory", label: "Show selection in memory", group: "Navigate", run: () => ui.selected && ui.goMemory(ui.selected) },
+      { id: "struct", label: "Show selection in struct view", group: "Navigate", run: () => ui.selected && ui.goStruct(ui.selected) },
+      { id: "sig", label: "Make signature at selection", group: "Navigate", run: () => ui.selected && ui.goSig(ui.selected) },
+      { id: "attach", label: "Attach to a process", group: "Target", run: () => ui.setRail("targets") },
+      { id: "detach", label: "Detach from target", group: "Target", run: () => void conn.detach() },
+      { id: "modules", label: "Refresh module list", group: "Target", run: () => void conn.refreshModules() },
+      { id: "watch", label: "Open watchlist", group: "Target", run: () => ui.setRail("watch") },
+      { id: "names", label: "Open names & comments", group: "Target", run: () => ui.setRail("names") },
+      { id: "ai", label: "Open AI assistant", group: "Target", run: () => ui.setRail("ai") },
+      { id: "export", label: "Export session to file", group: "Session", run: () => ui.set({ sessionExportOpen: true }) },
+      { id: "import", label: "Import session from file", group: "Session", run: () => ui.set({ sessionImportOpen: true }) },
+      { id: "settings", label: "Open settings", group: "App", run: () => ui.set({ settingsOpen: true }) },
+      { id: "update", label: "Check for updates", group: "App", run: () => void upd.check({ manual: true }) },
+      { id: "docs", label: "Open Echo API docs", group: "App", run: () => void openUrl("https://echo-23.gitbook.io/angel") },
+      { id: "protocol", label: "Open protocol reference", group: "App", run: () => void openUrl("https://github.com/NetVar1337/EchoDebug/blob/main/PROTOCOL.md") },
+      { id: "releases", label: "Open GitHub releases", group: "App", run: () => void openUrl("https://github.com/NetVar1337/EchoDebug/releases") },
+    );
+    for (const [id, label] of kThemes) out.push({ id: `theme:${id}`, label: `Theme: ${label}`, group: "App", run: () => ui.set({ theme: id }) });
+    return out;
+  }, [ui, conn, upd]);
+
+  const shown = useMemo(() => {
+    const scored = cmds
+      .map((c) => ({ c, s: fuzzy(q, c.label) + (q ? fuzzy(q, c.group) * 0.25 : 0) }))
+      .filter((x) => x.s >= 0)
+      .sort((a, b) => b.s - a.s);
+    return scored.slice(0, 60).map((x) => x.c);
+  }, [cmds, q]);
+
+  useEffect(() => setSel(0), [q]);
+
+  useEffect(() => {
+    const k = (e: KeyboardEvent) => {
+      if (e.key === "Escape") ui.set({ paletteOpen: false });
+      else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSel((s) => Math.min(shown.length - 1, s + 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSel((s) => Math.max(0, s - 1));
+      } else if (e.key === "Enter") {
+        const c = shown[sel];
+        if (c) {
+          ui.set({ paletteOpen: false });
+          c.run();
+        }
+      }
+    };
+    window.addEventListener("keydown", k);
+    return () => window.removeEventListener("keydown", k);
+  }, [shown, sel, ui]);
+
+  useEffect(() => {
+    listRef.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [sel]);
+
+  const run = (c: Cmd) => {
+    ui.set({ paletteOpen: false });
+    c.run();
+  };
+
+  let lastGroup = "";
+  return (
+    <div className="modal-scrim" onMouseDown={(e) => e.target === e.currentTarget && ui.set({ paletteOpen: false })}>
+      <div className="modal palette" role="dialog" aria-label="Command palette">
+        <input
+          autoFocus
+          className="palette-input"
+          placeholder="Type a command…"
+          value={q}
+          spellCheck={false}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              const c = shown[sel];
+              if (c) run(c);
+            } else if (e.key === "Escape") ui.set({ paletteOpen: false });
+          }}
+        />
+        <div className="palette-list" ref={listRef}>
+          {shown.length === 0 && <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>No matching command.</div>}
+          {shown.map((c, i) => {
+            const head = c.group !== lastGroup ? c.group : null;
+            lastGroup = c.group;
+            return (
+              <div key={c.id}>
+                {head && <div className="palette-group">{head}</div>}
+                <button className="palette-item" data-active={i === sel} onMouseEnter={() => setSel(i)} onClick={() => run(c)}>
+                  <span className="grow ellipsis">{c.label}</span>
+                  {c.hint && <span className="faint">{c.hint}</span>}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}

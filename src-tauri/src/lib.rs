@@ -65,12 +65,31 @@ fn scripts_dir() -> Result<String, String> {
     scripts_path().map(|p| p.display().to_string())
 }
 
+/// Writes a session export next to the user's documents; the frontend picks the file
+/// with the dialog plugin and passes the chosen path back.
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    fs::write(&p, contents).map_err(|e| format!("write {}: {e}", p.display()))?;
+    Ok(p.display().to_string())
+}
+
+/// Reads a session file the user picked.
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let mut port = std::env::var("ECHODEBUG_PORT")
                 .ok()
@@ -107,7 +126,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             relay_info,
             install_agent,
-            scripts_dir
+            scripts_dir,
+            write_text_file,
+            read_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

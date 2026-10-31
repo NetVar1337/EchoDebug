@@ -3,12 +3,13 @@ import { Search } from "lucide-react";
 import { fmtAddr, toBig } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
 import { parsePe, type PeInfo } from "@/lib/analysis/pe";
+import { detectPacker, sectionEntropies, type PackerVerdict, type SectionEntropy } from "@/lib/analysis/entropy";
 import { attempt } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress, Tabs } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
 
-type Sub = "headers" | "sections" | "exports" | "imports";
+type Sub = "headers" | "sections" | "exports" | "imports" | "analysis";
 const kLimit = 3000;
 const hx = (n: number | bigint) => "0x" + n.toString(16).toUpperCase();
 
@@ -20,6 +21,8 @@ export default function PeView() {
   const [progress, setProgress] = useState(1);
   const [sub, setSub] = useState<Sub>("headers");
   const [filter, setFilter] = useState("");
+  const [entropy, setEntropy] = useState<SectionEntropy[]>([]);
+  const [packer, setPacker] = useState<PackerVerdict | null>(null);
 
   useEffect(() => {
     if (!m) return;
@@ -30,7 +33,12 @@ export default function PeView() {
     void attempt("pe", loadImage(m, (d, t) => live && setProgress(d / t))).then((img) => {
       if (!live || !img) return;
       setProgress(1);
-      try { setPe(parsePe(img)); } catch (e) { setErr(String(e)); }
+      try {
+        const parsed = parsePe(img);
+        setPe(parsed);
+        setEntropy(sectionEntropies(img, parsed));
+        setPacker(detectPacker(img, parsed));
+      } catch (e) { setErr(String(e)); }
     });
     return () => { live = false; };
   }, [m?.name, m?.base]);
@@ -81,18 +89,54 @@ export default function PeView() {
           </tbody>
         </table>
       );
+    if (sub === "imports")
+      return (
+        <div className="tree mono">
+          {imports.map((d) => (
+            <details key={d.dll} open={!!f}>
+              <summary>{d.dll} <span className="faint">({d.funcs.length})</span></summary>
+              {d.funcs.slice(0, kLimit).map((x) => (
+                <div key={x.iatRva} className="fn-row" onClick={() => ui.select(abs(x.iatRva))} onDoubleClick={() => ui.goMemory(abs(x.iatRva))} style={{ paddingLeft: 28 }}>
+                  <span className="grow">{x.name ?? `#${x.ordinal}`}</span><span className="faint">IAT {hx(x.iatRva)}</span>
+                </div>
+              ))}
+            </details>
+          ))}
+        </div>
+      );
     return (
-      <div className="tree mono">
-        {imports.map((d) => (
-          <details key={d.dll} open={!!f}>
-            <summary>{d.dll} <span className="faint">({d.funcs.length})</span></summary>
-            {d.funcs.slice(0, kLimit).map((x) => (
-              <div key={x.iatRva} className="fn-row" onClick={() => ui.select(abs(x.iatRva))} onDoubleClick={() => ui.goMemory(abs(x.iatRva))} style={{ paddingLeft: 28 }}>
-                <span className="grow">{x.name ?? `#${x.ordinal}`}</span><span className="faint">IAT {hx(x.iatRva)}</span>
-              </div>
+      <div className="panel-section">
+        <div className="label">Packer / protection</div>
+        {packer ? (
+          <>
+            <div className={packer.packed ? "danger" : "ok"}>
+              {packer.packed ? "likely packed or protected" : "no packing indicators"} · confidence {Math.round(packer.confidence * 100)}%
+            </div>
+            {packer.reasons.length > 0 && (
+              <ul className="faint" style={{ fontSize: 12, margin: 0, paddingLeft: 18 }}>
+                {packer.reasons.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            )}
+          </>
+        ) : (
+          <div className="faint">No verdict.</div>
+        )}
+        <div className="label">Section entropy</div>
+        <table className="table mono">
+          <thead><tr><th>Section</th><th>Size</th><th>Entropy</th></tr></thead>
+          <tbody>
+            {entropy.map((e) => (
+              <tr key={e.name + e.rva}>
+                <td>{e.name}</td>
+                <td className="faint">{(e.size / 1024).toFixed(0)}K</td>
+                <td>
+                  <span className={e.entropy > 7.2 ? "danger" : e.entropy > 6.5 ? "warn" : "ok"}>{e.entropy.toFixed(2)}</span>
+                  <span className="entropy-bar"><span style={{ width: `${(e.entropy / 8) * 100}%` }} data-hot={e.entropy > 7.2} /></span>
+                </td>
+              </tr>
             ))}
-          </details>
-        ))}
+          </tbody>
+        </table>
       </div>
     );
   };
@@ -107,7 +151,7 @@ export default function PeView() {
           {pe && <span className="faint" style={{ fontSize: 12 }}>{pe.sections.length} sections · {pe.exports.length} exports · {pe.imports.reduce((n, d) => n + d.funcs.length, 0)} imports</span>}
         </div>
         {progress < 1 && <Progress value={progress} />}
-        <Tabs tabs={[{ id: "headers", label: "Headers" }, { id: "sections", label: "Sections" }, { id: "exports", label: "Exports" }, { id: "imports", label: "Imports" }]} active={sub} onSelect={setSub} />
+        <Tabs tabs={[{ id: "headers", label: "Headers" }, { id: "sections", label: "Sections" }, { id: "exports", label: "Exports" }, { id: "imports", label: "Imports" }, { id: "analysis", label: "Analysis" }]} active={sub} onSelect={setSub} />
         <div className="vlist">{body()}</div>
       </div>
     </NeedsAgent>

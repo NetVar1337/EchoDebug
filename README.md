@@ -42,25 +42,33 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 
 | Area | What you get |
 |---|---|
-| Shell | Reverse-Slap layout: activity rail, targets/modules/watch/AI panels, scanner, tabbed workspace, output, inspector, status bar, splitters, three themes plus accent colours, Ctrl+G go-to |
+| Shell | Reverse-Slap layout: frameless title bar with File/View/Window/Theme/Help menus and window buttons, activity rail, targets/modules/watch/names/AI panels, scanner, tabbed workspace, output, inspector, status bar, splitters, three themes plus accent colours, boot splash, global tooltips, motion preference (on/auto/off) |
+| Navigation | Ctrl+G go-to, **Ctrl+Shift+P command palette** over every action, Alt+← back in the disassembly, X for xrefs, N to rename, `;` to comment |
 | Targets & modules | Local process list, attach by pid/name, module list, open a module in PE/Strings/Disassembly/Memory, dump to `scripts\dmp` |
-| Disassembly | Function list (`enumerate_functions`), virtualized listing, clickable branch targets with history, xrefs (rel32 + RIP-relative), make-signature, bookmarks |
+| Disassembly | Function list (`enumerate_functions`), virtualized listing, clickable branch targets with history, xrefs (rel32 + RIP-relative), make-signature, bookmarks, user names and comments |
 | Memory | Live hex/ASCII view with change highlighting, in-place byte writes, region map with r/w/x flags, data inspector |
 | Structs | ReClass-style typed fields, follow pointers, RTTI class names, C++ header export |
 | Scanner | Cheat Engine-style first/next value scan (u8–u64, i8–i64, f32/f64, bytes, string, wstring; exact/unknown/changed/increased/…), AOB (IDA pattern) scan, string scan |
 | Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks |
 | Strings | ASCII + UTF-16 extraction, category/regex filters, CSV export, xrefs per string |
-| PE browser | Headers, sections, data directories, imports (with IAT slots), exports |
+| PE browser | Headers, sections, data directories, imports (with IAT slots), exports, **Analysis tab** with per-section entropy and packer/protector heuristics |
 | Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array output |
 | Pointers | Live pointer-chain resolver, bounded pointer scan whose results load straight into the resolver |
+| Call graph | The function under the cursor with its direct callees (from Echo's own disassembly) and the call sites that reference it |
+| .NET explorer | ECMA-335 metadata parsed straight out of the loaded module: namespaces, types, methods, fields, base types |
+| Crypto scanner | Finds known constant tables (AES S-box, SHA-256 K/H, MD5 T, CRC-32, Blowfish, ChaCha/Salsa sigma, TEA delta, Base64 alphabet, Rijndael mix) |
+| Code caves | Padding runs inside executable sections (0xCC / 0x90 / 0x00) with their size and section |
+| Snapshots | Capture a window of process memory, diff two captures byte by byte |
+| Binary map | Module section layout as a proportional bar plus the live region map with protection flags |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly |
-| AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint; the model drives the same tools as MCP |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 20 tools |
+| AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Mistral, DeepSeek, Ollama, LM Studio); the model drives the same 29 tools as MCP, sees the current target/module/selection, and asks before running a mutating tool |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 29 tools |
+| Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
 | Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |
 
 **Not available on the Echo backend:** the native debugger (breakpoints, stepping, VEH), Frida,
-kernel inspection, network capture/proxy, and Reverse-Slap/AiDA's decompilers and .NET explorer.
+kernel inspection, network capture/proxy, and Reverse-Slap/AiDA's decompilers and .NET decompiler.
 Echo exposes no API for these, and EchoDebug deliberately ships no driver to replace them.
 
 ### MCP
@@ -74,8 +82,9 @@ localhost dev servers, so web pages can't reach your target's memory.
 
 ### AI settings
 
-Under **Settings → AI**, choose the provider, model and API key. The key is stored in the app's
-local storage on this machine and is sent only to the endpoint you configure.
+Under **Settings → AI**, choose the provider endpoint, model and API key. The key is stored in the app's
+local storage on this machine and is sent only to the endpoint you configure. Local servers
+(Ollama, LM Studio) need no key.
 
 ## Development
 
@@ -85,7 +94,7 @@ Requirements: Node 22+, Rust (stable, 1.90+), and on Windows the WebView2 runtim
 npm ci
 npm run tauri dev            # desktop app with hot reload
 npm run dev                  # UI only in a browser (needs a relay: cargo run -p echo-debug-relay --manifest-path src-tauri/Cargo.toml)
-npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, AI loop)
+npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, AI loop)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 ```

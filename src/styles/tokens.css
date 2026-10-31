@@ -10,7 +10,8 @@
   --type-body: 14px;
   --type-small: 12.5px;
   --type-mono: 13px;
-  --topbar-h: 30px;
+  --topbar-h: 32px;
+  --titlebar-h: 32px;
   --statusbar-h: 24px;
   --rail-w: 46px;
   --tabbar-h: 32px;
@@ -18,7 +19,13 @@
   --font-ui: "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
   --accent-hover: color-mix(in srgb, var(--accent) 82%, white);
+  --accent-active: color-mix(in srgb, var(--accent) 62%, black);
   --selection: color-mix(in srgb, var(--accent) 30%, transparent);
+  /* motion scale */
+  --ease: cubic-bezier(0.2, 0, 0.2, 1);
+  --fast: 90ms;
+  --med: 190ms;
+  --slow: 260ms;
 }
 
 [data-theme="obsidian"] {

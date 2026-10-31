@@ -9,7 +9,7 @@ are lowercase hex strings without a prefix (`"4883ec28"`). Sizes and counts are 
  ┌──────────────────────────────┐               ┌────────────────────────────────────┐
  │ echo_debug.as (AngelScript)   │──ws /ext────▶ │ relay (Rust, axum)                 │
  │   ws::connect  → ext verbs   │               │   routes by "type"                 │◀── ws /client ── React UI
- │   process::open_socket ──────┼──ws /agent──▶ │   rewrites ids per upstream        │◀── ws /client ── other tools
+ │ process::open_socket ────────┼──ws /agent──▶ │   rewrites ids per upstream        │◀── ws /client ── other tools
  └──────────────────────────────┘               │   POST /mcp  (MCP, Streamable HTTP)│◀── MCP clients (Claude Code…)
                                                 │   GET /health                      │
                                                 └────────────────────────────────────┘
@@ -83,7 +83,7 @@ On connect the agent sends (id-less) `{ "type":"event", "event":"hello", "versio
 | `scan_results` | `offset`, `limit` (≤ 2000) | `count`, `results:[{address, value, previous}]` (hex bytes) |
 | `scan_clear` | – | – |
 | `pointer_scan` | `target` (address), `max_depth?` (1–5, default 3), `max_offset?` (default 0x400), `max_results?` (default 500), `module_only_roots?` (default true) | `results:[{module, module_offset, offsets:[n...]}]`, `truncated` |
-| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `instructions` |
+| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `instructions`, `reached_end` (bool) |
 | `dump` | `module?`, `filename` | `path` (relative to the Echo scripts `dmp` folder) |
 | `freeze` | `address`, `data` (hex), `enabled` (bool) | `frozen` (count) — agent rewrites `data` at 20 Hz while enabled |
 | `freeze_list` | – | `entries:[{address,data}]` |
@@ -98,3 +98,21 @@ Other events: `log` (`level`, `message`), `attached`, `detached`, `freeze_error`
 
 `protocol` is bumped on incompatible changes. The app shows a warning when the agent's `version`
 differs from the app version and (re)installs the bundled agent into `%APPDATA%\scripts\echo_debug.as`.
+
+## MCP surface
+
+`POST /mcp` speaks JSON-RPC 2.0 with the standard `initialize`, `tools/list` and `tools/call`
+methods. Every tool in `src/lib/tools.json` maps one-to-one onto a verb above; the tool's `verb`
+becomes the request `type`, the tool's `input_schema` is passed through as the request body, and the
+reply is returned as pretty-printed JSON in a single text content block (`isError` is set when the
+relay replied with an error frame).
+
+The tool set covers the whole backend: process control (`status`, `list_processes`, `attach`,
+`detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,
+`memory_regions`), analysis (`disassemble`, `enumerate_functions`, `signature_scan`,
+`signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`),
+scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`, `value_scan_clear`,
+`pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`) and dumping
+(`dump_module`).
+
+Because the relay routes by verb, an MCP client gets exactly the same behaviour as the desktop UI.

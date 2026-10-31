@@ -1,5 +1,7 @@
 import { X } from "lucide-react";
 import { useConn } from "@/store/conn";
+import { kProviders } from "@/lib/ai-providers";
+import { kMotionPrefs, useMotion } from "@/store/motion";
 import { attempt, log } from "@/store/output";
 import { kDefaultAi, useUi, type AiProvider, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
@@ -12,6 +14,8 @@ export default function SettingsModal() {
   const ui = useUi();
   const conn = useConn();
   const upd = useUpdate();
+  const motion = useMotion((s) => s.pref);
+  const setMotion = useMotion((s) => s.setPref);
   const ai = ui.ai;
   const setAi = (p: Partial<typeof ai>) => ui.set({ ai: { ...ai, ...p } });
   const close = () => ui.set({ settingsOpen: false });
@@ -48,6 +52,12 @@ export default function SettingsModal() {
                 ))}
               </div>
             </div>
+            <div className="settings-row">
+              <span>Motion</span>
+              <select className="select" value={motion} onChange={(e) => setMotion(e.target.value as typeof motion)}>
+                {kMotionPrefs.map((m) => <option key={m.id} value={m.id}>{m.label} — {m.hint}</option>)}
+              </select>
+            </div>
           </div>
 
           <div className="settings-group">
@@ -78,12 +88,28 @@ export default function SettingsModal() {
                 <option value="openai">OpenAI-compatible</option>
               </select>
             </div>
+            <div className="settings-row">
+              <span>Endpoint</span>
+              <select className="select" value={ai.baseUrl} onChange={(e) => {
+                const p = kProviders.find((x) => x.baseUrl === e.target.value);
+                setAi(p ? { baseUrl: p.baseUrl, provider: p.provider, model: p.models[0] } : { baseUrl: e.target.value });
+              }}>
+                {kProviders.map((p) => <option key={p.id} value={p.baseUrl}>{p.label}</option>)}
+                {ai.baseUrl && !kProviders.some((p) => p.baseUrl === ai.baseUrl) && <option value={ai.baseUrl}>{ai.baseUrl}</option>}
+              </select>
+            </div>
             {ai.provider === "openai" && (
               <div className="settings-row"><span>Base URL</span><input className="input mono" value={ai.baseUrl} onChange={(e) => setAi({ baseUrl: e.target.value })} /></div>
             )}
-            <div className="settings-row"><span>Model</span><input className="input mono" value={ai.model} onChange={(e) => setAi({ model: e.target.value })} /></div>
+            <div className="settings-row">
+              <span>Model</span>
+              <input className="input mono" list="echodebug-models" value={ai.model} onChange={(e) => setAi({ model: e.target.value })} />
+              <datalist id="echodebug-models">
+                {kProviders.flatMap((p) => p.models).map((m) => <option key={m} value={m} />)}
+              </datalist>
+            </div>
             <div className="settings-row"><span>API key</span><input className="input mono" type="password" autoComplete="off" value={ai.apiKey} onChange={(e) => setAi({ apiKey: e.target.value })} /></div>
-            <div className="faint" style={{ fontSize: 12 }}>The key is stored locally on this machine (app storage) and sent only to the provider above.</div>
+            <div className="faint" style={{ fontSize: 12 }}>The key is stored locally on this machine (app storage) and sent only to the provider above. Local servers (Ollama, LM Studio) need no key.</div>
           </div>
 
           <div className="settings-group">

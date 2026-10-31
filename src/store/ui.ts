@@ -2,18 +2,40 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-export type RailView = "targets" | "modules" | "watch" | "ai";
-export type TabId = "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator";
+export type RailView = "targets" | "modules" | "watch" | "names" | "ai";
+export type TabId =
+  | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
+  | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 export type AiProvider = "anthropic" | "openai";
 
 export type AiSettings = { provider: AiProvider; apiKey: string; model: string; baseUrl: string };
+
+export const kTabs: { id: TabId; label: string }[] = [
+  { id: "disassembly", label: "Disassembly" },
+  { id: "memory", label: "Memory" },
+  { id: "structs", label: "Structs" },
+  { id: "strings", label: "Strings" },
+  { id: "pe", label: "PE Browser" },
+  { id: "signatures", label: "Signatures" },
+  { id: "pointers", label: "Pointers" },
+  { id: "emulator", label: "Emulator" },
+  { id: "graph", label: "Graph" },
+  { id: "dotnet", label: ".NET" },
+  { id: "crypto", label: "Crypto" },
+  { id: "caves", label: "Code Caves" },
+  { id: "snapshots", label: "Snapshots" },
+  { id: "map", label: "Binary Map" },
+];
 
 type UiStore = {
   rail: RailView;
   tab: TabId;
   settingsOpen: boolean;
   gotoOpen: boolean;
+  paletteOpen: boolean;
+  sessionExportOpen: boolean;
+  sessionImportOpen: boolean;
   theme: Theme;
   accent: string;
   autoUpdate: boolean;
@@ -46,6 +68,9 @@ export const useUi = create<UiStore>()(
       tab: "disassembly",
       settingsOpen: false,
       gotoOpen: false,
+      paletteOpen: false,
+      sessionExportOpen: false,
+      sessionImportOpen: false,
       theme: "obsidian",
       accent: "",
       autoUpdate: true,

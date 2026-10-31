@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Bookmark, Crosshair, Fingerprint, Search } from "lucide-react";
+import { ArrowLeft, Bookmark, Crosshair, Fingerprint, Search, Tag } from "lucide-react";
 import { request } from "@/lib/client";
 import { fmtAddr, labelAddr, parseAddress, showAddr, toBig } from "@/lib/hex";
 import { xrefsTo, type LiveXref } from "@/lib/live";
 import { useConn } from "@/store/conn";
+import { useNames } from "@/store/names";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
@@ -33,6 +34,7 @@ function InsnText({ text, onGo }: { text: string; onGo: (a: string) => void }) {
 export default function DisassemblyView() {
   const { modules, target } = useConn();
   const ui = useUi();
+  const names = useNames();
   const addBookmark = useWatch((s) => s.addBookmark);
   const mainMod = modules.find((m) => m.base === target?.base)?.name ?? modules[0]?.name ?? "";
   const modName = ui.module && modules.some((m) => m.name === ui.module) ? ui.module : mainMod;
@@ -82,8 +84,24 @@ export default function DisassemblyView() {
 
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
+      const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
       if (e.altKey && e.key === "ArrowLeft") back();
-      if (e.key === "x" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) void findRefs();
+      if (typing) return;
+      if (e.key === "x") void findRefs();
+      if (e.key === "n") {
+        const addr = ui.selected ?? at;
+        if (!addr) return;
+        const cur = names.nameOf(addr);
+        const next = window.prompt("Name", cur);
+        if (next !== null) names.rename(addr, next);
+      }
+      if (e.key === ";") {
+        const addr = ui.selected ?? at;
+        if (!addr) return;
+        const cur = names.commentOf(addr);
+        const next = window.prompt("Comment", cur);
+        if (next !== null) names.comment(addr, next);
+      }
     };
     window.addEventListener("keydown", k);
     return () => window.removeEventListener("keydown", k);
@@ -118,9 +136,10 @@ export default function DisassemblyView() {
           </div>
           <VList count={shown.length} scrollTo={fnIndex} row={(i) => {
             const f = shown[i];
+            const user = names.nameOf(f.address);
             return (
               <div className="fn-row" data-selected={i === fnIndex} onClick={() => go(f.address)}>
-                <span>sub_{showAddr(f.address).replace(/^0+/, "")}</span>
+                <span className={user ? "accent" : undefined}>{user || `sub_${showAddr(f.address).replace(/^0+/, "")}`}</span>
                 <span className="faint">{f.size}</span>
               </div>
             );
@@ -134,6 +153,12 @@ export default function DisassemblyView() {
             <label className="row" style={{ fontSize: 12 }}><input type="checkbox" checked={linear} onChange={(e) => setLinear(e.target.checked)} />linear</label>
             <IconButton tip="Xrefs to selection (X)" onClick={() => void findRefs()}><Crosshair size={14} /></IconButton>
             <IconButton tip="Make signature" onClick={() => ui.goSig(ui.selected ?? at ?? "")} disabled={!at}><Fingerprint size={14} /></IconButton>
+            <IconButton tip="Rename (N)" onClick={() => {
+              const addr = ui.selected ?? at;
+              if (!addr) return;
+              const next = window.prompt("Name", names.nameOf(addr));
+              if (next !== null) names.rename(addr, next);
+            }} disabled={!at}><Tag size={14} /></IconButton>
             <IconButton tip="Bookmark" onClick={() => at && addBookmark(ui.selected ?? at)} disabled={!at}><Bookmark size={14} /></IconButton>
           </div>
           {!at ? (
@@ -141,11 +166,13 @@ export default function DisassemblyView() {
           ) : (
             <VList className="vlist listing" count={lines.length} row={(i) => {
               const l = lines[i];
+              const cmt = names.commentOf(l.address);
               return (
                 <div className="insn-row" data-selected={ui.selected === l.address} onClick={() => ui.select(l.address)}>
                   <span className="insn-va">{showAddr(l.address)}</span>
                   <span className="insn-bytes">{l.bytes.replace(/(..)/g, "$1 ").trim()}</span>
                   <InsnText text={l.text} onGo={go} />
+                  {cmt && <span className="insn-comment" title={cmt}>{cmt}</span>}
                 </div>
               );
             }} />

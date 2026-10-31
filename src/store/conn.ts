@@ -21,6 +21,9 @@ type ConnStore = {
   target: Target | null;
   modules: Module[];
   progress: Progress;
+  /** the boot splash stays until the user continues or the target is attached */
+  splash: boolean;
+  dismissSplash: () => void;
   init: () => Promise<void>;
   refreshStatus: () => Promise<void>;
   refreshModules: () => Promise<void>;
@@ -52,6 +55,8 @@ export const useConn = create<ConnStore>((set, get) => ({
   target: null,
   modules: [],
   progress: null,
+  splash: true,
+  dismissSplash: () => set({ splash: false }),
 
   init: async () => {
     if (started) return; // StrictMode mounts effects twice in dev
@@ -104,7 +109,7 @@ export const useConn = create<ConnStore>((set, get) => ({
     const r = await request<Target & { native_socket?: boolean }>("attach", by);
     log("info", "attach", `attached ${r.name ?? by.name ?? r.pid} pid ${r.pid} base ${r.base}${r.native_socket === false ? " (memory server already open)" : ""}`);
     clearImages();
-    set({ target: { pid: r.pid, base: r.base, peb: r.peb, name: r.name ?? by.name } });
+    set({ target: { pid: r.pid, base: r.base, peb: r.peb, name: r.name ?? by.name }, splash: false });
     setTimeout(() => void get().refreshStatus().then(() => get().refreshModules()), 600);
   },
 

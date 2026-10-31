@@ -77,6 +77,20 @@ export default function MemoryView() {
     const ok = await attempt("write", request("write", { address: fmtAddr(base + BigInt(off)), data: text.padStart(2, "0").toLowerCase() }));
     if (ok) setTick(tick + 1);
   };
+  /** Writes a run of bytes at the selection (or the window base). */
+  const patch = async () => {
+    const at = sel ?? base;
+    if (at === null) return log("warn", "memory", "select an address first");
+    const text = window.prompt("Bytes to write (hex, spaces optional)", "");
+    if (!text) return;
+    const clean = text.replace(/[^0-9a-f]/gi, "");
+    if (!clean || clean.length % 2 !== 0) return log("warn", "memory", "need an even number of hex digits");
+    const ok = await attempt("write", request("write", { address: fmtAddr(at), data: clean.toLowerCase() }));
+    if (ok) {
+      log("info", "write", `wrote ${clean.length / 2} bytes at ${fmtAddr(at)}`);
+      setTick(tick + 1);
+    }
+  };
 
   return (
     <NeedsAgent>
@@ -91,6 +105,7 @@ export default function MemoryView() {
             <IconButton tip="Up 0x800" onClick={() => shift(-kWindow)} disabled={base === null}><ChevronUp size={14} /></IconButton>
             <IconButton tip="Down 0x800" onClick={() => shift(kWindow)} disabled={base === null}><ChevronDown size={14} /></IconButton>
             <IconButton tip={live ? "Pause live refresh" : "Resume live refresh"} onClick={() => setLive(!live)}>{live ? <Pause size={14} /> : <Play size={14} />}</IconButton>
+            <button className="btn small" onClick={() => void patch()} disabled={base === null}>Patch bytes…</button>
             <span className="mono faint ellipsis grow">{ui.memoryAt ? labelAddr(ui.memoryAt, modules) : ""}</span>
             <span className="faint" style={{ fontSize: 12 }}>double-click a byte to edit</span>
           </div>

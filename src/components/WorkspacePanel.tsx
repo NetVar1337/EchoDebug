@@ -1,4 +1,4 @@
-import { useUi, type TabId } from "@/store/ui";
+import { useUi, kTabs, type TabId } from "@/store/ui";
 import { Boundary, Panel, Tabs } from "./ui";
 import DisassemblyView from "./views/DisassemblyView";
 import MemoryView from "./views/MemoryView";
@@ -8,17 +8,12 @@ import PeView from "./views/PeView";
 import SignaturesView from "./views/SignaturesView";
 import PointersView from "./views/PointersView";
 import EmulatorView from "./views/EmulatorView";
-
-const kTabs: { id: TabId; label: string }[] = [
-  { id: "disassembly", label: "Disassembly" },
-  { id: "memory", label: "Memory" },
-  { id: "structs", label: "Structs" },
-  { id: "strings", label: "Strings" },
-  { id: "pe", label: "PE Browser" },
-  { id: "signatures", label: "Signatures" },
-  { id: "pointers", label: "Pointers" },
-  { id: "emulator", label: "Emulator" },
-];
+import GraphView from "./views/GraphView";
+import DotnetView from "./views/DotnetView";
+import CryptoView from "./views/CryptoView";
+import CavesView from "./views/CavesView";
+import SnapshotsView from "./views/SnapshotsView";
+import BinaryMapView from "./views/BinaryMapView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -29,6 +24,12 @@ const kViews: Record<TabId, () => JSX.Element> = {
   signatures: SignaturesView,
   pointers: PointersView,
   emulator: EmulatorView,
+  graph: GraphView,
+  dotnet: DotnetView,
+  crypto: CryptoView,
+  caves: CavesView,
+  snapshots: SnapshotsView,
+  map: BinaryMapView,
 };
 
 export default function WorkspacePanel() {

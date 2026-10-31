@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
-import { Eraser, Send, Square } from "lucide-react";
+import { Crosshair, Eraser, Send, Square } from "lucide-react";
 import { chat, type ChatLine } from "@/lib/ai";
+import { kMutatingTools } from "@/lib/ai-providers";
+import { useConn } from "@/store/conn";
 import { useUi } from "@/store/ui";
 import { IconButton, Panel } from "../ui";
 
@@ -21,6 +23,10 @@ function Rich({ text }: { text: string }) {
 export default function AiPanel() {
   const ai = useUi((s) => s.ai);
   const set = useUi((s) => s.set);
+  const selected = useUi((s) => s.selected);
+  const moduleName = useUi((s) => s.module);
+  const disasmAt = useUi((s) => s.disasmAt);
+  const target = useConn((s) => s.target);
   const [lines, setLines] = useState<ChatLine[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -29,15 +35,35 @@ export default function AiPanel() {
   const end = useRef<HTMLDivElement>(null);
   useEffect(() => { end.current?.scrollIntoView({ block: "end" }); }, [lines.length]);
 
-  const send = async () => {
-    const text = input.trim();
+  const send = async (explicit?: string) => {
+    const text = (explicit ?? input).trim();
     if (!text || busy) return;
     setInput("");
     setLines((l) => [...l, { role: "user", text }]);
     setBusy(true);
     abort.current = new AbortController();
     try {
-      await chat(ai, history.current, text, (l) => setLines((x) => [...x, l]), abort.current.signal);
+      await chat(
+        ai,
+        history.current,
+        text,
+        (l) => setLines((x) => [...x, l]),
+        abort.current.signal,
+        {
+          context: {
+            target: target ? `${target.name ?? "target"} (pid ${target.pid})` : undefined,
+            module: moduleName ?? undefined,
+            selection: selected ?? undefined,
+            address: disasmAt ?? undefined,
+          },
+          // The model may ask to write memory or freeze a value: make the user confirm.
+          approval: async (name, args) => {
+            if (!kMutatingTools[name]) return true;
+            const detail = JSON.stringify(args);
+            return window.confirm(`The assistant wants to run ${name} ${detail}.\n\nAllow it?`);
+          },
+        },
+      );
     } catch (e) {
       setLines((x) => [...x, { role: "assistant", text: `⚠ ${e instanceof Error ? e.message : String(e)}` }]);
     } finally {
@@ -48,13 +74,20 @@ export default function AiPanel() {
   return (
     <Panel
       title={<>AI Assistant <span className="faint">{ai.model}</span></>}
-      actions={<IconButton tip="New conversation" onClick={() => { history.current = []; setLines([]); }}><Eraser size={14} /></IconButton>}
+      actions={
+        <>
+          <IconButton tip="Ask about the current selection" onClick={() => void send(`What is at ${selected ?? disasmAt ?? "the current address"}? Disassemble it and explain what it does.`)} disabled={!selected && !disasmAt}>
+            <Crosshair size={14} />
+          </IconButton>
+          <IconButton tip="New conversation" onClick={() => { history.current = []; setLines([]); }}><Eraser size={14} /></IconButton>
+        </>
+      }
     >
       <div className="panel-body">
         <div className="chat">
           {lines.length === 0 && (
             <div className="faint" style={{ fontSize: 12.5 }}>
-              Ask about the attached process: "what does the function at game.exe+0x1234 do?", "find the string 'PlayerController' and its xrefs".
+              Ask about the attached process: &quot;what does the function at game.exe+0x1234 do?&quot;, &quot;find the string 'PlayerController' and its xrefs&quot;.
               {!ai.apiKey && <> <span className="link" onClick={() => set({ settingsOpen: true })}>Set an API key</span> first.</>}
             </div>
           )}
