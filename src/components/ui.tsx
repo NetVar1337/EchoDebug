@@ -51,7 +51,7 @@ export function NeedsAgent({ children, ext = false }: { children: ReactNode; ext
   return <>{children}</>;
 }
 
-export function IconButton({ tip, onClick, children, disabled }: { tip: string; onClick: () => void; children: ReactNode; disabled?: boolean }) {
+export function IconButton({ tip, onClick, children, disabled }: { tip: string; onClick: (e: React.MouseEvent<HTMLButtonElement>) => void; children: ReactNode; disabled?: boolean }) {
   return (
     <button className="icon-button" data-tip={tip} aria-label={tip} onClick={onClick} disabled={disabled}>
       {children}

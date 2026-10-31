@@ -52,7 +52,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks |
 | Strings | ASCII + UTF-16 extraction, category/regex filters, CSV export, xrefs per string |
 | PE browser | Headers, sections, data directories, imports (with IAT slots), exports, **Analysis tab** with per-section entropy and packer/protector heuristics |
-| Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array output |
+| Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array / x64dbg / YARA output, saved to a catalog |
 | Pointers | Live pointer-chain resolver, bounded pointer scan whose results load straight into the resolver |
 | Call graph | The function under the cursor with its direct callees (from Echo's own disassembly) and the call sites that reference it |
 | .NET explorer | ECMA-335 metadata parsed straight out of the loaded module: namespaces, types, methods, fields, base types |
