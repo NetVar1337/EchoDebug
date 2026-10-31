@@ -4,12 +4,13 @@ import { fmtAddr, toBig } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
 import { parsePe, type PeInfo } from "@/lib/analysis/pe";
 import { detectPacker, sectionEntropies, type PackerVerdict, type SectionEntropy } from "@/lib/analysis/entropy";
+import { buildIat, type IatMap } from "@/lib/analysis/iat";
 import { attempt } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress, Tabs } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
 
-type Sub = "headers" | "sections" | "exports" | "imports" | "analysis";
+type Sub = "headers" | "sections" | "exports" | "imports" | "analysis" | "iat";
 const kLimit = 3000;
 const hx = (n: number | bigint) => "0x" + n.toString(16).toUpperCase();
 
@@ -23,6 +24,7 @@ export default function PeView() {
   const [filter, setFilter] = useState("");
   const [entropy, setEntropy] = useState<SectionEntropy[]>([]);
   const [packer, setPacker] = useState<PackerVerdict | null>(null);
+  const [iat, setIat] = useState<IatMap | null>(null);
 
   useEffect(() => {
     if (!m) return;
@@ -38,6 +40,7 @@ export default function PeView() {
         setPe(parsed);
         setEntropy(sectionEntropies(img, parsed));
         setPacker(detectPacker(img, parsed));
+        setIat(buildIat(img, toBig(m.base), parsed));
       } catch (e) { setErr(String(e)); }
     });
     return () => { live = false; };
@@ -104,6 +107,22 @@ export default function PeView() {
           ))}
         </div>
       );
+    if (sub === "iat")
+      return (
+        <table className="table mono">
+          <colgroup><col style={{ width: 160 }} /><col /><col style={{ width: 120 }} /></colgroup>
+          <thead><tr><th>DLL</th><th>Function</th><th>Slot</th></tr></thead>
+          <tbody>
+            {(iat?.entries ?? []).slice(0, kLimit).map((e) => (
+              <tr key={e.address} onClick={() => ui.select(e.address)} onDoubleClick={() => ui.goMemory(e.address)}>
+                <td className="faint ellipsis">{e.dll}</td>
+                <td className="link">{e.name}</td>
+                <td className="dim">{hx(e.rva)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      );
     return (
       <div className="panel-section">
         <div className="label">Packer / protection</div>
@@ -151,7 +170,7 @@ export default function PeView() {
           {pe && <span className="faint" style={{ fontSize: 12 }}>{pe.sections.length} sections · {pe.exports.length} exports · {pe.imports.reduce((n, d) => n + d.funcs.length, 0)} imports</span>}
         </div>
         {progress < 1 && <Progress value={progress} />}
-        <Tabs tabs={[{ id: "headers", label: "Headers" }, { id: "sections", label: "Sections" }, { id: "exports", label: "Exports" }, { id: "imports", label: "Imports" }, { id: "analysis", label: "Analysis" }]} active={sub} onSelect={setSub} />
+        <Tabs tabs={[{ id: "headers", label: "Headers" }, { id: "sections", label: "Sections" }, { id: "exports", label: "Exports" }, { id: "imports", label: "Imports" }, { id: "iat", label: "IAT" }, { id: "analysis", label: "Analysis" }]} active={sub} onSelect={setSub} />
         <div className="vlist">{body()}</div>
       </div>
     </NeedsAgent>

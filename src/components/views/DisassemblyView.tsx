@@ -5,6 +5,7 @@ import { fmtAddr, labelAddr, parseAddress, showAddr, toBig } from "@/lib/hex";
 import { xrefsTo, type LiveXref } from "@/lib/live";
 import { loadImage } from "@/lib/memory";
 import { buildIat, ripDisplacement, type IatMap } from "@/lib/analysis/iat";
+import { buildExports, type ExportMap } from "@/lib/analysis/exports";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
 import { attempt, log } from "@/store/output";
@@ -29,7 +30,16 @@ function iatSymbol(line: Line, iat: IatMap | null): string | null {
   return entry ? `${entry.dll}!${entry.name}` : null;
 }
 
-function InsnText({ text, symbol, onGo }: { text: string; symbol: string | null; onGo: (a: string) => void }) {
+/** Exported symbol for a direct branch, e.g. `CreateFileW`. */
+function exportSymbol(line: Line, expMap: ExportMap | null): string | null {
+  if (!expMap) return null;
+  const m = /\b(call|jmp)\s+(0x[0-9a-f]+)\b/i.exec(line.text);
+  if (!m) return null;
+  const entry = expMap.byAddress.get("0x" + BigInt(m[2]).toString(16));
+  return entry ? entry.name : null;
+}
+
+function InsnText({ text, symbol, exportName, onGo }: { text: string; symbol: string | null; exportName: string | null; onGo: (a: string) => void }) {
   const sp = text.indexOf(" ");
   const mn = (sp < 0 ? text : text.slice(0, sp)).toLowerCase();
   const ops = sp < 0 ? "" : text.slice(sp);
@@ -39,6 +49,7 @@ function InsnText({ text, symbol, onGo }: { text: string; symbol: string | null;
     <span className="insn-text">
       <span className={cls}>{mn}</span>
       {parts.map((p, i) => (i % 2 === 1 ? <span key={i} className="num link" onDoubleClick={() => onGo(p)} title="double-click to follow">{p}</span> : <span key={i}>{p}</span>))}
+      {exportName && <span className="iat-symbol" title="exported symbol">{exportName}</span>}
       {symbol && <span className="iat-symbol" title="resolved import">{symbol}</span>}
     </span>
   );
@@ -58,9 +69,11 @@ export default function DisassemblyView() {
   const [history, setHistory] = useState<string[]>([]);
   const [xrefs, setXrefs] = useState<{ to: string; list: LiveXref[] } | null>(null);
   const [iat, setIat] = useState<IatMap | null>(null);
+  const [expMap, setExports] = useState<ExportMap | null>(null);
   const at = ui.disasmAt;
 
-  // The IAT is per module; load it once so RIP-relative calls show their import.
+  // The IAT and the export table are per module; load them once so
+  // RIP-relative calls show their import and direct calls show their export.
   useEffect(() => {
     const m = modules.find((x) => x.name === modName);
     if (!m) return;
@@ -68,6 +81,7 @@ export default function DisassemblyView() {
     void loadImage(m).then((img) => {
       if (!live || !img) return;
       setIat(buildIat(img, toBig(m.base)));
+      setExports(buildExports(img, toBig(m.base)));
     }).catch(() => undefined);
     return () => { live = false; };
   }, [modName, modules]);
@@ -197,7 +211,7 @@ export default function DisassemblyView() {
                 <div className="insn-row" data-selected={ui.selected === l.address} onClick={() => ui.select(l.address)}>
                   <span className="insn-va">{showAddr(l.address)}</span>
                   <span className="insn-bytes">{l.bytes.replace(/(..)/g, "$1 ").trim()}</span>
-                  <InsnText text={l.text} symbol={iatSymbol(l, iat)} onGo={go} />
+                  <InsnText text={l.text} symbol={iatSymbol(l, iat)} exportName={exportSymbol(l, expMap)} onGo={go} />
                   {cmt && <span className="insn-comment" title={cmt}>{cmt}</span>}
                 </div>
               );

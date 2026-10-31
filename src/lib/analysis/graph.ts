@@ -132,8 +132,8 @@ function twoByteImmediateSize(op2: number): number {
 type RipCandidate = {
   /** Image index of the ModRM byte. */
   modrmOffset: number;
-  /** Bytes occupied by the whole instruction. */
-  instructionLength: number;
+  /** RVA of the instruction that follows the RIP-relative operand. */
+  nextInstructionRva: number;
   /** The 32-bit displacement. */
   displacement: number;
 };
@@ -153,35 +153,27 @@ function findRipRelative(img: Uint8Array, start: number, end: number): RipCandid
     if ((modrm & 0xc7) !== 0x05) continue;
     if (p + 4 >= end) continue;
 
-    let opOffset = p - 1;
-    let instructionStart = opOffset;
-    let opcode = img[opOffset];
+    const opPos = p - 1;
+    if (opPos < start) continue;
+
+    const opcode = img[opPos];
+    let immediate = 0;
 
     if (opcode === 0x0f) {
-      if (opOffset - 1 < start) continue;
-      const op2 = img[opOffset - 1];
+      if (opPos - 1 < start) continue;
+      const op2 = img[opPos - 1];
       if (!isTwoByteModrmOpcode(op2)) continue;
-      instructionStart = opOffset - 1;
-      opcode = 0x0f;
+      immediate = twoByteImmediateSize(op2);
     } else {
-      // Skip a REX prefix in front of the opcode.
-      if (opcode >= 0x40 && opcode <= 0x4f) {
-        if (opOffset - 1 < start) continue;
-        opOffset--;
-        instructionStart = opOffset;
-        opcode = img[opOffset];
-      }
       if (!isModrmOpcode(opcode)) continue;
+      // A 0x67 prefix switches to 32-bit addressing, where rm=101 is absolute.
+      if (opPos - 1 >= start && img[opPos - 1] === 0x67) continue;
+      immediate = oneByteImmediateSize(opcode, modrm);
     }
 
-    const displacement = readInt32LE(img, p + 1);
-    const immediate =
-      opcode === 0x0f ? twoByteImmediateSize(img[p - 1]) : oneByteImmediateSize(opcode, modrm);
-
-    // ModRM (1) + disp32 (4) + immediate bytes.
-    const instructionLength = (p - instructionStart) + 1 + 4 + immediate;
-
-    out.push({ modrmOffset: p, instructionLength, displacement });
+    // ModRM (1 byte) + disp32 (4 bytes) + trailing immediate bytes.
+    const nextInstructionRva = p + 5 + immediate;
+    out.push({ modrmOffset: p, nextInstructionRva, displacement: readInt32LE(img, p + 1) });
   }
 
   return out;
@@ -294,10 +286,7 @@ export function buildCallGraph(
 
     // RIP-relative memory operands.
     for (const cand of findRipRelative(img, start, end)) {
-      const endOfInstruction = cand.modrmOffset + 1 + 4 - (cand.instructionLength - 1) + cand.instructionLength;
-      const nextInsnRva = cand.modrmOffset + cand.instructionLength;
-      void endOfInstruction;
-      const targetRva = nextInsnRva + cand.displacement;
+      const targetRva = cand.nextInstructionRva + cand.displacement;
       if (targetRva < 0 || targetRva >= img.length) continue;
       const knownFn = known.get(targetRva);
       addNode(targetRva, knownFn ? "function" : "unknown");
