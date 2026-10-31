@@ -56,6 +56,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array / x64dbg / YARA output, saved to a catalog |
 | Pointers | Live pointer-chain resolver, bounded pointer scan whose results load straight into the resolver |
 | Call graph | The function under the cursor with its direct callees (from Echo's own disassembly) and the call sites that reference it |
+| Xrefs | The whole reference graph of a module indexed in one pass: who points here, what this points at, and the most referenced addresses in the binary |
 | .NET explorer | ECMA-335 metadata parsed straight out of the loaded module: namespaces, types, methods, fields, base types |
 | Crypto scanner | Finds known constant tables (AES S-box, SHA-256 K/H, MD5 T, CRC-32, Blowfish, ChaCha/Salsa sigma, TEA delta, Base64 alphabet, Rijndael mix) |
 | Code caves | Padding runs inside executable sections (0xCC / 0x90 / 0x00) with their size and section |

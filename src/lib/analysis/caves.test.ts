@@ -31,6 +31,10 @@ function fakePe(): Uint8Array {
   dv.setUint32(st + 16, 0x1000, true); // raw size
   dv.setUint32(st + 36, 0x60000020, true); // code | execute | read
 
+  // Fill the executable section with a byte that is not a cave fill, so that
+  // only the runs a test carves out are reported.
+  img.fill(0x41, 0x1000, 0x2000);
+
   return img;
 }
 
@@ -81,7 +85,7 @@ describe("caves", () => {
     const cc = caves.find((c) => c.fill === 0xcc);
     expect(zero).toBeDefined();
     expect(cc).toBeDefined();
-    expect(caves.indexOf(cc as never)).toBeLessThan(caves.indexOf(zero as never));
+    expect(caves.indexOf(cc!)).toBeLessThan(caves.indexOf(zero!));
   });
 
   it("sorts by size descending, then rva ascending", () => {
