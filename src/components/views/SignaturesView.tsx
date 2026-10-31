@@ -1,14 +1,19 @@
 import { useState } from "react";
-import { Copy, Save, Search, Trash2 } from "lucide-react";
+import { Copy, Save, Search, Trash2, Upload } from "lucide-react";
 import { request } from "@/lib/client";
 import { fmtAddr, hexToBytes, labelAddr, moduleOf, parseAddress } from "@/lib/hex";
-import { readBytes } from "@/lib/memory";
+import { loadImage, readBytes } from "@/lib/memory";
 import { makeSignature, toByteArray, toCode, toIda, trim, type Insn, type Pattern } from "@/lib/analysis/sigmaker";
+import { flirtArchName, matchFlirt, parseFlirtFile } from "@/lib/analysis/flirt";
+import { executableRanges } from "@/lib/analysis/xrefindex";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
+import { useFlirt } from "@/store/flirt";
 import { useSigs, toYara } from "@/store/sigs";
 import { useUi } from "@/store/ui";
+import { isTauri, pickBinaryFile } from "@/lib/tauri";
 import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
+import ModulePicker, { useFocusedModule } from "../ModulePicker";
 
 async function hits(pattern: string, module: string): Promise<string[]> {
   const r = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern, module, find_all: true }, true);
@@ -19,6 +24,8 @@ export default function SignaturesView() {
   const ui = useUi();
   const modules = useConn((s) => s.modules);
   const catalog = useSigs();
+  const flirt = useFlirt();
+  const focused = useFocusedModule();
   const [mode, setMode] = useState<"code" | "raw">("code");
   const [pattern, setPattern] = useState<Pattern>([]);
   const [orig, setOrig] = useState<number[]>([]); // un-wildcarded bytes, so toggles can restore them
@@ -81,6 +88,48 @@ export default function SignaturesView() {
     const f = catalogFilter.toLowerCase();
     return !f || s.name.toLowerCase().includes(f) || s.note.toLowerCase().includes(f) || s.module.toLowerCase().includes(f);
   });
+
+  /** Loads a FLIRT signature file and matches it against the focused module. */
+  const loadFlirt = async (bytes: Uint8Array, fileName: string) => {
+    try {
+      const sig = await parseFlirtFile(bytes);
+      flirt.set(fileName, sig);
+      log("info", "flirt", `${fileName}: ${sig.libraryName || "signature set"} (${flirtArchName(sig.arch)})`);
+      await applyFlirt();
+    } catch (e) {
+      flirt.clear();
+      log("error", "flirt", `${fileName}: ${(e as Error).message}`);
+    }
+  };
+
+  /** Matches the loaded signature set against the focused module image. */
+  const applyFlirt = async () => {
+    if (!flirt.signature || !focused) return;
+    const img = await attempt("flirt", loadImage(focused));
+    if (!img) return;
+    const matches = matchFlirt(flirt.signature, img, BigInt(focused.base), executableRanges(img));
+    flirt.setMatches(matches);
+    const verified = matches.filter((m) => m.crcVerified).length;
+    log("info", "flirt", `${matches.length} matches in ${focused.name}${verified ? ` (${verified} CRC verified)` : ""}`);
+  };
+
+  const pickFlirt = async () => {
+    if (isTauri()) {
+      const bytes = await pickBinaryFile(["sig"], "FLIRT signature file");
+      if (bytes) await loadFlirt(bytes, "signature set");
+      return;
+    }
+    // Browser fallback: a file input.
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".sig";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      await loadFlirt(new Uint8Array(await file.arrayBuffer()), file.name);
+    };
+    input.click();
+  };
 
   return (
     <NeedsAgent>
@@ -154,6 +203,31 @@ export default function SignaturesView() {
                 <tbody>{found.map((a) => <tr key={a} onClick={() => ui.select(a)} onDoubleClick={() => ui.goDisasm(a)}><td className="link">{labelAddr(a, modules)}</td></tr>)}</tbody>
               </table>
             )}
+            <div className="panel-section">
+              <div className="label">FLIRT signature set</div>
+              <div className="row">
+                <ModulePicker />
+                <button className="btn" onClick={() => void pickFlirt()}><Upload size={12} /> Load .sig</button>
+                {flirt.fileName && <button className="btn" onClick={() => void applyFlirt()}>Re-scan</button>}
+                <span className="faint mono ellipsis grow">
+                  {flirt.fileName ? `${flirt.fileName} · ${flirt.signature?.libraryName || "?"} · ${flirt.matches.length} matches` : "no signature set loaded"}
+                </span>
+              </div>
+              {flirt.matches.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>Address</th><th>Function</th><th>Size</th></tr></thead>
+                  <tbody>
+                    {flirt.matches.map((m) => (
+                      <tr key={`${m.rva}-${m.name}`} onClick={() => ui.goDisasm(m.address)}>
+                        <td className="link">{labelAddr(m.address, modules)}</td>
+                        <td>{m.name}{m.crcVerified ? <span className="faint"> ✓</span> : null}</td>
+                        <td className="dim">{m.functionLength ? "0x" + m.functionLength.toString(16) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
         </div>
       </div>

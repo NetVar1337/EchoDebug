@@ -83,6 +83,12 @@ fn read_text_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path))
 }
 
+/// Reads a binary file the user picked (FLIRT signature databases).
+#[tauri::command]
+fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
+    fs::read(&path).map_err(|e| format!("read {}: {e}", path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -128,7 +134,8 @@ pub fn run() {
             install_agent,
             scripts_dir,
             write_text_file,
-            read_text_file
+            read_text_file,
+            read_binary_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

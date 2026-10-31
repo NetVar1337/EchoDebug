@@ -31,3 +31,16 @@ export async function openUrl(url: string): Promise<void> {
   const { openUrl: open } = await import("@tauri-apps/plugin-opener");
   await open(url);
 }
+
+/**
+ * Picks a file and returns its bytes. In the desktop app the native picker is
+ * used; in a browser the caller falls back to a file input.
+ */
+export async function pickBinaryFile(extensions: string[], title: string): Promise<Uint8Array | null> {
+  if (!isTauri()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const path = await open({ title, multiple: false, filters: [{ name: title, extensions }] });
+  if (!path || typeof path !== "string") return null;
+  const bytes = await invoke<number[]>("read_binary_file", { path });
+  return new Uint8Array(bytes);
+}
