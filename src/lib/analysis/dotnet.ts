@@ -276,11 +276,13 @@ function parseMetadataRoot(dv: DataView, base: number): MetaRoot | null {
 /* table stream decoding                                               */
 /* ------------------------------------------------------------------ */
 
+// ECMA-335 II.24.2.6: a coded index is 2 bytes wide when the largest row count
+// of the referenced tables is below 2^(16 - tagBits), 4 bytes otherwise.
 function codedWidth(coded: string, counts: number[]): number {
   const def = kCoded[coded];
   let max = 0;
   for (const t of def.tables) if (t >= 0) max = Math.max(max, counts[t] ?? 0);
-  return max <= (1 << def.bits) - 1 ? 2 : 4;
+  return max < 1 << (16 - def.bits) ? 2 : 4;
 }
 
 function colWidth(kind: ColKind, counts: number[], heapSizes: number): number {

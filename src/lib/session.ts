@@ -6,6 +6,7 @@ import { isTauri } from "./tauri";
 import { useUi, type AiProvider } from "@/store/ui";
 import { useWatch, type WatchEntry, type Bookmark } from "@/store/watch";
 import { useNames, type NameEntry } from "@/store/names";
+import { useTypes, type TypeDef } from "@/store/types";
 import { log } from "@/store/output";
 
 export type SessionFile = {
@@ -22,20 +23,12 @@ export type SessionFile = {
   watches: WatchEntry[];
   bookmarks: Bookmark[];
   names: NameEntry[];
-  struct: unknown;
+  types: TypeDef[];
 };
-
-const kStructKey = "echodebug.struct";
 
 export function buildSession(): SessionFile {
   const ui = useUi.getState();
   const w = useWatch.getState();
-  let struct: unknown = null;
-  try {
-    struct = JSON.parse(localStorage.getItem(kStructKey) ?? "null");
-  } catch {
-    struct = null;
-  }
   return {
     format: "echodebug.session",
     version: 1,
@@ -51,7 +44,7 @@ export function buildSession(): SessionFile {
     watches: w.watches,
     bookmarks: w.bookmarks,
     names: useNames.getState().names,
-    struct,
+    types: useTypes.getState().types,
   };
 }
 
@@ -108,7 +101,7 @@ export function applySession(data: SessionFile): boolean {
   const w = useWatch.getState();
   w.setWatches(data.watches ?? [], data.bookmarks ?? []);
   useNames.getState().setNames(data.names ?? []);
-  if (data.struct) localStorage.setItem(kStructKey, JSON.stringify(data.struct));
-  log("info", "session", `imported (${(data.watches ?? []).length} watches, ${(data.names ?? []).length} names)`);
+  useTypes.getState().setTypes(data.types ?? []);
+  log("info", "session", `imported (${(data.watches ?? []).length} watches, ${(data.names ?? []).length} names, ${(data.types ?? []).length} types)`);
   return true;
 }
