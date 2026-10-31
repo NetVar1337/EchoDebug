@@ -3,6 +3,8 @@ import { ArrowLeft, Bookmark, Crosshair, Fingerprint, Search, Tag } from "lucide
 import { request } from "@/lib/client";
 import { fmtAddr, labelAddr, parseAddress, showAddr, toBig } from "@/lib/hex";
 import { xrefsTo, type LiveXref } from "@/lib/live";
+import { loadImage } from "@/lib/memory";
+import { buildIat, ripDisplacement, type IatMap } from "@/lib/analysis/iat";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
 import { attempt, log } from "@/store/output";
@@ -17,7 +19,17 @@ export type Line = { address: string; length: number; bytes: string; text: strin
 const fnCache = new Map<string, Fn[]>();
 const kBranch = /^(j[a-z]+|call|loop[a-z]*)$/;
 
-function InsnText({ text, onGo }: { text: string; onGo: (a: string) => void }) {
+/** IAT symbol for a RIP-relative operand, e.g. `KERNEL32.CreateFileW`. */
+function iatSymbol(line: Line, iat: IatMap | null): string | null {
+  if (!iat) return null;
+  const disp = ripDisplacement(line.text);
+  if (disp === null) return null;
+  const target = toBig(line.address) + BigInt(line.length) + disp;
+  const entry = iat.byAddress.get("0x" + target.toString(16));
+  return entry ? `${entry.dll}!${entry.name}` : null;
+}
+
+function InsnText({ text, symbol, onGo }: { text: string; symbol: string | null; onGo: (a: string) => void }) {
   const sp = text.indexOf(" ");
   const mn = (sp < 0 ? text : text.slice(0, sp)).toLowerCase();
   const ops = sp < 0 ? "" : text.slice(sp);
@@ -27,6 +39,7 @@ function InsnText({ text, onGo }: { text: string; onGo: (a: string) => void }) {
     <span className="insn-text">
       <span className={cls}>{mn}</span>
       {parts.map((p, i) => (i % 2 === 1 ? <span key={i} className="num link" onDoubleClick={() => onGo(p)} title="double-click to follow">{p}</span> : <span key={i}>{p}</span>))}
+      {symbol && <span className="iat-symbol" title="resolved import">{symbol}</span>}
     </span>
   );
 }
@@ -44,7 +57,20 @@ export default function DisassemblyView() {
   const [linear, setLinear] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [xrefs, setXrefs] = useState<{ to: string; list: LiveXref[] } | null>(null);
+  const [iat, setIat] = useState<IatMap | null>(null);
   const at = ui.disasmAt;
+
+  // The IAT is per module; load it once so RIP-relative calls show their import.
+  useEffect(() => {
+    const m = modules.find((x) => x.name === modName);
+    if (!m) return;
+    let live = true;
+    void loadImage(m).then((img) => {
+      if (!live || !img) return;
+      setIat(buildIat(img, toBig(m.base)));
+    }).catch(() => undefined);
+    return () => { live = false; };
+  }, [modName, modules]);
 
   useEffect(() => {
     if (!modName) return;
@@ -171,7 +197,7 @@ export default function DisassemblyView() {
                 <div className="insn-row" data-selected={ui.selected === l.address} onClick={() => ui.select(l.address)}>
                   <span className="insn-va">{showAddr(l.address)}</span>
                   <span className="insn-bytes">{l.bytes.replace(/(..)/g, "$1 ").trim()}</span>
-                  <InsnText text={l.text} onGo={go} />
+                  <InsnText text={l.text} symbol={iatSymbol(l, iat)} onGo={go} />
                   {cmt && <span className="insn-comment" title={cmt}>{cmt}</span>}
                 </div>
               );
