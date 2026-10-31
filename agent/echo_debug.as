@@ -71,6 +71,8 @@ const uint64 EMU_CODE_MAX = 0x100000;
 const int64 EMU_MAX_INSNS = 5000000;
 const int64 EMU_MAX_TIMEOUT_US = 5000000;
 const int64 EMU_MAX_TRACE = 100000;
+const uint EMU_MAX_BLOBS = 64;           // injected / read-back memory blobs
+const uint64 EMU_MAX_BLOB_BYTES = 0x10000; // 64 KiB per blob
 
 // Value types
 const int VT_U8 = 0;
@@ -1994,6 +1996,50 @@ void h_emulate(json_obj@ r, int64 id)
     uint64 h = blank ? uc::create() : uc::create_process();
     if (h == 0) { send_error(id, E_FAILED, "emulator creation failed"); return; }
 
+    // Memory blobs: "write" injects bytes before the run, "read" reads them back after.
+    array<uint64> waddrs;
+    array<array<uint8> > wdata;
+    array<uint64> raddrs;
+    array<uint64> rsizes;
+    if (has_key(r, "write"))
+    {
+        if (r.type("write") != json_type::array) { uc::close(h); bad_args(id, "write must be an array"); return; }
+        json_obj@ arr = r.get_obj("write");
+        if (arr.length() > EMU_MAX_BLOBS) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "at most 64 write blobs"); return; }
+        for (uint i = 0; i < arr.length(); i++)
+        {
+            json_obj@ blob = arr.get_obj_at(i);
+            if (blob is null) { uc::close(h); bad_args(id, "write entries must be objects"); return; }
+            uint64 a;
+            if (!get_addr(blob, "address", a)) { uc::close(h); bad_args(id, "write entries need an address"); return; }
+            string hex;
+            if (!opt_str(blob, "data", "", hex)) { uc::close(h); bad_args(id, "write entries need hex data"); return; }
+            array<uint8> bytes;
+            if (!parse_hex_bytes(hex, bytes) || bytes.length() == 0) { uc::close(h); bad_args(id, "write data must be non-empty hex"); return; }
+            if (bytes.length() > EMU_MAX_BLOB_BYTES) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "a write blob is limited to 64 KiB"); return; }
+            waddrs.insertLast(a);
+            wdata.insertLast(bytes);
+        }
+    }
+    if (has_key(r, "read"))
+    {
+        if (r.type("read") != json_type::array) { uc::close(h); bad_args(id, "read must be an array"); return; }
+        json_obj@ arr = r.get_obj("read");
+        if (arr.length() > EMU_MAX_BLOBS) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "at most 64 read blobs"); return; }
+        for (uint i = 0; i < arr.length(); i++)
+        {
+            json_obj@ blob = arr.get_obj_at(i);
+            if (blob is null) { uc::close(h); bad_args(id, "read entries must be objects"); return; }
+            uint64 a;
+            if (!get_addr(blob, "address", a)) { uc::close(h); bad_args(id, "read entries need an address"); return; }
+            uint64 n = EMU_MAX_BLOB_BYTES;
+            if (!opt_addr(blob, "size", n, n)) { uc::close(h); bad_args(id, "read size must be an address or number"); return; }
+            if (n == 0 || n > EMU_MAX_BLOB_BYTES) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "read size must be 1..65536"); return; }
+            raddrs.insertLast(a);
+            rsizes.insertLast(n);
+        }
+    }
+
     bool ok = true;
     if (blank)
     {
@@ -2010,6 +2056,18 @@ void h_emulate(json_obj@ r, int64 id)
     g_emu_trace_on = trace;
     g_emu_trace_limit = uint(tlim);
     ok = ok && uc::hook_code(h, @emu_hook);
+    // Inject the blobs before the run: map the page if the emulator has not faulted it in yet.
+    for (uint i = 0; i < waddrs.length() && ok; i++)
+    {
+        uint64 a = waddrs[i];
+        if (uc::mem_query(h, a) < 0)
+        {
+            uint64 page = a & ~uint64(0xFFF);
+            uint64 span = align_up(a + wdata[i].length(), 0x1000) - page;
+            ok = uc::mem_map(h, page, span, uint(uc::prot::all));
+        }
+        if (ok) ok = uc::mem_write(h, a, wdata[i]);
+    }
     for (uint i = 0; i < rnames.length() && ok; i++)
     {
         x86_reg reg;
@@ -2039,6 +2097,21 @@ void h_emulate(json_obj@ r, int64 id)
         regs_out.set(names[i], hex_addr(v));
     }
     uint64 fault = uc::fault_address(h);
+
+    // Read the requested blobs back before the handle is closed.
+    json_obj@ mem_out = json::array();
+    for (uint i = 0; i < raddrs.length(); i++)
+    {
+        array<uint8> bytes;
+        bytes.resize(rsizes[i]);
+        bool got = uc::mem_read(h, raddrs[i], uint(rsizes[i]), bytes);
+        json_obj@ entry = json_obj();
+        entry.set("address", hex_addr(raddrs[i]));
+        entry.set("size", rsizes[i]);
+        entry.set("ok", got);
+        entry.set("data", got ? hex_of(bytes, 0, uint(rsizes[i])) : "");
+        mem_out.push(entry);
+    }
     uc::close(h);
 
     json_obj@ tr = json::array();
@@ -2051,6 +2124,7 @@ void h_emulate(json_obj@ r, int64 id)
     o.set("regs", regs_out);
     o.set("trace", tr);
     o.set("instructions", g_emu_count);
+    o.set("mem", mem_out);
     // Unicorn reports a timeout or instruction-limit stop as "ok"; this tells them apart.
     o.set("reached_end", res == uc::error::ok && rip == stop_at);
     send_json(o);
