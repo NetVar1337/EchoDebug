@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, Map as MapIcon, Pause, Play, Search } from "lucide-react";
 import { request } from "@/lib/client";
-import { fmtAddr, labelAddr, parseAddress, showAddr, toBig } from "@/lib/hex";
+import { bytesToHex, fmtAddr, labelAddr, parseAddress, showAddr, toBig } from "@/lib/hex";
 import { readBytes } from "@/lib/memory";
 import { useConn } from "@/store/conn";
+import { usePatches } from "@/store/patches";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent } from "../ui";
@@ -56,6 +57,7 @@ function Regions({ onPick }: { onPick: (a: string) => void }) {
 export default function MemoryView() {
   const ui = useUi();
   const modules = useConn((s) => s.modules);
+  const patches = usePatches();
   const base = ui.memoryAt ? toBig(ui.memoryAt) & ~0xfn : null;
   const [data, setData] = useState<Uint8Array | null>(null);
   const prev = useRef<Uint8Array | null>(null);
@@ -88,11 +90,31 @@ export default function MemoryView() {
   };
   const shift = (d: number) => base !== null && ui.goMemory(fmtAddr(base + BigInt(d) < 0n ? 0n : base + BigInt(d)));
   const sel = ui.selected ? toBig(ui.selected) : null;
+  /** Writes bytes and records the previous content so the write can be reverted. */
+  const writeBytes = async (addr: bigint, data: string, note: string): Promise<boolean> => {
+    const before = await attempt("write", readBytes(addr, data.length / 2));
+    if (!before) {
+      log("error", "write", "could not read the current bytes");
+      return false;
+    }
+    const ok = await attempt("write", request("write", { address: fmtAddr(addr), data }));
+    if (!ok) return false;
+    patches.add({
+      id: Math.random().toString(36).slice(2, 10),
+      address: fmtAddr(addr),
+      written: data,
+      before: bytesToHex(before),
+      note,
+      created: Date.now(),
+      reverted: false,
+    });
+    setTick(tick + 1);
+    return true;
+  };
   const write = async (off: number, text: string) => {
     setEdit(null);
     if (base === null || !/^[0-9a-f]{1,2}$/i.test(text)) return;
-    const ok = await attempt("write", request("write", { address: fmtAddr(base + BigInt(off)), data: text.padStart(2, "0").toLowerCase() }));
-    if (ok) setTick(tick + 1);
+    await writeBytes(base + BigInt(off), text.padStart(2, "0").toLowerCase(), "memory view");
   };
   /** Writes a run of bytes at the selection (or the window base). */
   const patch = async () => {
@@ -102,11 +124,8 @@ export default function MemoryView() {
     if (!text) return;
     const clean = text.replace(/[^0-9a-f]/gi, "");
     if (!clean || clean.length % 2 !== 0) return log("warn", "memory", "need an even number of hex digits");
-    const ok = await attempt("write", request("write", { address: fmtAddr(at), data: clean.toLowerCase() }));
-    if (ok) {
-      log("info", "write", `wrote ${clean.length / 2} bytes at ${fmtAddr(at)}`);
-      setTick(tick + 1);
-    }
+    const ok = await writeBytes(at, clean.toLowerCase(), "memory view");
+    if (ok) log("info", "write", `wrote ${clean.length / 2} bytes at ${fmtAddr(at)}`);
   };
 
   return (

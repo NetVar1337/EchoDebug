@@ -213,6 +213,10 @@ button:disabled { opacity: 0.45; cursor: default; }
 .entropy-bar { display: inline-block; width: 90px; height: 6px; margin-left: 8px; vertical-align: middle; background: var(--bg-2); border-radius: 3px; overflow: hidden; }
 .entropy-bar > span { display: block; height: 100%; background: var(--accent); }
 .entropy-bar > span[data-hot="true"] { background: var(--danger); }
+.risk-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--text-faint); }
+.risk-dot[data-level="high"] { background: var(--danger); }
+.risk-dot[data-level="medium"] { background: var(--warning); }
+.risk-dot[data-level="low"] { background: var(--accent); }
 
 
 /* --- hex ------------------------------------------------------------------ */

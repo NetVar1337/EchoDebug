@@ -3,14 +3,13 @@
 import { useMemo, useState } from "react";
 import { Pencil, Trash2 } from "lucide-react";
 import { readBytes } from "@/lib/memory";
-import { fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
+import { fmtAddr, labelAddr, parseAddress } from "@/lib/hex";
+import { diffRange, type DiffEntry } from "@/lib/analysis/snapshot";
 import { decodeBytes, encodeBytes, useSnapshots, type Snapshot } from "@/store/snapshots";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent } from "../ui";
-
-type Row = { offset: number; address: string; before: number; after: number };
 
 const kSizes = [0x100, 0x400, 0x1000, 0x10000];
 
@@ -22,7 +21,7 @@ export default function SnapshotsView() {
   const [size, setSize] = useState(0x100);
   const [a, setA] = useState<string | null>(null);
   const [b, setB] = useState<string | null>(null);
-  const [rows, setRows] = useState<Row[]>([]);
+  const [rows, setRows] = useState<DiffEntry[]>([]);
 
   const capture = async () => {
     const addr = parseAddress(at, modules);
@@ -45,14 +44,7 @@ export default function SnapshotsView() {
     const sa = snaps.snapshots.find((s) => s.id === a);
     const sb = snaps.snapshots.find((s) => s.id === b);
     if (!sa || !sb) return;
-    const ba = decodeBytes(sa.data);
-    const bb = decodeBytes(sb.data);
-    const base = toBig(sa.address);
-    const out: Row[] = [];
-    const n = Math.min(ba.length, bb.length);
-    for (let i = 0; i < n; i++) {
-      if (ba[i] !== bb[i]) out.push({ offset: i, address: fmtAddr(base + BigInt(i)), before: ba[i], after: bb[i] });
-    }
+    const out = diffRange(decodeBytes(sa.data), decodeBytes(sb.data), sa.address);
     setRows(out);
     log("info", "snapshot", `${out.length} differing bytes`);
   };

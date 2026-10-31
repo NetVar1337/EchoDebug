@@ -14,6 +14,8 @@ import CryptoView from "./views/CryptoView";
 import CavesView from "./views/CavesView";
 import SnapshotsView from "./views/SnapshotsView";
 import BinaryMapView from "./views/BinaryMapView";
+import PatchesView from "./views/PatchesView";
+import TriageView from "./views/TriageView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -30,6 +32,8 @@ const kViews: Record<TabId, () => JSX.Element> = {
   caves: CavesView,
   snapshots: SnapshotsView,
   map: BinaryMapView,
+  patches: PatchesView,
+  triage: TriageView,
 };
 
 export default function WorkspacePanel() {

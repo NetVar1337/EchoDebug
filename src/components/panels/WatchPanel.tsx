@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import { Lock, LockOpen, Plus, X } from "lucide-react";
 import { request } from "@/lib/client";
 import { readMany } from "@/lib/batch";
-import { bytesToHex, fmtAddr, labelAddr, parseAddress } from "@/lib/hex";
+import { bytesToHex, fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
 import { decode, encode, kSizes, type ValueType } from "@/lib/analysis/values";
+import { readBytes } from "@/lib/memory";
 import { useConn } from "@/store/conn";
+import { usePatches } from "@/store/patches";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry } from "@/store/watch";
@@ -15,6 +17,7 @@ const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64
 export default function WatchPanel() {
   const w = useWatch();
   const { agent, modules } = useConn();
+  const patches = usePatches();
   const ui = useUi();
   const [values, setValues] = useState<Record<string, Uint8Array | null>>({});
   const [newAddr, setNewAddr] = useState("");
@@ -40,8 +43,21 @@ export default function WatchPanel() {
 
   const write = async (e: WatchEntry, text: string) => {
     try {
-      const data = bytesToHex(encode(text, e.type));
+      const bytes = encode(text, e.type);
+      const data = bytesToHex(bytes);
+      const before = await readBytes(toBig(e.address), bytes.length).catch(() => null);
       await request("write", { address: e.address, data });
+      if (before) {
+        patches.add({
+          id: Math.random().toString(36).slice(2, 10),
+          address: e.address,
+          written: data,
+          before: bytesToHex(before),
+          note: "watchlist",
+          created: Date.now(),
+          reverted: false,
+        });
+      }
       if (e.frozen) await request("freeze", { address: e.address, data, enabled: true });
     } catch (err) {
       log("error", "write", String(err));

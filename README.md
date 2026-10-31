@@ -60,6 +60,8 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Code caves | Padding runs inside executable sections (0xCC / 0x90 / 0x00) with their size and section |
 | Snapshots | Capture a window of process memory, diff two captures byte by byte |
 | Binary map | Module section layout as a proportional bar plus the live region map with protection flags |
+| Patches | Every write EchoDebug makes is journalled with the bytes that were there before, and can be reverted with one click |
+| Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
 | AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Mistral, DeepSeek, Ollama, LM Studio); the model drives the same 29 tools as MCP, sees the current target/module/selection, and asks before running a mutating tool |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 29 tools |

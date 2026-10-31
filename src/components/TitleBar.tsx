@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { Minus, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import iconUrl from "@/assets/icon.png";
-import { useUi, type TabId, type Theme } from "@/store/ui";
+import { useUi, kTabs, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
 import { useConn } from "@/store/conn";
 import { openUrl } from "@/lib/tauri";
@@ -14,12 +14,6 @@ type MenuName = "File" | "View" | "Window" | "Theme" | "Help";
 type Item = { label: string; hint?: string; run: () => void; checked?: boolean } | "sep";
 
 const kRepo = "https://github.com/NetVar1337/EchoDebug";
-const kTabs: [TabId, string][] = [
-  ["disassembly", "Disassembly"], ["memory", "Memory"], ["structs", "Structs"], ["strings", "Strings"],
-  ["pe", "PE Browser"], ["signatures", "Signatures"], ["pointers", "Pointers"], ["emulator", "Emulator"],
-  ["graph", "Graph"], ["dotnet", ".NET"], ["crypto", "Crypto"], ["caves", "Code Caves"],
-  ["snapshots", "Snapshots"], ["map", "Binary Map"],
-];
 const kThemes: [Theme, string][] = [["obsidian", "Obsidian"], ["nord", "Nord"], ["blood-orange", "Blood Orange"]];
 
 async function windowAction(action: "minimize" | "toggleMaximize" | "close") {
@@ -90,7 +84,7 @@ export default function TitleBar() {
         { label: "Exit", hint: "Alt+F4", run: () => void windowAction("close") },
       ])}
       {menu("View", [
-        ...kTabs.map(([id, label]) => ({ label, run: () => ui.setTab(id), checked: ui.tab === id })),
+        ...kTabs.map((t) => ({ label: t.label, run: () => ui.setTab(t.id), checked: ui.tab === t.id })),
         "sep",
         { label: "Go to address…", hint: "Ctrl+G", run: () => ui.set({ gotoOpen: true }) },
         { label: "Command palette…", hint: "Ctrl+Shift+P", run: () => ui.set({ paletteOpen: true }) },
