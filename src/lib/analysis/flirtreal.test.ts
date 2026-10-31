@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { flirtArchName, matchFlirt, parseFlirtFile } from "./flirt";
 
 // The signature files that ship with IDA. They are the ground truth for the
 // parser: v5 is uncompressed, v7 is zlib and v10 is zlib as well.
-const kSigDir = "C:/Program Files/IDA Professional 9.5/sig/pc";
+const kSigDir = process.env.ECHODEBUG_FLIRT_SIG_DIR ?? "C:/Program Files/IDA Professional 9.5/sig/pc";
+// The directory only exists on a machine with IDA installed.
+const kAvailable = existsSync(kSigDir);
 
 function load(name: string): Uint8Array {
   return new Uint8Array(readFileSync(`${kSigDir}/${name}`));
@@ -19,7 +21,7 @@ function has(name: string): boolean {
   }
 }
 
-describe("flirt against the real IDA signature files", () => {
+describe.skipIf(!kAvailable)("flirt against the real IDA signature files", () => {
   it("reads an uncompressed v5 signature file", async () => {
     if (!has("aztec.sig")) return;
     const sig = await parseFlirtFile(load("aztec.sig"));
