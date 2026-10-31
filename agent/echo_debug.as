@@ -21,7 +21,7 @@
 //   * A published ScanState is never mutated again. Jobs build a new one and swap the handle, so
 //     readers only hold g_scan_mx long enough to copy the handle (pattern from the Echo docs).
 
-const string AGENT_VERSION = "0.2.0";
+const string AGENT_VERSION = "0.3.0";
 const int RELAY_PORT = 47110;
 const string AUTO_ATTACH = "";   // optional process name to attach on load
 
