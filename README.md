@@ -48,7 +48,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Disassembly | Function list (`enumerate_functions`), virtualized listing, clickable branch targets with history, xrefs (rel32 + RIP-relative), make-signature, bookmarks, user names and comments |
 | Memory | Live hex/ASCII view with change highlighting, in-place byte writes, region map with r/w/x flags, data inspector |
 | Structs | ReClass-style typed fields, follow pointers, RTTI class names, C++ header export |
-| RTTI | Every class the module declares, with its base class and the vftables that belong to it |
+| RTTI | Every class the module declares, with its base class and the vftables that belong to it; resolve any live object to its vtable and the virtual functions behind it |
 | Scanner | Cheat Engine-style first/next value scan (u8–u64, i8–i64, f32/f64, bytes, string, wstring; exact/unknown/changed/increased/…), AOB (IDA pattern) scan, string scan |
 | Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks |
 | Strings | ASCII + UTF-16 extraction, category/regex filters, CSV export, xrefs per string |

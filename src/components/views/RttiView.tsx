@@ -1,10 +1,11 @@
 // RTTI class inventory: every class the module declares, with its base class
 // and the vftables that belong to it.
 import { useEffect, useMemo, useState } from "react";
-import { Search } from "lucide-react";
+import { Crosshair, Search } from "lucide-react";
 import { labelAddr } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
 import { buildRtti, findVftables, type RttiClass, type RttiInventory } from "@/lib/analysis/rtti";
+import { resolveVirtualCalls, type VObject } from "@/lib/analysis/vtable";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
@@ -20,6 +21,9 @@ export default function RttiView() {
   const [filter, setFilter] = useState("");
   const [sel, setSel] = useState<RttiClass | null>(null);
   const [vfts, setVfts] = useState<RttiClass["vftables"]>([]);
+  const [objAddr, setObjAddr] = useState("");
+  const [obj, setObj] = useState<VObject | null>(null);
+  const [objBusy, setObjBusy] = useState(false);
 
   useEffect(() => {
     if (!m) return;
@@ -51,6 +55,19 @@ export default function RttiView() {
     setVfts(findVftables(img, BigInt(m.base), c));
   };
 
+  const resolveObject = async () => {
+    const a = objAddr.trim();
+    if (!a) return;
+    setObjBusy(true);
+    setObj(null);
+    const r = await attempt("vtable", resolveVirtualCalls(a, modules));
+    setObjBusy(false);
+    if (!r) return;
+    setObj(r);
+    if (r.failed) log("warn", "vtable", r.failed);
+    else log("info", "vtable", `${r.className || "object"} at ${r.vtable}, ${r.slots.length} virtual slots`);
+  };
+
   return (
     <NeedsAgent>
       <div className="split-h" style={{ ["--fn-w" as string]: "380px" }}>
@@ -76,12 +93,42 @@ export default function RttiView() {
           </div>
         </div>
         <div className="list-col vlist" style={{ borderRight: "none" }}>
-          {!sel ? (
-            <div className="empty">
-              <div className="empty-title">Pick a class.</div>
-              <div className="empty-hint">Every class the module declares is listed here, with the vftables that belong to it.</div>
-            </div>
-          ) : (
+          <div className="toolbar">
+            <span className="panel-title">Resolve an object</span>
+            <span className="grow" />
+            <input className="input mono" style={{ width: 180 }} placeholder="object address" value={objAddr} onChange={(e) => setObjAddr(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void resolveObject(); }} />
+            <button className="btn" onClick={() => void resolveObject()} disabled={objBusy || !objAddr.trim()}><Crosshair size={13} /> Resolve</button>
+          </div>
+          {obj && obj.failed && <div className="panel-section"><div className="warn">{obj.failed}</div></div>}
+          {obj && !obj.failed && (
+            <>
+              <div className="panel-section">
+                <div className="label">{obj.className || "Unnamed object"}</div>
+                <div className="kv">
+                  <span>object</span><span className="mono link" onClick={() => ui.goMemory(obj.object)}>{obj.object}</span>
+                  <span>vtable</span><span className="mono link" onClick={() => ui.goMemory(obj.vtable)}>{obj.vtable}</span>
+                  <span>base</span><span>{obj.baseName || "—"}</span>
+                </div>
+              </div>
+              <div className="panel-section">
+                <div className="label">Virtual functions</div>
+                <table className="table mono">
+                  <thead><tr><th>#</th><th>Target</th><th>Module</th><th>Offset</th></tr></thead>
+                  <tbody>
+                    {obj.slots.map((s) => (
+                      <tr key={s.index} onClick={() => ui.goDisasm(s.target)}>
+                        <td className="dim">{s.index}</td>
+                        <td className="link">{s.target}</td>
+                        <td>{s.module || "—"}</td>
+                        <td className="dim">{s.offset}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+          {sel && (
             <>
               <div className="panel-section">
                 <div className="label">{sel.name}</div>

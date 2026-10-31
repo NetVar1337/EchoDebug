@@ -6,7 +6,7 @@ import { labelAddr } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
 import { buildIat, type IatEntry } from "@/lib/analysis/iat";
 import { classifyImports, type RiskHit } from "@/lib/analysis/risk";
-import { xrefsTo, type LiveXref } from "@/lib/live";
+import { buildXrefIndex, executableRanges, type XrefIndex } from "@/lib/analysis/xrefindex";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
@@ -21,7 +21,8 @@ export default function TriageView() {
   const [progress, setProgress] = useState(1);
   const [filter, setFilter] = useState("");
   const [sel, setSel] = useState<IatEntry | null>(null);
-  const [refs, setRefs] = useState<LiveXref[] | null>(null);
+  const [idx, setIdx] = useState<XrefIndex | null>(null);
+  const [refs, setRefs] = useState<{ rva: number; kind: string }[] | null>(null);
 
   useEffect(() => {
     if (!m) return;
@@ -33,6 +34,9 @@ export default function TriageView() {
       setProgress(1);
       const found = classifyImports(buildIat(img, BigInt(m.base)));
       setHits(found);
+      // The reference index is built once here; every import then resolves
+      // its callsites from it instead of rescanning the image.
+      setIdx(buildXrefIndex(img, executableRanges(img)));
       const high = found.filter((h) => h.level === "high").length;
       log("info", "triage", `${found.length} notable imports in ${m.name} (${high} high risk)`);
     });
@@ -44,11 +48,15 @@ export default function TriageView() {
     return hits.filter((h) => !f || h.entry.name.toLowerCase().includes(f) || h.why.includes(f) || h.entry.dll.toLowerCase().includes(f));
   }, [hits, filter]);
 
-  const showRefs = async (e: IatEntry) => {
+  const showRefs = (e: IatEntry) => {
     setSel(e);
-    setRefs(null);
-    const list = await attempt("xrefs", xrefsTo(e.address, modules));
-    if (list) setRefs(list);
+    if (!idx || !m) {
+      setRefs(null);
+      return;
+    }
+    const rva = Number(BigInt(e.address) - BigInt(m.base));
+    const list = (idx.to.get(rva) ?? []).map((x) => ({ rva: x.fromRva, kind: x.kind }));
+    setRefs(list);
   };
 
   return (
@@ -98,8 +106,8 @@ export default function TriageView() {
                 <thead><tr><th>Callsite</th><th>Kind</th></tr></thead>
                 <tbody>
                   {(refs ?? []).map((x) => (
-                    <tr key={x.rva} onClick={() => ui.goDisasm("0x" + x.address.toString(16))}>
-                      <td className="link">{labelAddr("0x" + x.address.toString(16), modules)}</td>
+                    <tr key={x.rva} onClick={() => ui.goDisasm("0x" + (BigInt(m?.base ?? "0x0") + BigInt(x.rva)).toString(16))}>
+                      <td className="link">{labelAddr("0x" + (BigInt(m?.base ?? "0x0") + BigInt(x.rva)).toString(16), modules)}</td>
                       <td className="faint">{x.kind}</td>
                     </tr>
                   ))}
