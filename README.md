@@ -66,8 +66,8 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
 | Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
-| AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Mistral, DeepSeek, Ollama, LM Studio); the model drives the same 29 tools as MCP, sees the current target/module/selection, and asks before running a mutating tool |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 29 tools |
+| AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Mistral, DeepSeek, Ollama, LM Studio); the model drives the same 33 tools as MCP, sees the current target/module/selection, and asks before running a mutating tool |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 33 tools |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
 | Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |

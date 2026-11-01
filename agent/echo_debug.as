@@ -12,14 +12,18 @@
 //     3004. attach goes through the job slot because it is not documented whether process::attach /
 //     process::open_socket are safe on the ws thread, and because serialising attach against scans
 //     guarantees a scan never sees the target change underneath it.
-//   * emulate runs inline on the ws thread: it is hard-bounded (timeout_us <= 5 s), and keeping it
-//     there means the code-hook globals are only ever touched by that single thread.
+//   * emulate and peb_walk also run through the job slot: the slot serialises them, so the
+//     code-hook globals (g_emu_*) are only ever touched by one job thread at a time.
 //   * Ticking threads (only creatable from main): keepalive at 1 tps (reconnect with backoff,
 //     process-exit detection, AUTO_ATTACH retries, job watchdog) and freeze at 20 tps.
-//   * Shared state: g_state_mx (attach state + job slot), g_scan_mx (published scan-state handle),
-//     g_freeze_mx (freeze list), g_send_mx (serialises ws::send across threads). Locks never nest.
+//   * Shared state: g_state_mx (attach state + job slot incl. the claimed JobParams — claim and
+//     params are written under one lock so the watchdog can never recycle a slot mid-handoff),
+//     g_scan_mx (published scan-state handle), g_freeze_mx (freeze list), g_send_mx (serialises
+//     ws::send across threads). Locks never nest.
 //   * A published ScanState is never mutated again. Jobs build a new one and swap the handle, so
 //     readers only hold g_scan_mx long enough to copy the handle (pattern from the Echo docs).
+//   * Freeze entries keep the bytes that were at the address before freezing; they are restored
+//     on detach, on target exit and in on_unload (Echo docs: undo target modifications on unload).
 
 const string AGENT_VERSION = "0.3.0";
 const int RELAY_PORT = 47110;
@@ -48,7 +52,7 @@ const uint FREEZE_MAX_ENTRIES = 1024;
 const uint FREEZE_MAX_BYTES = 4096;
 const uint CHAIN_MAX_OFFSETS = 64;
 const uint64 JOB_TIME_LIMIT_MS = 100000;       // the relay fails requests after 120 s
-const uint64 JOB_WATCHDOG_MS = 180000;         // frees the slot if a job thread died mid-way
+const uint64 JOB_WATCHDOG_MS = 125000;         // frees the slot if a job thread died mid-way (just past the relay's 120 s timeout)
 
 // Value scanner limits
 const uint MAX_CANDIDATES = 4000000;
@@ -123,16 +127,13 @@ uint64 g_peb = 0;
 string g_name = "";
 bool g_auto_pending = false;
 
-// job slot (g_state_mx). Params are written only after a successful claim, read only by the job.
+// job slot (g_state_mx). The params handle is claimed atomically with the slot: both are written
+// under the same lock, so a recycled slot can never hand a job another request's params.
 string g_job = "";
 int64 g_job_id = 0;
 uint g_job_seq = 0;
 uint64 g_job_t0 = 0;
-string g_job_attach_name = "";
-uint32 g_job_attach_pid = 0;
-ScanSpec@ g_job_scan;
-ScanState@ g_job_old;
-PtrSpec@ g_job_ptr;
+JobParams@ g_job_params;
 
 // published scan state (g_scan_mx)
 ScanState@ g_scan;
@@ -145,7 +146,7 @@ uint g_ka_tick = 0;
 uint g_ka_next_try = 2;
 uint g_ka_wait = 2;
 
-// emulate hook state (ws thread only, see header)
+// emulate hook state (only touched by the emulate job thread; the job slot serialises jobs)
 uint64 g_emu_count = 0;
 bool g_emu_trace_on = false;
 uint g_emu_trace_limit = 0;
@@ -162,8 +163,45 @@ class FreezeEntry
 {
     uint64 address;
     array<uint8> data;
+    array<uint8> original;   // bytes at `address` before the freeze, for restore on detach/unload
+    bool has_original;
     bool failed;
-    FreezeEntry() { address = 0; failed = false; }
+    FreezeEntry() { address = 0; has_original = false; failed = false; }
+}
+
+// Everything a job thread needs, claimed atomically with the job slot (g_state_mx).
+class JobParams
+{
+    string attach_name;
+    uint32 attach_pid;
+    ScanSpec@ scan;
+    ScanState@ old;
+    PtrSpec@ ptr;
+    EmuJob@ emu;
+    JobParams() { attach_pid = 0; }
+}
+
+// A fully parsed emulate request; executed by run_emulate on the job thread.
+class EmuJob
+{
+    uint64 start;
+    uint64 stop;
+    array<uint8> code;              // blank-emulator mode (uc::create); empty = process mode
+    array<string> rnames;
+    array<uint64> rvals;
+    array<uint64> waddrs;           // injected blobs
+    array<array<uint8> > wdata;
+    array<uint64> raddrs;           // read-back blobs
+    array<uint64> rsizes;
+    int64 max_insns;
+    int64 timeout_us;
+    bool trace;
+    int64 trace_limit;
+    EmuJob()
+    {
+        start = 0; stop = 0; max_insns = 100000; timeout_us = 1000000;
+        trace = false; trace_limit = 2000;
+    }
 }
 
 class RegionList
@@ -292,6 +330,30 @@ class PageReader
         }
         if (buf is null) return false;
         v = buf_read(buf, off, w);
+        return true;
+    }
+
+    // Same paging, but returns raw bytes (pattern scans).
+    bool read_buf(uint64 a, uint w, array<uint8> &out v)
+    {
+        v.resize(0);
+        uint64 pg = a & ~uint64(0xFFF);
+        uint64 off = a - pg;
+        if (off + w > 0x1000)
+        {
+            array<uint8>@ b = process::read_bytes(a, w);
+            if (b is null || b.length() != w) return false;
+            v = b;
+            return true;
+        }
+        if (pg != page)
+        {
+            page = pg;
+            @buf = process::read_buffer(pg, 0x1000);
+        }
+        if (buf is null) return false;
+        v.resize(w);
+        for (uint i = 0; i < w; i++) v[i] = buf.read_uint8(off + i);
         return true;
     }
 }
@@ -757,6 +819,8 @@ bool parse_value(json_obj@ r, const string &in k, int vt, uint64 &out bits, doub
     if (t == json_type::number)
     {
         double d = r.get_double(k);
+        // integer types reject fractional JSON numbers (e.g. -0.5 must not truncate to 0)
+        if (d != double(r.get_int64(k)) && d != double(r.get_uint64(k))) return false;
         if (d < 0) { neg = true; mag = uint64(-r.get_int64(k)); }
         else mag = r.get_uint64(k);
     }
@@ -847,6 +911,8 @@ void send_hello()
     bool a = g_attached;
     uint64 pid = g_pid;
     uint64 base = g_base;
+    uint64 peb = g_peb;
+    string nm = g_name;
     g_state_mx.unlock_shared();
     json_obj@ o = new_event("hello");
     o.set("version", AGENT_VERSION);
@@ -855,6 +921,8 @@ void send_hello()
     o.set("attached", a);
     o.set("pid", a ? pid : uint64(0));
     o.set("base", hex_addr(a ? base : uint64(0)));
+    o.set("peb", hex_addr(a ? peb : uint64(0)));
+    o.set("name", a ? nm : "");
     send_json(o);
 }
 
@@ -877,7 +945,8 @@ bool require_attached(int64 id)
     return false;
 }
 
-bool claim_job(const string &in kind, int64 id, uint &out seq)
+// Claims the job slot and its params under one lock: a job never observes another request's params.
+bool claim_job(const string &in kind, int64 id, JobParams@ p, uint &out seq)
 {
     g_state_mx.lock();
     bool ok = g_job == "";
@@ -887,6 +956,7 @@ bool claim_job(const string &in kind, int64 id, uint &out seq)
         g_job_id = id;
         g_job_seq++;
         g_job_t0 = util::tickcount();
+        @g_job_params = p;
     }
     seq = g_job_seq;
     g_state_mx.unlock();
@@ -897,7 +967,7 @@ bool claim_job(const string &in kind, int64 id, uint &out seq)
 void release_job(uint seq)
 {
     g_state_mx.lock();
-    if (g_job_seq == seq) g_job = "";
+    if (g_job_seq == seq) { g_job = ""; @g_job_params = null; }
     g_state_mx.unlock();
 }
 
@@ -933,10 +1003,34 @@ void clear_freeze()
     g_freeze_mx.unlock();
 }
 
-// Attaches by name (pid ignored) or by pid (name == ""). Runs on a job thread or in main().
+// Writes the pre-freeze bytes back to the target and empties the list. Call while still attached.
+void restore_freeze()
+{
+    g_freeze_mx.lock();
+    for (uint i = 0; i < g_freeze.length(); i++)
+    {
+        FreezeEntry@ e = g_freeze[i];
+        if (e.has_original) process::write_bytes(e.original, e.address);
+    }
+    g_freeze.resize(0);
+    g_freeze_mx.unlock();
+}
+
+bool was_attached()
+{
+    g_state_mx.lock_shared();
+    bool a = g_attached;
+    g_state_mx.unlock_shared();
+    return a;
+}
+
+// Attaches by name (pid ignored) or by pid (name == ""). Runs on a job thread.
 bool do_attach(const string &in name, uint32 pid, bool &out sock)
 {
     sock = false;
+    // Re-attaching to a different target must not leak frozen values into it: restore the old
+    // target's bytes before the attach redirects memory access.
+    if (was_attached()) restore_freeze();
     uint64 apid = 0;
     uint64 abase = 0;
     uint64 apeb = 0;
@@ -1003,16 +1097,21 @@ void job_main()
     string kind = g_job;
     int64 id = g_job_id;
     uint seq = g_job_seq;
+    JobParams@ p = g_job_params;
     g_state_mx.unlock_shared();
 
-    if (kind == "attach") run_attach(id);
-    else if (kind == "scan_new") run_scan_new(id, g_job_scan);
-    else if (kind == "scan_next") run_scan_next(id, g_job_scan, g_job_old);
-    else if (kind == "pointer_scan") run_pointer_scan(id, g_job_ptr);
+    if (kind == "attach") run_attach(id, p);
+    else if (kind == "auto_attach")
+    {
+        bool sock;
+        if (!do_attach(p.attach_name, 0, sock)) console::log(LOG_PREFIX + "waiting for " + p.attach_name);
+    }
+    else if (kind == "scan_new") run_scan_new(id, p.scan);
+    else if (kind == "scan_next") run_scan_next(id, p.scan, p.old);
+    else if (kind == "pointer_scan") run_pointer_scan(id, p.ptr);
+    else if (kind == "emulate") run_emulate(id, p.emu);
+    else if (kind == "peb_walk") run_peb_walk(id);
 
-    @g_job_scan = null;
-    @g_job_old = null;
-    @g_job_ptr = null;
     release_job(seq);
 }
 
@@ -1021,14 +1120,15 @@ void job_main()
 // ---------------------------------------------------------------------------------------------
 
 // Collects regions intersecting [lo, hi) in ascending order. With `clip` the entries are cut to
-// [lo, hi). Returns true when truncated (max_count or iteration guard hit).
-bool walk_regions(uint64 lo, uint64 hi, bool present_only, bool writable_only, uint max_count, bool clip, RegionList@ rl)
+// [lo, hi). Returns true when truncated (max_count, iteration or time guard hit). The time guard
+// matters: this runs on a ws/job thread and the relay fails requests after 120 s.
+bool walk_regions(uint64 t0, uint64 lo, uint64 hi, bool present_only, bool writable_only, uint max_count, bool clip, RegionList@ rl)
 {
     uint64 addr = lo;
     uint64 stride = 0x1000;
     for (uint iter = 0; addr < hi; iter++)
     {
-        if (iter >= WALK_MAX_ITER) return true;
+        if (iter >= WALK_MAX_ITER || time_up(t0)) return true;
         memory_region m = process::virtual_query(addr);
         uint64 rend = m.base + m.size;
         if (m.size == 0 || rend <= addr)
@@ -1075,17 +1175,18 @@ void h_attach(json_obj@ r, int64 id)
     if (!opt_int(r, "pid", 0, pid)) { bad_args(id, "pid must be a number"); return; }
     if (name == "" && pid == 0) { bad_args(id, "attach requires 'name' or 'pid'"); return; }
     if (name == "" && (pid < 0 || pid > int64(0xFFFFFFFF))) { bad_args(id, "pid out of range"); return; }
+    JobParams@ p = JobParams();
+    p.attach_name = name;
+    p.attach_pid = uint32(pid);
     uint seq;
-    if (!claim_job("attach", id, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
-    g_job_attach_name = name;
-    g_job_attach_pid = uint32(pid);
+    if (!claim_job("attach", id, p, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
     create_thread(0, @job_main);
 }
 
-void run_attach(int64 id)
+void run_attach(int64 id, JobParams@ p)
 {
-    string name = g_job_attach_name;
-    uint32 pid = g_job_attach_pid;
+    string name = p.attach_name;
+    uint32 pid = p.attach_pid;
     bool sock;
     if (!do_attach(name, pid, sock))
     {
@@ -1109,6 +1210,7 @@ void h_detach(json_obj@ r, int64 id)
     g_state_mx.lock();
     g_auto_pending = false;
     g_state_mx.unlock();
+    if (was_attached()) restore_freeze();   // undo frozen values before the attach is gone
     process::detach();
     mark_detached("requested");
     send_json(ok_reply("detach", id));
@@ -1133,12 +1235,29 @@ void h_write(json_obj@ r, int64 id)
     if (!get_addr(r, "address", addr)) { bad_args(id, "write requires 'address'"); return; }
     string hex;
     if (!opt_str(r, "data", "", hex)) { bad_args(id, "data must be a hex string"); return; }
+    bool force;
+    if (!opt_bool(r, "force", false, force)) { bad_args(id, "force must be a bool"); return; }
     array<uint8> bytes;
     if (!parse_hex_bytes(hex, bytes) || bytes.length() == 0) { bad_args(id, "data must be non-empty hex"); return; }
     if (bytes.length() > WRITE_MAX) { send_error(id, E_LIMIT, "limit exceeded", "write is limited to 1 MiB"); return; }
+    // Echo writes physical memory: page protections do not apply and a bad address will not
+    // simply fail. Unless forced, refuse writes that land in unmapped space (Echo docs golden rule).
+    if (!force)
+    {
+        memory_region m0 = process::virtual_query(addr);
+        memory_region m1 = process::virtual_query(addr + uint64(bytes.length()) - 1);
+        if (!m0.present || !m1.present)
+        {
+            send_error(id, E_FAILED, "write target not mapped",
+                       hex_addr(addr) + " .. " + hex_addr(addr + uint64(bytes.length()) - 1));
+            return;
+        }
+    }
     if (!process::write_bytes(bytes, addr)) { send_error(id, E_FAILED, "write failed", hex_addr(addr)); return; }
+    memory_region m = process::virtual_query(addr);
     json_obj@ o = ok_reply("write", id);
     o.set("written", bytes.length());
+    o.set("region", region_json(m.base, m.size, m.present, m.writable, m.executable));
     send_json(o);
 }
 
@@ -1170,7 +1289,7 @@ void h_regions(json_obj@ r, int64 id)
     if (maxn > int64(WALK_MAX_REGIONS)) maxn = WALK_MAX_REGIONS;
 
     RegionList@ rl = RegionList();
-    bool trunc = walk_regions(lo, hi, present_only, false, uint(maxn), false, rl);
+    bool trunc = walk_regions(util::tickcount(), lo, hi, present_only, false, uint(maxn), false, rl);
     json_obj@ arr = json::array();
     for (uint i = 0; i < rl.base.length(); i++)
     {
@@ -1264,20 +1383,38 @@ void h_freeze(json_obj@ r, int64 id)
     }
 
     bool full = false;
+    json_obj@ patched_ev;   // journal event for the app's patch journal (sent after unlock)
     g_freeze_mx.lock();
     int idx = -1;
     for (uint i = 0; i < g_freeze.length(); i++)
         if (g_freeze[i].address == addr) { idx = int(i); break; }
     if (enabled)
     {
-        if (idx >= 0) { g_freeze[uint(idx)].data = bytes; g_freeze[uint(idx)].failed = false; }
+        if (idx >= 0)
+        {
+            g_freeze[uint(idx)].data = bytes;
+            g_freeze[uint(idx)].failed = false;
+        }
         else if (g_freeze.length() >= FREEZE_MAX_ENTRIES) full = true;
         else
         {
             FreezeEntry@ e = FreezeEntry();
             e.address = addr;
             e.data = bytes;
+            // capture the pre-freeze bytes once, so detach/unload can restore them
+            array<uint8>@ orig = process::read_bytes(addr, bytes.length());
+            if (orig !is null && orig.length() == bytes.length()) { e.original = orig; e.has_original = true; }
             g_freeze.insertLast(e);
+        }
+        if (!full)
+        {
+            // one journal event per enable: old = pre-freeze bytes when captured, else previous data
+            FreezeEntry@ e = idx >= 0 ? g_freeze[uint(idx)] : g_freeze[g_freeze.length() - 1];
+            patched_ev = new_event("patched");
+            patched_ev.set("address", hex_addr(addr));
+            patched_ev.set("old", e.has_original ? hex_of(e.original, 0, e.original.length())
+                                                 : hex_of(e.data, 0, e.data.length()));
+            patched_ev.set("new", hex_of(bytes, 0, bytes.length()));
         }
     }
     else if (idx >= 0) g_freeze.removeAt(uint(idx));
@@ -1285,6 +1422,7 @@ void h_freeze(json_obj@ r, int64 id)
     g_freeze_mx.unlock();
 
     if (full) { send_error(id, E_LIMIT, "limit exceeded", "at most 1024 frozen entries"); return; }
+    if (patched_ev !is null) send_json(patched_ev);
     json_obj@ o = ok_reply("freeze", id);
     o.set("frozen", n);
     send_json(o);
@@ -1417,9 +1555,10 @@ void h_scan_new(json_obj@ r, int64 id)
         s.hi = hi;
     }
 
+    JobParams@ p = JobParams();
+    @p.scan = s;
     uint seq;
-    if (!claim_job("scan_new", id, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
-    @g_job_scan = s;
+    if (!claim_job("scan_new", id, p, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
     create_thread(0, @job_main);
 }
 
@@ -1488,7 +1627,7 @@ void run_scan_new(int64 id, ScanSpec@ s)
 {
     uint64 t0 = util::tickcount();
     RegionList@ rl = RegionList();
-    bool trunc = walk_regions(s.lo, s.hi, true, s.writable_only, WALK_MAX_REGIONS, true, rl);
+    bool trunc = walk_regions(t0, s.lo, s.hi, true, s.writable_only, WALK_MAX_REGIONS, true, rl);
     string note = trunc ? "region list truncated" : "";
 
     ScanState@ st = ScanState(s);
@@ -1573,10 +1712,11 @@ void h_scan_next(json_obj@ r, int64 id)
         return;
     }
 
+    JobParams@ p = JobParams();
+    @p.scan = s;
+    @p.old = old;
     uint seq;
-    if (!claim_job("scan_next", id, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
-    @g_job_scan = s;
-    @g_job_old = old;
+    if (!claim_job("scan_next", id, p, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
     create_thread(0, @job_main);
 }
 
@@ -1636,8 +1776,8 @@ void run_scan_next(int64 id, ScanSpec@ s, ScanState@ old)
             uint64 a = old.addrs[i];
             if (pattern)
             {
-                array<uint8>@ cur = process::read_bytes(a, w);
-                if (cur is null || cur.length() != w) continue;
+                array<uint8> cur;
+                if (!pr.read_buf(a, w, cur)) continue;
                 bool eq = (s.op == OP_EXACT) ? bytes_eq(cur, 0, s.pattern, 0, w) : bytes_eq(cur, 0, old.prev_raw, i * w, w);
                 if ((s.op == OP_CHANGED) == eq) continue;
                 if (add_pat_hit(st, a, cur, MAX_CANDIDATES)) break;
@@ -1741,9 +1881,10 @@ void h_pointer_scan(json_obj@ r, int64 id)
     p.max_offset = uint64(maxoff);
     p.max_results = uint(maxres);
 
+    JobParams@ jp = JobParams();
+    @jp.ptr = p;
     uint seq;
-    if (!claim_job("pointer_scan", id, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
-    @g_job_ptr = p;
+    if (!claim_job("pointer_scan", id, jp, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
     create_thread(0, @job_main);
 }
 
@@ -1763,7 +1904,7 @@ void run_pointer_scan(int64 id, PtrSpec@ p)
         }
 
     RegionList@ rl = RegionList();
-    bool trunc = walk_regions(USER_LO, USER_HI, true, true, WALK_MAX_REGIONS, true, rl);
+    bool trunc = walk_regions(t0, USER_LO, USER_HI, true, true, WALK_MAX_REGIONS, true, rl);
     string note = trunc ? "region list truncated" : "";
 
     // Node store; node 0 is the target. Each level's nodes are appended in ascending address order
@@ -1942,41 +2083,35 @@ uint64 pick_stack_base(bool blank)
     return c[0];
 }
 
+// Validates the request on the ws thread, then hands a parsed EmuJob to the job slot: emulation can
+// run for seconds, and the slot keeps it from blocking every other verb meanwhile.
 void h_emulate(json_obj@ r, int64 id)
 {
-    uint64 start;
-    uint64 stop_at;
-    if (!get_addr(r, "start", start) || !get_addr(r, "end", stop_at)) { bad_args(id, "emulate requires 'start' and 'end'"); return; }
+    EmuJob@ e = EmuJob();
+    if (!get_addr(r, "start", e.start) || !get_addr(r, "end", e.stop)) { bad_args(id, "emulate requires 'start' and 'end'"); return; }
     string codehex;
     if (!opt_str(r, "code", "", codehex)) { bad_args(id, "code must be a hex string"); return; }
-    array<uint8> code;
     bool blank = codehex != "";
     if (blank)
     {
-        if (!parse_hex_bytes(codehex, code) || code.length() == 0) { bad_args(id, "code must be hex"); return; }
-        if (code.length() > EMU_CODE_MAX) { send_error(id, E_LIMIT, "limit exceeded", "code is limited to 1 MiB"); return; }
+        if (!parse_hex_bytes(codehex, e.code) || e.code.length() == 0) { bad_args(id, "code must be hex"); return; }
+        if (e.code.length() > EMU_CODE_MAX) { send_error(id, E_LIMIT, "limit exceeded", "code is limited to 1 MiB"); return; }
     }
     else if (!require_attached(id)) return;
 
-    int64 maxi;
-    int64 tmo;
-    int64 tlim;
-    bool trace;
-    if (!opt_int(r, "max_insns", 100000, maxi) || !opt_int(r, "timeout_us", 1000000, tmo) ||
-        !opt_int(r, "trace_limit", 2000, tlim) || !opt_bool(r, "trace", false, trace))
+    if (!opt_int(r, "max_insns", 100000, e.max_insns) || !opt_int(r, "timeout_us", 1000000, e.timeout_us) ||
+        !opt_int(r, "trace_limit", 2000, e.trace_limit) || !opt_bool(r, "trace", false, e.trace))
     {
         bad_args(id, "max_insns/timeout_us/trace_limit must be numbers, trace a bool");
         return;
     }
-    if (maxi < 1 || tmo < 1 || tlim < 0) { bad_args(id, "max_insns and timeout_us must be >= 1"); return; }
-    if (maxi > EMU_MAX_INSNS || tmo > EMU_MAX_TIMEOUT_US || tlim > EMU_MAX_TRACE)
+    if (e.max_insns < 1 || e.timeout_us < 1 || e.trace_limit < 0) { bad_args(id, "max_insns and timeout_us must be >= 1"); return; }
+    if (e.max_insns > EMU_MAX_INSNS || e.timeout_us > EMU_MAX_TIMEOUT_US || e.trace_limit > EMU_MAX_TRACE)
     {
         send_error(id, E_LIMIT, "limit exceeded", "max_insns <= 5000000, timeout_us <= 5000000, trace_limit <= 100000");
         return;
     }
 
-    array<string> rnames;
-    array<uint64> rvals;
     if (has_key(r, "regs"))
     {
         if (r.type("regs") != json_type::object) { bad_args(id, "regs must be an object"); return; }
@@ -1988,91 +2123,98 @@ void h_emulate(json_obj@ r, int64 id)
             uint64 v;
             if (!emu_reg(keys[i], reg)) { bad_args(id, "unknown register: " + keys[i]); return; }
             if (!get_addr(regs, keys[i], v)) { bad_args(id, "register values must be hex strings: " + keys[i]); return; }
-            rnames.insertLast(keys[i]);
-            rvals.insertLast(v);
+            e.rnames.insertLast(keys[i]);
+            e.rvals.insertLast(v);
         }
     }
 
-    uint64 h = blank ? uc::create() : uc::create_process();
-    if (h == 0) { send_error(id, E_FAILED, "emulator creation failed"); return; }
-
     // Memory blobs: "write" injects bytes before the run, "read" reads them back after.
-    array<uint64> waddrs;
-    array<array<uint8> > wdata;
-    array<uint64> raddrs;
-    array<uint64> rsizes;
     if (has_key(r, "write"))
     {
-        if (r.type("write") != json_type::array) { uc::close(h); bad_args(id, "write must be an array"); return; }
+        if (r.type("write") != json_type::array) { bad_args(id, "write must be an array"); return; }
         json_obj@ arr = r.get_obj("write");
-        if (arr.length() > EMU_MAX_BLOBS) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "at most 64 write blobs"); return; }
+        if (arr.length() > EMU_MAX_BLOBS) { send_error(id, E_LIMIT, "limit exceeded", "at most 64 write blobs"); return; }
         for (uint i = 0; i < arr.length(); i++)
         {
             json_obj@ blob = arr.get_obj_at(i);
-            if (blob is null) { uc::close(h); bad_args(id, "write entries must be objects"); return; }
+            if (blob is null) { bad_args(id, "write entries must be objects"); return; }
             uint64 a;
-            if (!get_addr(blob, "address", a)) { uc::close(h); bad_args(id, "write entries need an address"); return; }
+            if (!get_addr(blob, "address", a)) { bad_args(id, "write entries need an address"); return; }
             string hex;
-            if (!opt_str(blob, "data", "", hex)) { uc::close(h); bad_args(id, "write entries need hex data"); return; }
+            if (!opt_str(blob, "data", "", hex)) { bad_args(id, "write entries need hex data"); return; }
             array<uint8> bytes;
-            if (!parse_hex_bytes(hex, bytes) || bytes.length() == 0) { uc::close(h); bad_args(id, "write data must be non-empty hex"); return; }
-            if (bytes.length() > EMU_MAX_BLOB_BYTES) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "a write blob is limited to 64 KiB"); return; }
-            waddrs.insertLast(a);
-            wdata.insertLast(bytes);
+            if (!parse_hex_bytes(hex, bytes) || bytes.length() == 0) { bad_args(id, "write data must be non-empty hex"); return; }
+            if (bytes.length() > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "a write blob is limited to 64 KiB"); return; }
+            e.waddrs.insertLast(a);
+            e.wdata.insertLast(bytes);
         }
     }
     if (has_key(r, "read"))
     {
-        if (r.type("read") != json_type::array) { uc::close(h); bad_args(id, "read must be an array"); return; }
+        if (r.type("read") != json_type::array) { bad_args(id, "read must be an array"); return; }
         json_obj@ arr = r.get_obj("read");
-        if (arr.length() > EMU_MAX_BLOBS) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "at most 64 read blobs"); return; }
+        if (arr.length() > EMU_MAX_BLOBS) { send_error(id, E_LIMIT, "limit exceeded", "at most 64 read blobs"); return; }
         for (uint i = 0; i < arr.length(); i++)
         {
             json_obj@ blob = arr.get_obj_at(i);
-            if (blob is null) { uc::close(h); bad_args(id, "read entries must be objects"); return; }
+            if (blob is null) { bad_args(id, "read entries must be objects"); return; }
             uint64 a;
-            if (!get_addr(blob, "address", a)) { uc::close(h); bad_args(id, "read entries need an address"); return; }
+            if (!get_addr(blob, "address", a)) { bad_args(id, "read entries need an address"); return; }
             uint64 n = EMU_MAX_BLOB_BYTES;
-            if (!opt_addr(blob, "size", n, n)) { uc::close(h); bad_args(id, "read size must be an address or number"); return; }
-            if (n == 0 || n > EMU_MAX_BLOB_BYTES) { uc::close(h); send_error(id, E_LIMIT, "limit exceeded", "read size must be 1..65536"); return; }
-            raddrs.insertLast(a);
-            rsizes.insertLast(n);
+            if (!opt_addr(blob, "size", n, n)) { bad_args(id, "read size must be an address or number"); return; }
+            if (n == 0 || n > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "read size must be 1..65536"); return; }
+            e.raddrs.insertLast(a);
+            e.rsizes.insertLast(n);
         }
     }
+
+    JobParams@ p = JobParams();
+    @p.emu = e;
+    uint seq;
+    if (!claim_job("emulate", id, p, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
+    create_thread(0, @job_main);
+}
+
+// Runs on the job thread; the job slot serialises it, so the g_emu_* hook state stays single-writer.
+void run_emulate(int64 id, EmuJob@ e)
+{
+    bool blank = e.code.length() > 0;
+    uint64 h = blank ? uc::create() : uc::create_process();
+    if (h == 0) { send_error(id, E_FAILED, "emulator creation failed"); return; }
 
     bool ok = true;
     if (blank)
     {
-        uint64 page = start & ~uint64(0xFFF);
-        uint64 pend = align_up(start + code.length(), 0x1000);
-        ok = uc::mem_map(h, page, pend - page, uint(uc::prot::all)) && uc::mem_write(h, start, code);
+        uint64 page = e.start & ~uint64(0xFFF);
+        uint64 pend = align_up(e.start + e.code.length(), 0x1000);
+        ok = uc::mem_map(h, page, pend - page, uint(uc::prot::all)) && uc::mem_write(h, e.start, e.code);
     }
     // setup_stack writes `end` as the return address, so a final `ret` lands on the stop address.
-    ok = ok && uc::setup_stack(h, pick_stack_base(blank), EMU_STACK_SIZE, stop_at);
-    if (ok && uc::mem_query(h, stop_at) < 0)
-        ok = uc::mem_map(h, stop_at & ~uint64(0xFFF), 0x1000, uint(uc::prot::read | uc::prot::exec));
+    ok = ok && uc::setup_stack(h, pick_stack_base(blank), EMU_STACK_SIZE, e.stop);
+    if (ok && uc::mem_query(h, e.stop) < 0)
+        ok = uc::mem_map(h, e.stop & ~uint64(0xFFF), 0x1000, uint(uc::prot::read | uc::prot::exec));
     g_emu_count = 0;
     g_emu_trace.resize(0);
-    g_emu_trace_on = trace;
-    g_emu_trace_limit = uint(tlim);
+    g_emu_trace_on = e.trace;
+    g_emu_trace_limit = uint(e.trace_limit);
     ok = ok && uc::hook_code(h, @emu_hook);
     // Inject the blobs before the run: map the page if the emulator has not faulted it in yet.
-    for (uint i = 0; i < waddrs.length() && ok; i++)
+    for (uint i = 0; i < e.waddrs.length() && ok; i++)
     {
-        uint64 a = waddrs[i];
+        uint64 a = e.waddrs[i];
         if (uc::mem_query(h, a) < 0)
         {
             uint64 page = a & ~uint64(0xFFF);
-            uint64 span = align_up(a + wdata[i].length(), 0x1000) - page;
+            uint64 span = align_up(a + e.wdata[i].length(), 0x1000) - page;
             ok = uc::mem_map(h, page, span, uint(uc::prot::all));
         }
-        if (ok) ok = uc::mem_write(h, a, wdata[i]);
+        if (ok) ok = uc::mem_write(h, a, e.wdata[i]);
     }
-    for (uint i = 0; i < rnames.length() && ok; i++)
+    for (uint i = 0; i < e.rnames.length() && ok; i++)
     {
         x86_reg reg;
-        emu_reg(rnames[i], reg);
-        ok = uc::reg_write64(h, reg, rvals[i]);
+        emu_reg(e.rnames[i], reg);
+        ok = uc::reg_write64(h, reg, e.rvals[i]);
     }
     if (!ok)
     {
@@ -2081,7 +2223,7 @@ void h_emulate(json_obj@ r, int64 id)
         return;
     }
 
-    int res = uc::start(h, start, stop_at, uint64(tmo), uint64(maxi));
+    int res = uc::start(h, e.start, e.stop, uint64(e.timeout_us), uint64(e.max_insns));
 
     array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
                             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
@@ -2100,16 +2242,16 @@ void h_emulate(json_obj@ r, int64 id)
 
     // Read the requested blobs back before the handle is closed.
     json_obj@ mem_out = json::array();
-    for (uint i = 0; i < raddrs.length(); i++)
+    for (uint i = 0; i < e.raddrs.length(); i++)
     {
         array<uint8> bytes;
-        bytes.resize(rsizes[i]);
-        bool got = uc::mem_read(h, raddrs[i], uint(rsizes[i]), bytes);
+        bytes.resize(e.rsizes[i]);
+        bool got = uc::mem_read(h, e.raddrs[i], uint(e.rsizes[i]), bytes);
         json_obj@ entry = json_obj();
-        entry.set("address", hex_addr(raddrs[i]));
-        entry.set("size", rsizes[i]);
+        entry.set("address", hex_addr(e.raddrs[i]));
+        entry.set("size", e.rsizes[i]);
         entry.set("ok", got);
-        entry.set("data", got ? hex_of(bytes, 0, uint(rsizes[i])) : "");
+        entry.set("data", got ? hex_of(bytes, 0, uint(e.rsizes[i])) : "");
         mem_out.push(entry);
     }
     uc::close(h);
@@ -2126,7 +2268,145 @@ void h_emulate(json_obj@ r, int64 id)
     o.set("instructions", g_emu_count);
     o.set("mem", mem_out);
     // Unicorn reports a timeout or instruction-limit stop as "ok"; this tells them apart.
-    o.set("reached_end", res == uc::error::ok && rip == stop_at);
+    o.set("reached_end", res == uc::error::ok && rip == e.stop);
+    send_json(o);
+}
+
+// Re-points Echo's native memory server at the relay. The relay asks for this when its /agent
+// side has no connection but the agent is attached (e.g. after an app restart, the old
+// process::open_socket connection is dead and must be re-opened).
+void h_reopen_socket(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    bool ok = process::open_socket(native_url());
+    json_obj@ ev = new_event("native_socket");
+    ev.set("ok", ok);
+    send_json(ev);
+    if (!ok) emit_log("warn", "native memory socket could not be re-opened (still active on Echo's side); re-attach or reload the script to restore it");
+    json_obj@ o = ok_reply("reopen_socket", id);
+    o.set("ok", ok);
+    send_json(o);
+}
+
+// Resolves one export of a loaded module: process::get_module_base + process::get_module_export.
+void h_resolve_export(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    string mod;
+    string name;
+    if (!opt_str(r, "module", "", mod) || !opt_str(r, "name", "", name)) { bad_args(id, "module/name must be strings"); return; }
+    if (mod == "") { bad_args(id, "resolve_export requires 'module'"); return; }
+    if (name == "") { bad_args(id, "resolve_export requires 'name'"); return; }
+    uint64 base = process::get_module_base(mod);
+    if (base == 0) { send_error(id, E_FAILED, "module not found", mod); return; }
+    uint64 addr = process::get_module_export(base, name);
+    if (addr == 0) { send_error(id, E_FAILED, "export not found", mod + "!" + name); return; }
+    json_obj@ o = ok_reply("resolve_export", id);
+    o.set("address", hex_addr(addr));
+    o.set("module_base", hex_addr(base));
+    send_json(o);
+}
+
+void h_peb_walk(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    JobParams@ p = JobParams();
+    uint seq;
+    if (!claim_job("peb_walk", id, p, seq)) { send_error(id, E_BUSY, "busy", "another job is running"); return; }
+    create_thread(0, @job_main);
+}
+
+// Walks PEB->Ldr->InLoadOrderModuleList inside a process-backed emulator (uc::create_process),
+// using the stubs from the Echo docs. Cross-checks process::get_module_list and yields FullDllName.
+void run_peb_walk(int64 id)
+{
+    uint64 h = uc::create_process();
+    if (h == 0) { send_error(id, E_FAILED, "emulator creation failed", "no process attached"); return; }
+
+    const uint64 INIT = 0x1000, READ = 0x2000, NAME = 0x3000, STOP = 0x6000;
+    // gs:[0x60] -> PEB -> Ldr -> &InLoadOrderModuleList; sentinel in rcx, first entry in rdi
+    array<uint8> stub_init = {
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x40, 0x18,
+        0x48, 0x8D, 0x40, 0x10,
+        0x48, 0x89, 0xC1,
+        0x48, 0x8B, 0x38,
+        0xC3
+    };
+    // rdi = LDR_DATA_TABLE_ENTRY: DllBase/EntryPoint/SizeOfImage, advance rdi to next entry
+    array<uint8> stub_read = {
+        0x48, 0x8B, 0x47, 0x30,
+        0x48, 0x8B, 0x5F, 0x38,
+        0x8B, 0x4F, 0x40,
+        0x48, 0x8B, 0x3F,
+        0xC3
+    };
+    // rax = FullDllName.Buffer ([rdi+0x50])
+    array<uint8> stub_name = { 0x48, 0x8B, 0x47, 0x50, 0xC3 };
+
+    bool ok = uc::mem_map(h, INIT, 0x1000, uint(uc::prot::all))
+        && uc::mem_map(h, READ, 0x1000, uint(uc::prot::all))
+        && uc::mem_map(h, NAME, 0x1000, uint(uc::prot::all))
+        && uc::mem_map(h, STOP, 0x1000, uint(uc::prot::all))
+        && uc::setup_stack(h, 0x10000, 0x2000, STOP)
+        && uc::mem_write(h, INIT, stub_init)
+        && uc::mem_write(h, READ, stub_read)
+        && uc::mem_write(h, NAME, stub_name);
+
+    json_obj@ mods = json::array();
+    if (ok)
+    {
+        ok = uc::start(h, INIT, STOP) == uc::error::ok;
+        uint64 sentinel = 0, flink = 0;
+        if (ok)
+        {
+            uc::reg_read64(h, x86_reg::rcx, sentinel);
+            uc::reg_read64(h, x86_reg::rdi, flink);
+        }
+        uint guard = 0;
+        while (ok && flink != sentinel && flink != 0 && guard < 4096)
+        {
+            guard++;
+            uc::reg_write64(h, x86_reg::rdi, flink);
+            if (uc::start(h, READ, STOP) != uc::error::ok) break;
+            uint64 dll_base = 0, entry = 0, size = 0, next = 0;
+            uc::reg_read64(h, x86_reg::rax, dll_base);
+            uc::reg_read64(h, x86_reg::rbx, entry);
+            uc::reg_read64(h, x86_reg::rcx, size);
+            uc::reg_read64(h, x86_reg::rdi, next);
+            string name = "";
+            uc::reg_write64(h, x86_reg::rdi, flink);
+            if (uc::start(h, NAME, STOP) == uc::error::ok)
+            {
+                uint64 name_ptr = 0;
+                uc::reg_read64(h, x86_reg::rax, name_ptr);
+                if (name_ptr != 0)
+                {
+                    array<uint8> w;
+                    w.resize(512);
+                    if (uc::mem_read(h, name_ptr, 512, w))
+                    {
+                        uint n = 0;
+                        while (n + 1 < 512 && (w[n] != 0 || w[n + 1] != 0)) n += 2;
+                        w.resize(n);
+                        name = util::wide_to_string(w, true);
+                    }
+                }
+            }
+            json_obj@ m = json_obj();
+            m.set("base", hex_addr(dll_base));
+            m.set("entry", hex_addr(entry));
+            m.set("size", size);
+            m.set("name", name);
+            mods.push(m);
+            flink = next;
+        }
+    }
+    uc::close(h);
+    if (!ok) { send_error(id, E_FAILED, "peb walk failed"); return; }
+    json_obj@ o = ok_reply("peb_walk", id);
+    o.set("count", mods.length());
+    o.set("modules", mods);
     send_json(o);
 }
 
@@ -2139,6 +2419,21 @@ void on_open()
     console::log(LOG_PREFIX + "connected to relay " + ext_url());
     alert::show_tag("EchoDebug: connected to app", TAG, 80, 255, 120);
     send_hello();
+    // Re-announce the attach so the relay's status/target refresh after a reconnect or script reload.
+    g_state_mx.lock_shared();
+    bool a = g_attached;
+    uint64 pid = g_pid;
+    uint64 base = g_base;
+    string nm = g_name;
+    g_state_mx.unlock_shared();
+    if (a)
+    {
+        json_obj@ ev = new_event("attached");
+        ev.set("pid", pid);
+        ev.set("base", hex_addr(base));
+        ev.set("name", nm);
+        send_json(ev);
+    }
 }
 
 void on_message(string msg)
@@ -2165,6 +2460,9 @@ void on_message(string msg)
     else if (type == "dump") h_dump(r, id);
     else if (type == "freeze") h_freeze(r, id);
     else if (type == "freeze_list") h_freeze_list(r, id);
+    else if (type == "reopen_socket") h_reopen_socket(r, id);
+    else if (type == "resolve_export") h_resolve_export(r, id);
+    else if (type == "peb_walk") h_peb_walk(r, id);
     else send_error(id, E_UNKNOWN_VERB, "unknown verb", type);
 }
 
@@ -2185,11 +2483,11 @@ void on_error(string msg)
 
 void try_auto_attach()
 {
+    JobParams@ p = JobParams();
+    p.attach_name = AUTO_ATTACH;
     uint seq;
-    if (!claim_job("auto_attach", 0, seq)) return;
-    bool sock;
-    if (!do_attach(AUTO_ATTACH, 0, sock)) console::log(LOG_PREFIX + "waiting for " + AUTO_ATTACH);
-    release_job(seq);
+    if (!claim_job("auto_attach", 0, p, seq)) return;
+    create_thread(0, @job_main);   // attach on a one-shot thread, not the 1 tps tick thread
 }
 
 // 1 tps: reconnect with backoff (the app may start after Echo), detect target exit, retry
@@ -2206,15 +2504,16 @@ void keepalive_tick()
     }
 
     g_state_mx.lock();
-    bool died = g_attached && g_job == "" && !process::is_alive();
+    bool died = g_attached && !process::is_alive();   // even mid-job: the target is gone either way
     if (died && AUTO_ATTACH != "") g_auto_pending = true;
     bool auto_try = g_auto_pending && !g_attached && g_job == "" && g_ka_tick % 5 == 0;
     bool stuck = g_job != "" && util::tickcount() - g_job_t0 > JOB_WATCHDOG_MS;
-    if (stuck) g_job = "";
+    if (stuck) { g_job = ""; @g_job_params = null; }
     g_state_mx.unlock();
 
     if (died)
     {
+        restore_freeze();   // undo frozen values while the attach is still alive
         process::detach();
         mark_detached("process exited");
     }
@@ -2288,6 +2587,13 @@ bool main()
 
 void on_unload()
 {
+    // Echo docs: on_unload is where external effects on the target are undone, and the golden
+    // rule is to detach there. Restore frozen values first — the writes need the attach alive.
+    if (was_attached())
+    {
+        restore_freeze();
+        process::detach();
+    }
     ws::disconnect();
     alert::dismiss(TAG);
 }

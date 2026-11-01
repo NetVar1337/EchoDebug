@@ -67,14 +67,22 @@ Error codes: `3000` unknown verb · `3001` not attached · `3002` bad arguments 
 `3004` busy (another long job running) · `3005` limit exceeded.
 
 On connect the agent sends (id-less) `{ "type":"event", "event":"hello", "version":"x.y.z", "protocol":1,
-"user":"<util::get_username()>", "attached":bool, "pid":N, "base":"0x.." }`.
+"user":"<util::get_username()>", "attached":bool, "pid":N, "base":"0x..", "peb":"0x..", "name":"..." }`.
+When the agent is already attached at (re)connect it also re-sends an `attached` event. If the
+relay sees `hello` with `attached:true` but has no `/agent` upstream (e.g. after an app restart,
+which kills Echo's old `process::open_socket` connection), the relay pokes the agent with a
+one-shot `reopen_socket` request; the agent re-opens the native socket and emits a
+`native_socket` event with `ok`.
 
 | verb | request fields | reply fields |
 |---|---|---|
 | `attach` | `name` (string) **or** `pid` (number) | `pid`, `base`, `peb`, `name`, `native_socket` (bool: `process::open_socket` result) |
 | `detach` | – | – |
 | `alive` | – | `alive` (bool), `pid` |
-| `write` | `address`, `data` (hex) | `written` (byte count) |
+| `write` | `address`, `data` (hex), `force?` (bool, default false) | `written` (byte count), `region` ({base,size,present,writable,executable} of the target). Without `force`, writes whose range is not fully mapped are refused (Echo writes physical memory, so an unmapped target must not be written blindly) |
+| `reopen_socket` | – | `ok` (bool: `process::open_socket` result) |
+| `resolve_export` | `module`, `name` | `address`, `module_base` |
+| `peb_walk` | – | `count`, `modules:[{base,entry,size,name}]` (PEB Ldr walk via a process-backed Unicorn emulator; runs on the job slot) |
 | `query` | `address` | `region: {base,size,present,writable,executable}` |
 | `regions` | `start?` (default `0x10000`), `end?` (default `0x7fffffffffff`), `max?` (default 20000), `present_only?` (default true) | `regions:[{base,size,present,writable,executable}]`, `truncated` (bool) |
 | `chain` | `base` (address), `offsets` (array of numbers; may be negative) | `hops:[{address, value}]` (value = pointer read at that hop, hex), `final` (address), `ok` (bool) |
@@ -88,11 +96,19 @@ On connect the agent sends (id-less) `{ "type":"event", "event":"hello", "versio
 | `freeze` | `address`, `data` (hex), `enabled` (bool) | `frozen` (count) — agent rewrites `data` at 20 Hz while enabled |
 | `freeze_list` | – | `entries:[{address,data}]` |
 
-Long jobs (`scan_new`, `scan_next`, `pointer_scan`) run on a one-shot thread; only one at a time
-(otherwise `3004`). They emit progress events `{ "type":"event", "event":"progress", "job":"scan_new",
-"done":N, "total":N }` and finish with the normal reply carrying the original `id`.
+Long jobs (`attach`, `scan_new`, `scan_next`, `pointer_scan`, `emulate`, `peb_walk`, `auto_attach`) run on a
+one-shot thread; only one at a time (otherwise `3004`). Scans and pointer scans emit progress events
+`{ "type":"event", "event":"progress", "job":"scan_new", "done":N, "total":N }` and finish with the
+normal reply carrying the original `id`. Emulation is hard-bounded (`timeout_us` <= 5 s, `max_insns` <= 5M)
+but still goes through the slot so a long run never blocks the other verbs.
 
-Other events: `log` (`level`, `message`), `attached`, `detached`, `freeze_error` (`address`).
+Other events: `log` (`level`, `message`), `attached` (`pid`,`base`,`name` — also re-sent on reconnect),
+`detached`, `freeze_error` (`address`), `patched` (`address`,`old`,`new` — emitted once per `freeze`
+enable so clients can journal the pre-freeze bytes; frozen values are restored on detach/unload),
+`native_socket` (`ok` — health of Echo's native memory socket after a `reopen_socket` poke).
+
+The agent restores the pre-freeze bytes of every frozen address on `detach`, on target exit and in
+`on_unload`, and calls `process::detach()` in `on_unload` (Echo docs teardown rule).
 
 ## Versioning
 
@@ -110,9 +126,9 @@ relay replied with an error frame).
 The tool set covers the whole backend: process control (`status`, `list_processes`, `attach`,
 `detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,
 `memory_regions`), analysis (`disassemble`, `enumerate_functions`, `signature_scan`,
-`signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`),
-scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`, `value_scan_clear`,
-`pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`) and dumping
-(`dump_module`).
+`signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
+`resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
+`value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
+dumping (`dump_module`) and socket housekeeping (`reopen_native_socket`).
 
 Because the relay routes by verb, an MCP client gets exactly the same behaviour as the desktop UI.

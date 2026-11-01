@@ -384,3 +384,56 @@ async fn newer_upstream_replaces_old() {
         Some(Ok(Message::Close(_))) | None | Some(Err(_))
     ));
 }
+
+#[tokio::test]
+async fn hello_attached_without_agent_pokes_reopen_socket() {
+    let (addr, _) = start().await;
+    let mut ext = connect(addr, "/ext").await;
+    let mut client = client_when(addr, false, true).await;
+
+    // attached per the agent, but no /agent (native memory server) connection
+    send(
+        &mut ext,
+        json!({ "type": "event", "event": "hello", "version": "0.4.0", "protocol": 1,
+                "attached": true, "pid": 42, "base": "0x140000000", "peb": "0x1f3a0000b40", "name": "game.exe" }),
+    )
+    .await;
+    // the relay pokes the agent to re-open the native socket
+    let req = recv_until(&mut ext, |v| v["type"] == "reopen_socket").await;
+    assert!(req["id"].is_u64());
+    send(&mut ext, json!({ "type": "reopen_socket_result", "id": req["id"], "success": true, "ok": true })).await;
+    // status carries the target incl. name/peb from hello
+    let st = recv_until(&mut client, |v| {
+        v["type"] == "status" && v["target"]["pid"] == 42
+    })
+    .await;
+    assert_eq!(st["target"]["name"], "game.exe");
+    assert_eq!(st["target"]["peb"], "0x1f3a0000b40");
+    assert_eq!(st["agent"], false);
+
+    // not poked when the native server is connected, or when not attached
+    let mut agent = connect(addr, "/agent").await;
+    let _ = recv_until(&mut client, |v| v["type"] == "status" && v["agent"] == true).await;
+    send(
+        &mut ext,
+        json!({ "type": "event", "event": "hello", "version": "0.4.0", "protocol": 1,
+                "attached": true, "pid": 42, "base": "0x140000000" }),
+    )
+    .await;
+    send(
+        &mut ext,
+        json!({ "type": "event", "event": "hello", "version": "0.4.0", "protocol": 1, "attached": false }),
+    )
+    .await;
+    // give the relay a moment; the only frames the ext should get are none
+    let mut got_poke = false;
+    while let Ok(Some(Ok(Message::Text(t)))) =
+        tokio::time::timeout(Duration::from_millis(300), ext.next()).await
+    {
+        let v: Value = serde_json::from_str(t.as_str()).unwrap();
+        if v["type"] == "reopen_socket" {
+            got_poke = true;
+        }
+    }
+    assert!(!got_poke, "reopen_socket poked although agent upstream is connected / not attached");
+}

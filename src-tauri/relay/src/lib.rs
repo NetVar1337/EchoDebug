@@ -201,6 +201,28 @@ impl Relay {
         }
     }
 
+    /// Sends a one-shot request to the ext agent; the reply (if any) is dropped. Used for
+    /// housekeeping pokes like `reopen_socket` that no client is waiting on.
+    fn poke_ext(&self, verb: &str) {
+        let id = self.next_id();
+        let (tx, _rx) = oneshot::channel();
+        let mut s = self.lock();
+        let Some(conn) = s.ext.as_ref().map(|up| up.conn) else {
+            return;
+        };
+        if s.ext.as_ref().unwrap().tx.send(json!({ "type": verb, "id": id }).to_string()).is_ok() {
+            s.pending.insert(
+                id,
+                Pending {
+                    kind: Kind::Ext,
+                    conn,
+                    orig: Value::Null,
+                    reply: tx,
+                },
+            );
+        }
+    }
+
     fn on_upstream_frame(&self, kind: Kind, text: &str) {
         let Ok(Value::Object(mut msg)) = serde_json::from_str::<Value>(text) else {
             return;
@@ -211,28 +233,42 @@ impl Relay {
                 if kind != Kind::Ext {
                     return;
                 }
-                let status_changed = if msg.get("event").and_then(Value::as_str) == Some("hello") {
+                let event = msg.get("event").and_then(Value::as_str);
+                let (status_changed, reopen_socket) = if event == Some("hello") {
                     let mut s = self.lock();
                     s.ext_version = msg
                         .get("version")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned();
-                    s.target = if msg.get("attached") == Some(&Value::Bool(true)) {
-                        json!({ "pid": msg.get("pid"), "base": msg.get("base") })
+                    let attached = msg.get("attached") == Some(&Value::Bool(true));
+                    s.target = if attached {
+                        json!({
+                            "pid": msg.get("pid"),
+                            "base": msg.get("base"),
+                            "peb": msg.get("peb"),
+                            "name": msg.get("name"),
+                        })
                     } else {
                         Value::Null
                     };
-                    true
-                } else if msg.get("event").and_then(Value::as_str) == Some("detached") {
+                    // Attached per the agent, but no native memory server connected: after an app
+                    // restart Echo's old process::open_socket connection is dead. Ask the agent to
+                    // re-open it (one-shot, fire-and-forget).
+                    let reopen = attached && s.agent.is_none();
+                    (true, reopen)
+                } else if event == Some("detached") {
                     self.lock().target = Value::Null;
-                    true
+                    (true, false)
                 } else {
-                    false
+                    (false, false)
                 };
                 let _ = self.0.events.send(text.to_owned());
                 if status_changed {
                     self.broadcast_status();
+                }
+                if reopen_socket {
+                    self.poke_ext("reopen_socket");
                 }
             }
             Some(Some(id)) => {
