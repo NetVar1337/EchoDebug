@@ -1,9 +1,9 @@
 // Session export / import: a single JSON file that restores the workspace
-// (theme, watches, bookmarks, names, comments, struct layout and AI settings).
+// (theme, watches, bookmarks, names, comments, struct layout).
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { isTauri } from "./tauri";
-import { useUi, type AiProvider } from "@/store/ui";
+import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry, type Bookmark } from "@/store/watch";
 import { useNames, type NameEntry } from "@/store/names";
 import { useTypes, type TypeDef } from "@/store/types";
@@ -18,7 +18,6 @@ export type SessionFile = {
     accent: string;
     tab: string;
     module: string | null;
-    ai: { provider: string; model: string; baseUrl: string };
   };
   watches: WatchEntry[];
   bookmarks: Bookmark[];
@@ -38,8 +37,6 @@ export function buildSession(): SessionFile {
       accent: ui.accent,
       tab: ui.tab,
       module: ui.module,
-      // the API key never leaves the machine
-      ai: { provider: ui.ai.provider, model: ui.ai.model, baseUrl: ui.ai.baseUrl },
     },
     watches: w.watches,
     bookmarks: w.bookmarks,
@@ -96,7 +93,6 @@ export function applySession(data: SessionFile): boolean {
     accent: data.ui?.accent ?? ui.accent,
     tab: (data.ui?.tab ?? ui.tab) as typeof ui.tab,
     module: data.ui?.module ?? ui.module,
-    ai: { ...ui.ai, provider: (data.ui?.ai?.provider ?? ui.ai.provider) as AiProvider, model: data.ui?.ai?.model ?? ui.ai.model, baseUrl: data.ui?.ai?.baseUrl ?? ui.ai.baseUrl },
   });
   const w = useWatch.getState();
   w.setWatches(data.watches ?? [], data.bookmarks ?? []);

@@ -1,4 +1,4 @@
-import { Bookmark, Boxes, Settings, Sparkles, Tag, Target } from "lucide-react";
+import { Bookmark, Boxes, Network, Settings, Tag, Target } from "lucide-react";
 import { useUi, type RailView } from "@/store/ui";
 
 const kItems: { id: RailView; label: string; Icon: typeof Target }[] = [
@@ -6,7 +6,7 @@ const kItems: { id: RailView; label: string; Icon: typeof Target }[] = [
   { id: "modules", label: "Modules", Icon: Boxes },
   { id: "watch", label: "Watchlist & Bookmarks", Icon: Bookmark },
   { id: "names", label: "Names & Comments", Icon: Tag },
-  { id: "ai", label: "AI Assistant", Icon: Sparkles },
+  { id: "mcp", label: "MCP Server", Icon: Network },
 ];
 
 export default function ActivityRail() {

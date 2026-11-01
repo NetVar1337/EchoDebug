@@ -40,6 +40,10 @@ A `/client` request is routed by its `type`:
      (local process list of the machine running the app, sorted by name)
 3. **Everything else** → `/ext`.
 
+Two more local verbs feed the app's MCP panel: `mcp_log` → `{ "type":"mcp_log_result", ..., "entries":[...] }`
+(ring buffer of the last 200 `tools/call` requests the relay saw) and `mcp_meta` → serverInfo,
+capabilities, prompt and resource catalogs.
+
 The relay replaces the client's `id` with a relay-unique integer before forwarding and restores the
 original `id` (any JSON value; default `0`) on the reply. If the needed upstream is not connected the relay
 replies immediately with:
@@ -83,6 +87,11 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `reopen_socket` | – | `ok` (bool: `process::open_socket` result) |
 | `resolve_export` | `module`, `name` | `address`, `module_base` |
 | `peb_walk` | – | `count`, `modules:[{base,entry,size,name}]` (PEB Ldr walk via a process-backed Unicorn emulator; runs on the job slot) |
+| `watch` | `address`, `size?` (1–16, default 4), `label?` | `watched` (count). The agent samples the address at 10 tps and emits `watch_event` on change |
+| `unwatch` | `address` | `watched` (count) |
+| `watch_list` | – | `entries:[{address,size,label,last}]` (last = hex of the most recent sample) |
+| `read_typed` | `address`, `type` (`u8..u64`,`i8..i64`,`f32`,`f64`,`string`,`wstring`,`bytes`), `length?` (bytes/string/wstring cap, ≤ 4096) | `ok`, `value` (decoded string / hex), `raw` (hex bits) |
+| `region_stats` | `start?`, `end?` | region counts and byte totals split by present/writable/executable, `truncated` |
 | `query` | `address` | `region: {base,size,present,writable,executable}` |
 | `regions` | `start?` (default `0x10000`), `end?` (default `0x7fffffffffff`), `max?` (default 20000), `present_only?` (default true) | `regions:[{base,size,present,writable,executable}]`, `truncated` (bool) |
 | `chain` | `base` (address), `offsets` (array of numbers; may be negative) | `hops:[{address, value}]` (value = pointer read at that hop, hex), `final` (address), `ok` (bool) |
@@ -105,7 +114,8 @@ but still goes through the slot so a long run never blocks the other verbs.
 Other events: `log` (`level`, `message`), `attached` (`pid`,`base`,`name` — also re-sent on reconnect),
 `detached`, `freeze_error` (`address`), `patched` (`address`,`old`,`new` — emitted once per `freeze`
 enable so clients can journal the pre-freeze bytes; frozen values are restored on detach/unload),
-`native_socket` (`ok` — health of Echo's native memory socket after a `reopen_socket` poke).
+`native_socket` (`ok` — health of Echo's native memory socket after a `reopen_socket` poke),
+`watch_event` (`address`,`label?`,`old`,`new` — hex bytes before/after a watched address changed).
 
 The agent restores the pre-freeze bytes of every frozen address on `detach`, on target exit and in
 `on_unload`, and calls `process::detach()` in `on_unload` (Echo docs teardown rule).
@@ -117,11 +127,21 @@ differs from the app version and (re)installs the bundled agent into `%APPDATA%\
 
 ## MCP surface
 
-`POST /mcp` speaks JSON-RPC 2.0 with the standard `initialize`, `tools/list` and `tools/call`
-methods. Every tool in `src/lib/tools.json` maps one-to-one onto a verb above; the tool's `verb`
-becomes the request `type`, the tool's `input_schema` is passed through as the request body, and the
-reply is returned as pretty-printed JSON in a single text content block (`isError` is set when the
-relay replied with an error frame).
+`POST /mcp` speaks JSON-RPC 2.0 (single messages and batches; notifications get `202 Accepted`).
+Supported methods: `initialize` (advertises `tools`, `prompts` and `resources` capabilities plus
+`instructions`), `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
+`resources/list`, `resources/read`. Every tool in `src/lib/tools.json` maps one-to-one onto a verb
+above; the tool's `verb` becomes the request `type`, the tool's `input_schema` is passed through as
+the request body, and the reply is returned as pretty-printed JSON in a single text content block
+(`isError` is set when the relay replied with an error frame). Each `tools/call` is appended to a
+200-entry ring buffer, exposed as the `echodebug://mcp/log` resource and the local `mcp_log` verb.
+
+Prompts (`prompts/get` returns ready-to-use user messages with arguments substituted):
+`explain_function` (address), `find_pattern` (pattern, module?), `find_string` (text, module?),
+`pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module).
+
+Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
+`echodebug://target/modules` (fails when no memory server is connected).
 
 The tool set covers the whole backend: process control (`status`, `list_processes`, `attach`,
 `detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,

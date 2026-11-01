@@ -1,9 +1,8 @@
 import { X } from "lucide-react";
 import { useConn } from "@/store/conn";
-import { kProviders } from "@/lib/ai-providers";
 import { kMotionPrefs, useMotion } from "@/store/motion";
 import { attempt, log } from "@/store/output";
-import { kDefaultAi, useUi, type AiProvider, type Theme } from "@/store/ui";
+import { useUi, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
 import { IconButton } from "./ui";
@@ -16,8 +15,6 @@ export default function SettingsModal() {
   const upd = useUpdate();
   const motion = useMotion((s) => s.pref);
   const setMotion = useMotion((s) => s.setPref);
-  const ai = ui.ai;
-  const setAi = (p: Partial<typeof ai>) => ui.set({ ai: { ...ai, ...p } });
   const close = () => ui.set({ settingsOpen: false });
   const reinstall = async () => {
     const r = await attempt("agent", installAgent());
@@ -77,39 +74,11 @@ export default function SettingsModal() {
           </div>
 
           <div className="settings-group">
-            <div className="label">AI assistant</div>
-            <div className="settings-row">
-              <span>Provider</span>
-              <select className="select" value={ai.provider} onChange={(e) => {
-                const provider = e.target.value as AiProvider;
-                setAi({ provider, model: provider === "anthropic" ? kDefaultAi.model : "gpt-4o" });
-              }}>
-                <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI-compatible</option>
-              </select>
+            <div className="label">MCP server</div>
+            <div className="settings-row"><span>Endpoint</span><span className="mono selectable">http://127.0.0.1:{conn.port}/mcp</span></div>
+            <div className="faint" style={{ fontSize: 12 }}>
+              Connect any MCP client: <span className="mono selectable">claude mcp add --transport http echodebug http://127.0.0.1:{conn.port}/mcp</span> — see the MCP Server panel for the tool catalog, prompts, resources and a live call log.
             </div>
-            <div className="settings-row">
-              <span>Endpoint</span>
-              <select className="select" value={ai.baseUrl} onChange={(e) => {
-                const p = kProviders.find((x) => x.baseUrl === e.target.value);
-                setAi(p ? { baseUrl: p.baseUrl, provider: p.provider, model: p.models[0] } : { baseUrl: e.target.value });
-              }}>
-                {kProviders.map((p) => <option key={p.id} value={p.baseUrl}>{p.label}</option>)}
-                {ai.baseUrl && !kProviders.some((p) => p.baseUrl === ai.baseUrl) && <option value={ai.baseUrl}>{ai.baseUrl}</option>}
-              </select>
-            </div>
-            {ai.provider === "openai" && (
-              <div className="settings-row"><span>Base URL</span><input className="input mono" value={ai.baseUrl} onChange={(e) => setAi({ baseUrl: e.target.value })} /></div>
-            )}
-            <div className="settings-row">
-              <span>Model</span>
-              <input className="input mono" list="echodebug-models" value={ai.model} onChange={(e) => setAi({ model: e.target.value })} />
-              <datalist id="echodebug-models">
-                {kProviders.flatMap((p) => p.models).map((m) => <option key={m} value={m} />)}
-              </datalist>
-            </div>
-            <div className="settings-row"><span>API key</span><input className="input mono" type="password" autoComplete="off" value={ai.apiKey} onChange={(e) => setAi({ apiKey: e.target.value })} /></div>
-            <div className="faint" style={{ fontSize: 12 }}>The key is stored locally on this machine (app storage) and sent only to the provider above. Local servers (Ollama, LM Studio) need no key.</div>
           </div>
 
           <div className="settings-group">

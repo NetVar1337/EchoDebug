@@ -437,3 +437,60 @@ async fn hello_attached_without_agent_pokes_reopen_socket() {
     }
     assert!(!got_poke, "reopen_socket poked although agent upstream is connected / not attached");
 }
+
+#[tokio::test]
+async fn mcp_prompts_resources_and_call_log() {
+    let (addr, relay) = start().await;
+
+    // initialize advertises tools + prompts + resources
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }), None).await;
+    assert_eq!(r["result"]["capabilities"], json!({ "tools": {}, "prompts": {}, "resources": {} }));
+    assert!(r["result"]["instructions"].as_str().unwrap().contains("attach"));
+
+    // prompts/list + prompts/get with argument substitution
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/list" }), None).await;
+    let names: Vec<&str> = r["result"]["prompts"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    for want in ["explain_function", "find_pattern", "find_string", "pointer_path", "scan_value", "triage_module"] {
+        assert!(names.contains(&want), "missing prompt {want}");
+    }
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": { "name": "explain_function", "arguments": { "address": "0x140001000" } } }), None).await;
+    let text = r["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("0x140001000") && !text.contains("{{"), "args substituted: {text}");
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 4, "method": "prompts/get", "params": { "name": "nope" } }), None).await;
+    assert_eq!(r["error"]["code"], -32602);
+
+    // resources/list + resources/read (status works without upstreams)
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 5, "method": "resources/list" }), None).await;
+    let uris: Vec<&str> = r["result"]["resources"].as_array().unwrap().iter().map(|x| x["uri"].as_str().unwrap()).collect();
+    assert!(uris.contains(&"echodebug://status") && uris.contains(&"echodebug://mcp/log"));
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": { "uri": "echodebug://status" } }), None).await;
+    let status: Value = serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(status["type"], "status");
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": { "uri": "echodebug://target/modules" } }), None).await;
+    assert_eq!(r["error"]["code"], -32000, "modules resource needs the memory server");
+
+    // a tools/call lands in the ring buffer → echodebug://mcp/log and the local mcp_log verb
+    let mut ext = connect(addr, "/ext").await;
+    let _ = client_when(addr, false, true).await;
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": { "name": "is_alive", "arguments": {} } }), None).await;
+    assert_eq!(r["result"]["isError"], true, "no agent needed for ext verb, but ext not attached → error");
+    let req = recv_until(&mut ext, |v| v["type"] == "alive").await;
+    send(&mut ext, json!({ "type": "alive_result", "id": req["id"], "success": true, "alive": true, "pid": 7 })).await;
+
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 9, "method": "resources/read", "params": { "uri": "echodebug://mcp/log" } }), None).await;
+    let log: Value = serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    let entries = log["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|e| e["tool"] == "is_alive" && e["verb"] == "alive"), "call logged: {log}");
+
+    // local verbs for the app's MCP panel
+    let mut client = client_when(addr, false, true).await;
+    send(&mut client, json!({ "type": "mcp_log", "id": 1 })).await;
+    let r = recv_until(&mut client, |v| v["type"] == "mcp_log_result").await;
+    assert!(r["entries"].as_array().unwrap().iter().any(|e| e["tool"] == "is_alive"));
+    send(&mut client, json!({ "type": "mcp_meta", "id": 2 })).await;
+    let r = recv_until(&mut client, |v| v["type"] == "mcp_meta_result").await;
+    assert_eq!(r["serverInfo"]["name"], "echodebug");
+    assert!(r["prompts"].as_array().unwrap().len() >= 6);
+    assert!(r["resources"].as_array().unwrap().len() >= 4);
+    assert!(r["tools"].as_u64().unwrap() >= 30);
+}

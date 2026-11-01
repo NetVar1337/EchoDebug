@@ -12,7 +12,7 @@ import StatusBar from "@/components/StatusBar";
 import TitleBar from "@/components/TitleBar";
 import TooltipLayer from "@/components/TooltipLayer";
 import WorkspacePanel from "@/components/WorkspacePanel";
-import AiPanel from "@/components/panels/AiPanel";
+import McpPanel from "@/components/panels/McpPanel";
 import ModulesPanel from "@/components/panels/ModulesPanel";
 import NamesPanel from "@/components/panels/NamesPanel";
 import TargetsPanel from "@/components/panels/TargetsPanel";
@@ -26,7 +26,7 @@ import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
 import { Boundary } from "@/components/ui";
 
-const kLeft = { targets: TargetsPanel, modules: ModulesPanel, watch: WatchPanel, names: NamesPanel, ai: AiPanel };
+const kLeft = { targets: TargetsPanel, modules: ModulesPanel, watch: WatchPanel, names: NamesPanel, mcp: McpPanel };
 
 export default function App() {
   const appRef = useRef<HTMLDivElement>(null);

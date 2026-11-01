@@ -51,6 +51,10 @@ const uint64 WRITE_MAX = 0x100000;             // 1 MiB per write
 const uint FREEZE_MAX_ENTRIES = 1024;
 const uint FREEZE_MAX_BYTES = 4096;
 const uint CHAIN_MAX_OFFSETS = 64;
+
+// Watch list limits (agent-side sampler, emits watch_event on change)
+const uint WATCH_MAX_ENTRIES = 256;
+const uint WATCH_MAX_BYTES = 16;
 const uint64 JOB_TIME_LIMIT_MS = 100000;       // the relay fails requests after 120 s
 const uint64 JOB_WATCHDOG_MS = 125000;         // frees the slot if a job thread died mid-way (just past the relay's 120 s timeout)
 
@@ -141,6 +145,10 @@ ScanState@ g_scan;
 // freeze list (g_freeze_mx)
 array<FreezeEntry@> g_freeze;
 
+// watch list (g_watch_mx): sampled at 10 tps, watch_event emitted on change
+mutex@ g_watch_mx = create_mutex();
+array<WatchEntry@> g_watch;
+
 // keepalive thread only
 uint g_ka_tick = 0;
 uint g_ka_next_try = 2;
@@ -167,6 +175,16 @@ class FreezeEntry
     bool has_original;
     bool failed;
     FreezeEntry() { address = 0; has_original = false; failed = false; }
+}
+
+class WatchEntry
+{
+    uint64 address;
+    uint size;
+    string label;
+    array<uint8> prev;    // last sampled bytes
+    bool has_prev;
+    WatchEntry() { address = 0; size = 4; has_prev = false; }
 }
 
 // Everything a job thread needs, claimed atomically with the job slot (g_state_mx).
@@ -1003,6 +1021,13 @@ void clear_freeze()
     g_freeze_mx.unlock();
 }
 
+void clear_watch()
+{
+    g_watch_mx.lock();
+    g_watch.resize(0);
+    g_watch_mx.unlock();
+}
+
 // Writes the pre-freeze bytes back to the target and empties the list. Call while still attached.
 void restore_freeze()
 {
@@ -1061,6 +1086,7 @@ bool do_attach(const string &in name, uint32 pid, bool &out sock)
     // Addresses from a previous target are meaningless now.
     publish_scan(null);
     clear_freeze();
+    clear_watch();
 
     g_state_mx.lock();
     g_attached = true;
@@ -1086,6 +1112,7 @@ void mark_detached(const string &in why)
     g_state_mx.unlock();
     publish_scan(null);
     clear_freeze();
+    clear_watch();
     console::log(LOG_PREFIX + "detached (" + why + ")");
     alert::show_tag("EchoDebug: detached (" + why + ")", TAG, 255, 160, 40);
     send_json(new_event("detached"));
@@ -1442,6 +1469,237 @@ void h_freeze_list(json_obj@ r, int64 id)
     g_freeze_mx.unlock_shared();
     json_obj@ o = ok_reply("freeze_list", id);
     o.set("entries", arr);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Watch list: the agent samples these addresses at 10 tps and emits watch_event on change
+// ---------------------------------------------------------------------------------------------
+
+void h_watch(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 addr;
+    if (!get_addr(r, "address", addr)) { bad_args(id, "watch requires 'address'"); return; }
+    int64 sz;
+    if (!opt_int(r, "size", 4, sz)) { bad_args(id, "size must be a number"); return; }
+    if (sz < 1 || sz > int64(WATCH_MAX_BYTES)) { send_error(id, E_LIMIT, "limit exceeded", "watch size must be 1..16"); return; }
+    string label;
+    if (!opt_str(r, "label", "", label)) { bad_args(id, "label must be a string"); return; }
+
+    g_watch_mx.lock();
+    int idx = -1;
+    for (uint i = 0; i < g_watch.length(); i++)
+        if (g_watch[i].address == addr) { idx = int(i); break; }
+    if (idx >= 0)
+    {
+        g_watch[uint(idx)].size = uint(sz);
+        if (label != "") g_watch[uint(idx)].label = label;
+    }
+    else if (g_watch.length() >= WATCH_MAX_ENTRIES)
+    {
+        g_watch_mx.unlock();
+        send_error(id, E_LIMIT, "limit exceeded", "at most 256 watched addresses");
+        return;
+    }
+    else
+    {
+        WatchEntry@ e = WatchEntry();
+        e.address = addr;
+        e.size = uint(sz);
+        e.label = label;
+        // seed with the current value so the first event only fires on a real change
+        array<uint8>@ b = process::read_bytes(addr, uint(sz));
+        if (b !is null && b.length() == uint(sz)) { e.prev = b; e.has_prev = true; }
+        g_watch.insertLast(e);
+    }
+    uint n = g_watch.length();
+    g_watch_mx.unlock();
+    json_obj@ o = ok_reply("watch", id);
+    o.set("watched", n);
+    send_json(o);
+}
+
+void h_unwatch(json_obj@ r, int64 id)
+{
+    uint64 addr;
+    if (!get_addr(r, "address", addr)) { bad_args(id, "unwatch requires 'address'"); return; }
+    g_watch_mx.lock();
+    for (uint i = 0; i < g_watch.length(); i++)
+        if (g_watch[i].address == addr) { g_watch.removeAt(i); break; }
+    uint n = g_watch.length();
+    g_watch_mx.unlock();
+    json_obj@ o = ok_reply("unwatch", id);
+    o.set("watched", n);
+    send_json(o);
+}
+
+void h_watch_list(json_obj@ r, int64 id)
+{
+    json_obj@ arr = json::array();
+    g_watch_mx.lock_shared();
+    for (uint i = 0; i < g_watch.length(); i++)
+    {
+        json_obj@ e = json_obj();
+        e.set("address", hex_addr(g_watch[i].address));
+        e.set("size", g_watch[i].size);
+        e.set("label", g_watch[i].label);
+        e.set("last", g_watch[i].has_prev ? hex_of(g_watch[i].prev, 0, g_watch[i].prev.length()) : "");
+        arr.push(e);
+    }
+    g_watch_mx.unlock_shared();
+    json_obj@ o = ok_reply("watch_list", id);
+    o.set("entries", arr);
+    send_json(o);
+}
+
+// 10 tps: sample watched addresses, emit watch_event on change.
+void watch_tick()
+{
+    if (!is_attached()) return;
+    g_watch_mx.lock();
+    for (uint i = 0; i < g_watch.length(); i++)
+    {
+        WatchEntry@ e = g_watch[i];
+        array<uint8>@ cur = process::read_bytes(e.address, e.size);
+        if (cur is null || cur.length() != e.size) continue;
+        if (e.has_prev && bytes_eq(cur, 0, e.prev, 0, e.size)) continue;
+        string old = e.has_prev ? hex_of(e.prev, 0, e.prev.length()) : "";
+        e.prev = cur;
+        e.has_prev = true;
+        g_watch_mx.unlock();
+        json_obj@ ev = new_event("watch_event");
+        ev.set("address", hex_addr(e.address));
+        if (e.label != "") ev.set("label", e.label);
+        ev.set("old", old);
+        ev.set("new", hex_of(cur, 0, cur.length()));
+        send_json(ev);
+        g_watch_mx.lock();
+    }
+    g_watch_mx.unlock();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Typed read: one call returns a decoded value instead of raw hex
+// ---------------------------------------------------------------------------------------------
+
+void h_read_typed(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 addr;
+    if (!get_addr(r, "address", addr)) { bad_args(id, "read_typed requires 'address'"); return; }
+    string vt;
+    if (!opt_str(r, "type", "", vt)) { bad_args(id, "read_typed requires 'type'"); return; }
+    int64 len = 0;
+    if (!opt_int(r, "length", 0, len)) { bad_args(id, "length must be a number"); return; }
+
+    json_obj@ o = ok_reply("read_typed", id);
+    o.set("address", hex_addr(addr));
+    o.set("type", vt);
+    if (vt == "u8" || vt == "u16" || vt == "u32" || vt == "u64" ||
+        vt == "i8" || vt == "i16" || vt == "i32" || vt == "i64" || vt == "f32" || vt == "f64")
+    {
+        uint w = vt == "u8" || vt == "i8" ? 1 : vt == "u16" || vt == "i16" ? 2 : vt == "f32" ? 4 : 8;
+        if (vt == "u32" || vt == "i32") w = 4;
+        array<uint8>@ b = process::read_bytes(addr, w);
+        if (b is null || b.length() != w) { o.set("ok", false); send_json(o); return; }
+        uint64 bits = 0;
+        for (uint i = 0; i < w; i++) bits |= uint64(b[i]) << (8 * i);
+        o.set("ok", true);
+        o.set("raw", bits_hex(bits, w));
+        if (vt == "f32" || vt == "f64")
+        {
+            double v;
+            o.set("value", flt_decode(w, bits, v) ? util::format_string("{}", v) : "NaN/Inf");
+        }
+        else if (vt == "i8" || vt == "i16" || vt == "i32" || vt == "i64")
+        {
+            int64 sv = int64(bits);
+            if (w < 8) sv = (sv << (64 - w * 8)) >> (64 - w * 8);   // sign-extend
+            o.set("value", util::format_string("{}", sv));
+        }
+        else o.set("value", util::format_string("{}", bits));
+    }
+    else if (vt == "string" || vt == "wstring")
+    {
+        uint n = uint(len > 0 ? len : (vt == "string" ? 256 : 512));
+        if (n > 4096) n = 4096;
+        array<uint8>@ b = process::read_bytes(addr, n);
+        if (b is null || b.length() == 0) { o.set("ok", false); send_json(o); return; }
+        if (vt == "string")
+        {
+            string s;
+            bool rd = process::read_string(addr, s);   // null-terminated, 256 char max
+            uint k = 0;
+            while (k < b.length() && b[k] != 0) k++;
+            o.set("ok", rd);
+            o.set("value", s);
+            o.set("raw", hex_of(b, 0, k));
+        }
+        else
+        {
+            uint k = 0;
+            while (k + 1 < b.length() && (b[k] != 0 || b[k + 1] != 0)) k += 2;
+            array<uint8> w2;
+            for (uint i = 0; i < k; i++) w2.insertLast(b[i]);
+            o.set("ok", true);
+            o.set("value", util::wide_to_string(w2, true));
+            o.set("raw", hex_of(b, 0, k));
+        }
+    }
+    else if (vt == "bytes")
+    {
+        uint n = uint(len > 0 ? len : 16);
+        if (n > 4096) { send_error(id, E_LIMIT, "limit exceeded", "bytes length must be 1..4096"); return; }
+        array<uint8>@ b = process::read_bytes(addr, n);
+        if (b is null || b.length() != n) { o.set("ok", false); send_json(o); return; }
+        o.set("ok", true);
+        o.set("value", hex_of(b, 0, n));
+    }
+    else { bad_args(id, "unknown type: " + vt + " (u8..u64, i8..i64, f32, f64, string, wstring, bytes)"); return; }
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Region statistics: aggregate the region walk by protection flags
+// ---------------------------------------------------------------------------------------------
+
+void h_region_stats(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 lo;
+    uint64 hi;
+    if (!opt_addr(r, "start", USER_LO, lo) || !opt_addr(r, "end", USER_HI, hi) || hi <= lo)
+    {
+        bad_args(id, "start/end must be addresses with start < end");
+        return;
+    }
+    uint64 t0 = util::tickcount();
+    RegionList@ rl = RegionList();
+    bool trunc = walk_regions(t0, lo, hi, false, false, WALK_MAX_REGIONS, true, rl);
+    uint n_present = 0, n_write = 0, n_exec = 0, n_rw = 0, n_rx = 0;
+    uint64 b_present = 0, b_write = 0, b_exec = 0;
+    for (uint i = 0; i < rl.base.length(); i++)
+    {
+        uint f = rl.flags[i];
+        bool p = (f & RF_PRESENT) != 0, w = (f & RF_WRITABLE) != 0, x = (f & RF_EXEC) != 0;
+        if (p) { n_present++; b_present += rl.size[i]; }
+        if (w) { n_write++; b_write += rl.size[i]; }
+        if (x) { n_exec++; b_exec += rl.size[i]; }
+        if (w && !x) n_rw++;
+        if (x && !w) n_rx++;
+    }
+    json_obj@ o = ok_reply("region_stats", id);
+    o.set("regions", rl.base.length());
+    o.set("present", n_present);
+    o.set("writable", n_write);
+    o.set("executable", n_exec);
+    o.set("rw_regions", n_rw);
+    o.set("rx_regions", n_rx);
+    o.set("present_bytes", b_present);
+    o.set("writable_bytes", b_write);
+    o.set("executable_bytes", b_exec);
+    o.set("truncated", trunc);
     send_json(o);
 }
 
@@ -2463,6 +2721,11 @@ void on_message(string msg)
     else if (type == "reopen_socket") h_reopen_socket(r, id);
     else if (type == "resolve_export") h_resolve_export(r, id);
     else if (type == "peb_walk") h_peb_walk(r, id);
+    else if (type == "watch") h_watch(r, id);
+    else if (type == "unwatch") h_unwatch(r, id);
+    else if (type == "watch_list") h_watch_list(r, id);
+    else if (type == "read_typed") h_read_typed(r, id);
+    else if (type == "region_stats") h_region_stats(r, id);
     else send_error(id, E_UNKNOWN_VERB, "unknown verb", type);
 }
 
@@ -2581,6 +2844,7 @@ bool main()
     ws::connect(ext_url(), @on_open, @on_message, @on_disconnect, @on_error);
     create_thread(1, @keepalive_tick);
     create_thread(20, @freeze_tick);
+    create_thread(10, @watch_tick);
     console::log(LOG_PREFIX + "agent v" + AGENT_VERSION + " loaded, relay " + ext_url());
     return true;
 }

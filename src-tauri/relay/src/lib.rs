@@ -1,11 +1,11 @@
 //! EchoDebug relay: routes `/client` and MCP requests to Echo's native memory server (`/agent`)
 //! and the AngelScript agent (`/ext`). See PROTOCOL.md at the repo root.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, TcpListener};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -40,6 +40,36 @@ static TOOLS: LazyLock<Vec<Value>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../../../src/lib/tools.json"))
         .expect("src/lib/tools.json is a JSON array")
 });
+
+/// MCP prompts: canned RE workflows an MCP client can hand to its model.
+static PROMPTS: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    serde_json::from_str(r#"[
+      { "name": "explain_function", "description": "Explain what the function at an address does: disassemble it, enumerate functions in the module, follow direct calls, note xrefs.",
+        "arguments": [{ "name": "address", "description": "0x-prefixed hex address inside a loaded module", "required": true }] },
+      { "name": "find_pattern", "description": "Find an IDA-style AoB pattern in a module and list the hits with disassembly around them.",
+        "arguments": [{ "name": "pattern", "description": "IDA pattern, e.g. '48 8B ?? ?? ?? ?? ?? E8'", "required": true }, { "name": "module", "description": "Module name; default main executable" }] },
+      { "name": "find_string", "description": "Locate a string in a module and disassemble the code that references it.",
+        "arguments": [{ "name": "text", "description": "Substring to search for", "required": true }, { "name": "module", "description": "Module name; default main executable" }] },
+      { "name": "pointer_path", "description": "Find static pointer chains that reach a target address, then verify one with the chain resolver.",
+        "arguments": [{ "name": "target", "description": "0x-prefixed hex address to reach", "required": true }, { "name": "max_depth", "description": "Pointer depth 1-5, default 3" }] },
+      { "name": "scan_value", "description": "Walk a Cheat-Engine-style value scan: first scan, then narrow with changed/increased/decreased until few candidates remain.",
+        "arguments": [{ "name": "value_type", "description": "u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bytes string wstring", "required": true }, { "name": "value", "description": "Value to search for on the first scan", "required": true }] },
+      { "name": "triage_module", "description": "Read a module's PE headers, imports and sections from live memory and flag what deserves a second look.",
+        "arguments": [{ "name": "module", "description": "Module name", "required": true }] }
+    ]"#).expect("prompts")
+});
+
+/// MCP resources: read-only snapshots of relay state.
+static RESOURCES: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    serde_json::from_str(r#"[
+      { "uri": "echodebug://status", "name": "Relay status", "description": "Connection state, app/agent versions and attached target", "mimeType": "application/json" },
+      { "uri": "echodebug://tools", "name": "Tool catalog", "description": "Every MCP tool with its input schema", "mimeType": "application/json" },
+      { "uri": "echodebug://mcp/log", "name": "MCP call log", "description": "Recent tools/call requests seen by the relay", "mimeType": "application/json" },
+      { "uri": "echodebug://target/modules", "name": "Target modules", "description": "Loaded modules of the attached process", "mimeType": "application/json" }
+    ]"#).expect("resources")
+});
+
+const MCP_LOG_CAP: usize = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -83,6 +113,7 @@ struct Inner {
     next_id: AtomicU64,
     shared: Mutex<Shared>,
     events: broadcast::Sender<String>,
+    mcp_log: Mutex<VecDeque<Value>>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -101,6 +132,7 @@ impl Relay {
             next_id: AtomicU64::new(1),
             shared: Mutex::new(Shared::default()),
             events: broadcast::channel(1024).0,
+            mcp_log: Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -158,6 +190,22 @@ impl Relay {
                     .await
                     .unwrap_or_default();
                 return json!({ "type": "processes_result", "id": orig, "success": true, "processes": processes });
+            }
+            // Local introspection verbs for the app's MCP panel.
+            "mcp_log" => {
+                let entries: Vec<Value> = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+                return json!({ "type": "mcp_log_result", "id": orig, "success": true, "entries": entries });
+            }
+            "mcp_meta" => {
+                return json!({
+                    "type": "mcp_meta_result", "id": orig, "success": true,
+                    "serverInfo": { "name": "echodebug", "version": self.0.app_version },
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {}, "prompts": {}, "resources": {} },
+                    "prompts": *PROMPTS,
+                    "resources": *RESOURCES,
+                    "tools": TOOLS.len(),
+                });
             }
             v if NATIVE_VERBS.contains(&v) => Kind::Agent,
             _ => Kind::Ext,
@@ -395,8 +443,9 @@ impl Relay {
         let result = match method {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                "capabilities": { "tools": {} },
+                "capabilities": { "tools": {}, "prompts": {}, "resources": {} },
                 "serverInfo": { "name": "echodebug", "version": self.0.app_version },
+                "instructions": "Reverse-engineering tools over Echo's hypervisor-backed memory API. Attach with the attach tool before reading/writing memory. Addresses are 0x-prefixed hex strings; byte payloads are lowercase hex. See prompts/list for canned workflows and resources/read for live status.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": TOOLS.iter().map(|t| json!({
@@ -405,6 +454,24 @@ impl Relay {
                 "inputSchema": t["input_schema"],
             })).collect::<Vec<_>>() })),
             "tools/call" => self.call_tool(&params).await,
+            "prompts/list" => Ok(json!({ "prompts": *PROMPTS })),
+            "prompts/get" => {
+                let Some(name) = params["name"].as_str() else {
+                    return Some(rpc_error(id, -32602, "missing prompt name".to_owned()));
+                };
+                let Some(p) = PROMPTS.iter().find(|p| p["name"] == name) else {
+                    return Some(rpc_error(id, -32602, format!("unknown prompt: {name}")));
+                };
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                Ok(prompt_messages(p, &args))
+            }
+            "resources/list" => Ok(json!({ "resources": *RESOURCES })),
+            "resources/read" => {
+                let Some(uri) = params["uri"].as_str() else {
+                    return Some(rpc_error(id, -32602, "missing resource uri".to_owned()));
+                };
+                self.read_resource(uri).await
+            }
             _ => Err((-32601, format!("method not found: {method}"))),
         };
         Some(match result {
@@ -428,8 +495,27 @@ impl Relay {
         };
         req.remove("id");
         req.insert("type".into(), tool["verb"].clone());
+        let t0 = SystemTime::now();
+        let args_str = serde_json::to_string(&req).unwrap_or_default();
+        let verb = tool["verb"].clone();
         let mut reply = self.request(Value::Object(req)).await;
         let is_error = reply["type"] == "error";
+        // Ring-buffer the call for the app's MCP panel and the echodebug://mcp/log resource.
+        let entry = json!({
+            "ts": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+            "tool": name,
+            "verb": verb,
+            "args": truncate_str(&args_str, 400),
+            "ok": !is_error,
+            "ms": t0.elapsed().map(|d| d.as_millis()).unwrap_or(0),
+        });
+        {
+            let mut log = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner());
+            if log.len() >= MCP_LOG_CAP {
+                log.pop_front();
+            }
+            log.push_back(entry);
+        }
         if let Some(m) = reply.as_object_mut() {
             m.remove("type");
             m.remove("id");
@@ -437,6 +523,65 @@ impl Relay {
         let text = serde_json::to_string_pretty(&reply).unwrap_or_default();
         Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }))
     }
+
+    async fn read_resource(&self, uri: &str) -> Result<Value, (i32, String)> {
+        let body = match uri {
+            "echodebug://status" => Value::Object(self.status("status")),
+            "echodebug://tools" => json!({ "tools": TOOLS.iter().map(|t| json!({
+                "name": t["name"], "verb": t["verb"], "description": t["description"], "inputSchema": t["input_schema"],
+            })).collect::<Vec<_>>() }),
+            "echodebug://mcp/log" => {
+                let entries: Vec<Value> = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+                json!({ "entries": entries })
+            }
+            "echodebug://target/modules" => {
+                if self.lock().agent.is_none() {
+                    return Err((-32000, "echo memory server not connected".to_owned()));
+                }
+                let mut req = Map::new();
+                req.insert("type".into(), json!("modules"));
+                self.request(Value::Object(req)).await
+            }
+            other => return Err((-32602, format!("unknown resource: {other}"))),
+        };
+        Ok(json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }] }))
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_owned()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+/// Renders a prompt's `messages` with the caller's arguments substituted.
+fn prompt_messages(prompt: &Value, args: &Value) -> Value {
+    let text = |name: &str, tmpl: &str| -> Value {
+        let mut t = tmpl.to_owned();
+        if let Some(a) = args.get(name).and_then(|v| v.as_str()) {
+            t = t.replace(&format!("{{{{{name}}}}}"), a);
+        }
+        json!({ "role": "user", "content": { "type": "text", "text": t } })
+    };
+    let name = prompt["name"].as_str().unwrap_or_default();
+    let msgs = match name {
+        "explain_function" => vec![text("address",
+            "Explain the function at {{address}}. Steps: disassemble 512 bytes there, list module functions to find its bounds, read the strings it references, and check which functions call it. Summarize its purpose, arguments and side effects, citing addresses as module+0xRVA.")],
+        "find_pattern" => vec![text("pattern",
+            "Find every occurrence of the IDA pattern {{pattern}} (module: {{module}}) with signature scanning, then disassemble 64 bytes around each hit and report what each site does.")],
+        "find_string" => vec![text("text",
+            "Find the string \"{{text}}\" (module: {{module}}) with string scanning, then find code references to each hit (scan for the little-endian address bytes) and disassemble those sites. Report what reads the string.")],
+        "pointer_path" => vec![text("target",
+            "Find static pointer chains that reach {{target}}: run a pointer scan with max_depth {{max_depth}} (default 3), take the first module-rooted result, verify it with the chain resolver, and report module+offset and the offsets array.")],
+        "scan_value" => vec![text("value",
+            "Run a value scan of type {{value_type}} for {{value}}: first scan with compare 'exact' (or 'unknown' if the value is not known yet), then narrow with changed/increased/decreased/unchanged scans until under 50 candidates remain. Report the surviving addresses and their current values.")],
+        "triage_module" => vec![text("module",
+            "Triage the module {{module}}: read its PE headers (sections, imports with IAT addresses, exports), compute per-section entropy from live memory, list suspicious imports (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread,NtProtectVirtualMemory, IsDebuggerPresent, …) with their call sites, and check for INT 2D / VMCALL / PEB-read anti-debug patterns. Summarize the findings.")],
+        _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],
+    };
+    json!({ "description": prompt["description"], "messages": msgs })
 }
 
 fn rpc_error(id: Value, code: i32, message: String) -> Value {

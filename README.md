@@ -24,8 +24,8 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
   signature/string scans, RTTI, function enumeration and disassembly.
 - **`agent/echo_debug.as`** adds everything Echo's server doesn't expose: attach, writes, region walk,
   pointer chains, the value scanner, pointer scan, Unicorn emulation, module dumps and freezing.
-- **The desktop app** runs the relay. It routes every request to the right side, so the UI, the AI
-  assistant and external MCP clients all use the same verbs. See [PROTOCOL.md](PROTOCOL.md).
+- **The desktop app** runs the relay. It routes every request to the right side, so the UI and
+  external MCP clients all use the same verbs. See [PROTOCOL.md](PROTOCOL.md).
 
 ## Quick start
 
@@ -42,7 +42,7 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 
 | Area | What you get |
 |---|---|
-| Shell | Reverse-Slap layout: frameless title bar with File/View/Window/Theme/Help menus and window buttons, activity rail, targets/modules/watch/names/AI panels, scanner, tabbed workspace, output, inspector, status bar, splitters, three themes plus accent colours, boot splash, global tooltips, motion preference (on/auto/off) |
+| Shell | Reverse-Slap layout: frameless title bar with File/View/Window/Theme/Help menus and window buttons, activity rail, targets/modules/watch/names/MCP panels, scanner, tabbed workspace, output, inspector, status bar, splitters, three themes plus accent colours, boot splash, global tooltips, motion preference (on/auto/off) |
 | Navigation | Ctrl+G go-to, **Ctrl+Shift+P command palette** over every action, Alt+← back in the disassembly, X for xrefs, N to rename, `;` to comment |
 | Targets & modules | Local process list, attach by pid/name, module list, open a module in PE/Strings/Disassembly/Memory, dump to `scripts\dmp` |
 | Disassembly | Function list (`enumerate_functions`), virtualized listing, clickable branch targets with history, xrefs (rel32 + RIP-relative), make-signature, bookmarks, user names and comments |
@@ -66,8 +66,8 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 | Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
 | Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
-| AI assistant | Chat with Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Mistral, DeepSeek, Ollama, LM Studio); the model drives the same 33 tools as MCP, sees the current target/module/selection, and asks before running a mutating tool |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP), 33 tools |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 37 tools plus 6 prompts and 4 resources; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
+| Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
 | Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |
@@ -85,11 +85,17 @@ claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp
 The relay listens on `127.0.0.1` only. It rejects browser origins other than the app's own and
 localhost dev servers, so web pages can't reach your target's memory.
 
-### AI settings
+### Connecting an MCP client
 
-Under **Settings → AI**, choose the provider endpoint, model and API key. The key is stored in the app's
-local storage on this machine and is sent only to the endpoint you configure. Local servers
-(Ollama, LM Studio) need no key.
+```bash
+claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp
+```
+
+Any MCP client works — the relay speaks Streamable HTTP JSON-RPC 2.0 (`initialize`, `ping`,
+`tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read`; batches supported,
+notifications answered with `202`). Prompts: `explain_function`, `find_pattern`, `find_string`,
+`pointer_path`, `scan_value`, `triage_module`. Resources: `echodebug://status`, `echodebug://tools`,
+`echodebug://mcp/log`, `echodebug://target/modules`.
 
 ## Development
 
@@ -99,7 +105,7 @@ Requirements: Node 22+, Rust (stable, 1.90+), and on Windows the WebView2 runtim
 npm ci
 npm run tauri dev            # desktop app with hot reload
 npm run dev                  # UI only in a browser (needs a relay: cargo run -p echo-debug-relay --manifest-path src-tauri/Cargo.toml)
-npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, AI loop)
+npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, sessions)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 ```

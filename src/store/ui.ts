@@ -2,14 +2,11 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-export type RailView = "targets" | "modules" | "watch" | "names" | "ai";
+export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug";
 export type Theme = "obsidian" | "nord" | "blood-orange";
-export type AiProvider = "anthropic" | "openai";
-
-export type AiSettings = { provider: AiProvider; apiKey: string; model: string; baseUrl: string };
 
 export const kTabs: { id: TabId; label: string }[] = [
   { id: "disassembly", label: "Disassembly" },
@@ -44,7 +41,6 @@ type UiStore = {
   theme: Theme;
   accent: string;
   autoUpdate: boolean;
-  ai: AiSettings;
   /** last address the user focused anywhere; drives the inspector */
   selected: string | null;
   disasmAt: string | null;
@@ -64,8 +60,6 @@ type UiStore = {
   goModule: (name: string, tab: "pe" | "strings") => void;
 };
 
-export const kDefaultAi: AiSettings = { provider: "anthropic", apiKey: "", model: "claude-sonnet-5-5", baseUrl: "https://api.openai.com/v1" };
-
 export const useUi = create<UiStore>()(
   persist(
     (set) => ({
@@ -79,7 +73,6 @@ export const useUi = create<UiStore>()(
       theme: "obsidian",
       accent: "",
       autoUpdate: true,
-      ai: kDefaultAi,
       selected: null,
       disasmAt: null,
       memoryAt: null,
@@ -99,7 +92,7 @@ export const useUi = create<UiStore>()(
     }),
     {
       name: "echodebug.ui",
-      partialize: (s) => ({ rail: s.rail, tab: s.tab, theme: s.theme, accent: s.accent, autoUpdate: s.autoUpdate, ai: s.ai }),
+      partialize: (s) => ({ rail: s.rail, tab: s.tab, theme: s.theme, accent: s.accent, autoUpdate: s.autoUpdate }),
     },
   ),
 );

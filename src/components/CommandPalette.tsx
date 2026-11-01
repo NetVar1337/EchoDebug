@@ -63,7 +63,7 @@ export default function CommandPalette() {
       { id: "modules", label: "Refresh module list", group: "Target", run: () => void conn.refreshModules() },
       { id: "watch", label: "Open watchlist", group: "Target", run: () => ui.setRail("watch") },
       { id: "names", label: "Open names & comments", group: "Target", run: () => ui.setRail("names") },
-      { id: "ai", label: "Open AI assistant", group: "Target", run: () => ui.setRail("ai") },
+      { id: "mcp", label: "Open MCP server panel", group: "Target", run: () => ui.setRail("mcp") },
       { id: "export", label: "Export session to file", group: "Session", run: () => ui.set({ sessionExportOpen: true }) },
       { id: "import", label: "Import session from file", group: "Session", run: () => ui.set({ sessionImportOpen: true }) },
       { id: "settings", label: "Open settings", group: "App", run: () => ui.set({ settingsOpen: true }) },
