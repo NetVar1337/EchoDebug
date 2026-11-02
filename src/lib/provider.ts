@@ -18,7 +18,10 @@ import { buildRtti, findVftables } from "./analysis/rtti";
 import { sectionEntropies, detectPacker } from "./analysis/entropy";
 import { diffRange } from "./analysis/snapshot";
 import { buildXrefIndex, executableRanges } from "./analysis/xrefindex";
-import { xrefsTo } from "./live";
+import { pdataFunctions, searchModuleCode, xrefsTo } from "./live";
+import { buildCfg, type CfgLine } from "./analysis/cfg";
+import { resolveSwitch } from "./analysis/jumptables";
+import { assemble } from "./analysis/asm";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 
@@ -198,6 +201,58 @@ provide("ui_snapshot_diff", async (args) => {
   const after = await readBytes(a, size);
   if (!before || !after) throw new Error("range not readable");
   return { address: fmtAddr(a), size, delay_ms: wait, ...limitList(diffRange(before, after, fmtAddr(a)), args, 2000) };
+});
+
+provide("ui_cfg", async (args) => {
+  const a = addrArg(args);
+  const m = moduleOf(a, modules());
+  const img = m ? await loadImage(m) : null;
+  const base = m ? toBig(m.base) : 0n;
+  const decode = async (x: bigint): Promise<CfgLine[]> => (await request<{ results: CfgLine[] }>("disassemble", { address: fmtAddr(x), size: 0x100 }, true).catch(() => null))?.results ?? [];
+  const cfg = await buildCfg(a, decode, {
+    maxInsns: num(args, "max_insns", 8000, 50000),
+    bounds: m ? { lo: base, hi: base + BigInt(m.size) } : undefined,
+    switchTargets: img ? (lines, i) => resolveSwitch(lines, i, img, base)?.targets ?? null : undefined,
+  });
+  return {
+    entry: fmtAddr(cfg.entry), truncated: cfg.truncated,
+    blocks: cfg.blocks.map((b) => ({ start: fmtAddr(b.start), end: fmtAddr(b.end), terminator: b.terminator, instructions: args.with_text ? b.lines.map((l) => `${l.address}  ${l.text}`) : b.lines.length })),
+    edges: cfg.edges.map((e) => ({ from: fmtAddr(e.from), to: fmtAddr(e.to), kind: e.kind, ...(e.label ? { case: e.label } : {}) })),
+  };
+});
+
+provide("ui_assemble", async (args) => {
+  const a = addrArg(args);
+  if (typeof args.code !== "string") throw new Error("missing 'code'");
+  const bytes = assemble(args.code, a);
+  return { address: fmtAddr(a), size: bytes.length, data: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(""), note: "not written; pass data to write_memory to apply" };
+});
+
+provide("ui_search_code", async (args) => {
+  const m = pickModule(args);
+  if (typeof args.pattern !== "string") throw new Error("missing 'pattern' (regex over instruction text)");
+  const hits = await searchModuleCode(m, new RegExp(args.pattern, "i"), { limit: num(args, "limit", 200, 5000) });
+  return { module: m.name, count: hits.length, results: hits };
+});
+
+provide("ui_jump_table", async (args) => {
+  const a = addrArg(args);
+  const m = moduleOf(a, modules());
+  if (!m) throw new Error("address is outside every module");
+  const img = await loadImage(m);
+  const r = await request<{ results: CfgLine[] }>("disassemble", { address: fmtAddr(a - 0x40n), size: 0x60 }, true);
+  const lines = r.results ?? [];
+  const i = lines.findIndex((l) => toBig(l.address) === a);
+  if (i < 0) throw new Error("no instruction boundary at that address (pass the indirect jmp itself)");
+  const t = resolveSwitch(lines, i, img, toBig(m.base));
+  if (!t) throw new Error("no recognisable jump table behind this jump");
+  return { ...t, targets: t.targets.map((x) => labelAddr(x, modules())) };
+});
+
+provide("ui_functions", async (args) => {
+  const m = pickModule(args);
+  const pdata = await pdataFunctions(m).catch(() => []);
+  return { module: m.name, source: ".pdata", ...limitList(pdata, args, 2000) };
 });
 
 // ------------------------------------------------------------------------------------------------

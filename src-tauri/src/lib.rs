@@ -90,6 +90,17 @@ fn write_text_file(path: String, contents: String) -> Result<String, String> {
     Ok(p.display().to_string())
 }
 
+/// Writes a binary file the user picked (rebuilt images, dumps).
+#[tauri::command]
+fn write_binary_file(path: String, contents: Vec<u8>) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    fs::write(&p, contents).map_err(|e| format!("write {}: {e}", p.display()))?;
+    Ok(p.display().to_string())
+}
+
 /// Reads a session file the user picked.
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
@@ -162,6 +173,7 @@ pub fn run() {
             install_agent,
             scripts_dir,
             write_text_file,
+            write_binary_file,
             read_text_file,
             read_binary_file
         ])

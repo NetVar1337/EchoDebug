@@ -515,10 +515,19 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let Some(addr) = arg_addr(req, "address") else {
         return json!({ "type": "error", "code": 1002, "message": "invalid or missing arguments", "detail": "disassemble requires 'address'" });
     };
-    let size = req.get("size").and_then(Value::as_u64).unwrap_or(0).clamp(1, 1_048_576) as usize;
+    // size 0 = "the function here": decode up to the first ret (or int3 padding), at most 64 KiB
+    let want = req.get("size").and_then(Value::as_u64).unwrap_or(0);
+    let function_mode = want == 0;
+    let mut size = if function_mode { 0x10000 } else { want.clamp(1, 1_048_576) as usize };
     let mut buf = vec![0u8; size];
-    if !mem.read_at(addr, &mut buf).map(|n| n == size).unwrap_or(false) {
+    let n = mem.read_at(addr, &mut buf).unwrap_or(0);
+    if n == 0 || (!function_mode && n != size) {
         return json!({ "type": "error", "code": 1005, "message": "memory read failed" });
+    }
+    if function_mode {
+        // keep what was readable: a function near the end of a mapping is shorter than 64 KiB
+        size = n;
+        buf.truncate(n);
     }
     let mut out = Vec::new();
     let mut ip = addr;
@@ -526,9 +535,14 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     while off < size {
         match disasm_one(&buf[off..], ip) {
             Some((len, text)) => {
+                let stop = function_mode && (text.starts_with("ret") || text.starts_with("int3") || text.starts_with("ud2"));
                 out.push(json!({ "address": hex_addr(ip), "length": len, "bytes": hex_bytes(&buf[off..off + len]), "text": text }));
                 ip += len as u64;
                 off += len;
+                if stop {
+                    size = off;
+                    break;
+                }
             }
             None => break,
         }
@@ -1333,6 +1347,17 @@ mod tests {
         assert_eq!(hits, vec![0x1001, 0x2000]);
         let one = find_pattern(&mem, &[0x48, 0x83], &[true; 2], 0x1000, 0x5000, false);
         assert_eq!(one, vec![0x1001]);
+    }
+
+    #[test]
+    fn disassemble_function_mode_stops_at_ret() {
+        let mem = FakeMem::new();
+        // push rbp ; ret ; nop
+        mem.put(0x1000, &[0x55, 0xc3, 0x90]);
+        let req = match json!({ "address": "0x1000", "size": 0 }) { Value::Object(m) => m, _ => unreachable!() };
+        let r = native_disassemble(&mem, &req);
+        assert_eq!(r["count"], 2, "{r}");
+        assert_eq!(r["complete"], true);
     }
 
     #[test]

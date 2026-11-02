@@ -20,6 +20,7 @@ import RttiView from "./views/RttiView";
 import XrefView from "./views/XrefView";
 import AntiDebugView from "./views/AntiDebugView";
 import DebuggerView from "./views/DebuggerView";
+import CfgView from "./views/CfgView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -42,6 +43,7 @@ const kViews: Record<TabId, () => JSX.Element> = {
   xrefs: XrefView,
   antidebug: AntiDebugView,
   debugger: DebuggerView,
+  cfg: CfgView,
 };
 
 export default function WorkspacePanel() {

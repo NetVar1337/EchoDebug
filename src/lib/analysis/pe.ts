@@ -128,3 +128,27 @@ export function parsePe(img: Uint8Array): PeInfo {
 
   return { is64, machine, timestamp, entryRva, imageBase, sizeOfImage, subsystem, characteristics, dllCharacteristics, sections, dirs, exports, imports };
 }
+
+export type RuntimeFunction = { begin: number; end: number; unwind: number; chained: boolean };
+
+/**
+ * x64 exception directory (.pdata): one RUNTIME_FUNCTION {begin, end, unwind} per function or
+ * function fragment. Fragments whose UNWIND_INFO has UNW_FLAG_CHAININFO continue the function
+ * before them, so they are flagged `chained` and are not function starts.
+ */
+export function parseRuntimeFunctions(img: Uint8Array, pe?: PeInfo): RuntimeFunction[] {
+  const info = pe ?? parsePe(img);
+  const dir = info.dirs.find((d) => d.name === "Exception");
+  if (!dir || !dir.rva || dir.size < 12) return [];
+  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const out: RuntimeFunction[] = [];
+  for (let o = dir.rva; o + 12 <= dir.rva + dir.size && o + 12 <= img.length; o += 12) {
+    const begin = dv.getUint32(o, true);
+    const end = dv.getUint32(o + 4, true);
+    const unwind = dv.getUint32(o + 8, true);
+    if (!begin || end <= begin || end > img.length) continue;
+    const flags = unwind > 0 && unwind < img.length ? img[unwind & ~1] >> 3 : 0;
+    out.push({ begin, end, unwind, chained: (unwind & 1) === 0 && (flags & 4) !== 0 });
+  }
+  return out.sort((a, b) => a.begin - b.begin);
+}

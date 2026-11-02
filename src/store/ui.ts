@@ -6,11 +6,12 @@ export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger";
+  | "debugger" | "cfg";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
   { id: "disassembly", label: "Disassembly" },
+  { id: "cfg", label: "CFG" },
   { id: "memory", label: "Memory" },
   { id: "structs", label: "Structs" },
   { id: "strings", label: "Strings" },
