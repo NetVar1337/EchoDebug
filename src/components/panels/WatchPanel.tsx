@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
-import { Lock, LockOpen, Plus, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Eye, EyeOff, Lock, LockOpen, Pin, Plus, X } from "lucide-react";
 import { request } from "@/lib/client";
 import { readMany } from "@/lib/batch";
 import { bytesToHex, fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
 import { decode, encode, kSizes, type ValueType } from "@/lib/analysis/values";
 import { readBytes } from "@/lib/memory";
-import { useConn } from "@/store/conn";
+import { onAgentEvent, useConn } from "@/store/conn";
 import { usePatches } from "@/store/patches";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
@@ -13,14 +13,46 @@ import { useWatch, type WatchEntry } from "@/store/watch";
 import { CommitInput, IconButton, Panel } from "../ui";
 
 const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "ptr", "ascii", "utf16"];
+const kAlertTypes = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bytes", "string", "wstring"];
+const kConds = ["changed", "equals", "not_equals", "greater", "less"];
+
+type AgentWatch = { address: string; overlay?: boolean };
+type Alert = { alert_id: number; address: string; value_type: string; condition: string; value: string; label: string; once: boolean; fired: number };
+
+/** Agent addresses are unpadded hex; compare by value. */
+const addrKey = (a: string) => toBig(a).toString(16);
 
 export default function WatchPanel() {
   const w = useWatch();
-  const { agent, modules } = useConn();
+  const { agent, ext, modules, target } = useConn();
   const patches = usePatches();
   const ui = useUi();
   const [values, setValues] = useState<Record<string, Uint8Array | null>>({});
   const [newAddr, setNewAddr] = useState("");
+  // agent-side state: which addresses are pinned to the in-game overlay, and the alert list
+  const [pinned, setPinned] = useState<Set<string>>(new Set());
+  const [overlayOn, setOverlayOn] = useState(true);
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [al, setAl] = useState({ address: "", type: "i32", cond: "changed", value: "", once: false });
+
+  const refreshAgent = useCallback(async () => {
+    if (!ext) return;
+    const [wl, alr] = await Promise.all([
+      request<{ entries: AgentWatch[]; overlay_enabled?: boolean }>("watch_list").catch(() => null),
+      request<{ entries: Alert[] }>("alert_list").catch(() => null),
+    ]);
+    if (wl) {
+      setPinned(new Set(wl.entries.filter((x) => x.overlay).map((x) => addrKey(x.address))));
+      setOverlayOn(wl.overlay_enabled !== false);
+    }
+    if (alr) setAlerts(alr.entries);
+  }, [ext]);
+
+  // the agent clears watches and alerts on attach/detach; a fired one-shot alert removes itself
+  useEffect(() => { void refreshAgent(); }, [refreshAgent, target?.pid]);
+  useEffect(() => onAgentEvent((f) => {
+    if (f.event === "alert_event" || f.event === "attached" || f.event === "detached") void refreshAgent();
+  }), [refreshAgent]);
 
   useEffect(() => {
     if (!agent || w.watches.length === 0) return;
@@ -71,8 +103,57 @@ export default function WatchPanel() {
     if (ok) w.updateWatch(e.id, { frozen: !e.frozen });
   };
 
+  const togglePin = async (e: WatchEntry) => {
+    const ok = pinned.has(addrKey(e.address))
+      ? await attempt("overlay", request("unwatch", { address: e.address }))
+      : await attempt("overlay", request("watch", {
+        address: e.address,
+        size: Math.min(kSizes[e.type], 16),
+        label: e.label || labelAddr(e.address, modules),
+        overlay: true,
+        type: e.type,
+      }));
+    if (ok) void refreshAgent();
+  };
+
+  const toggleOverlay = async () => {
+    const r = await attempt("overlay", request<{ enabled: boolean }>("overlay", { enabled: !overlayOn }));
+    if (r) setOverlayOn(r.enabled);
+  };
+
+  const addAlert = async () => {
+    const a = parseAddress(al.address, modules);
+    if (a === null) return log("warn", "alert", `cannot parse ${al.address}`);
+    const r = await attempt("alert", request<{ alert_id: number }>("alert_add", {
+      address: fmtAddr(a),
+      value_type: al.type,
+      condition: al.cond,
+      ...(al.cond !== "changed" ? { value: al.value } : {}),
+      once: al.once,
+      label: labelAddr(a, modules),
+    }));
+    if (r) {
+      log("info", "alert", `#${r.alert_id} armed: ${labelAddr(a, modules)} ${al.cond} ${al.cond !== "changed" ? al.value : ""}`);
+      void refreshAgent();
+    }
+  };
+
+  const removeAlert = async (id: number) => {
+    if (await attempt("alert", request("alert_remove", { alert_id: id }))) void refreshAgent();
+  };
+
   return (
-    <Panel title="Watchlist & Bookmarks">
+    <Panel
+      title="Watchlist & Bookmarks"
+      actions={ext && (
+        <>
+          {pinned.size > 0 && <span className="faint" style={{ fontSize: 11 }}>{pinned.size} pinned</span>}
+          <IconButton tip={overlayOn ? "In-game overlay on (click to hide)" : "In-game overlay off (click to show)"} onClick={() => void toggleOverlay()}>
+            {overlayOn ? <Eye size={13} className={pinned.size ? "accent" : undefined} /> : <EyeOff size={13} />}
+          </IconButton>
+        </>
+      )}
+    >
       <div className="panel-section">
         <div className="row">
           <input className="input mono grow" placeholder="address or module+0x…" value={newAddr} onChange={(e) => setNewAddr(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} />
@@ -81,7 +162,7 @@ export default function WatchPanel() {
       </div>
       <div className="panel-body">
         <table className="table">
-          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 48 }} /></colgroup>
+          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 72 }} /></colgroup>
           <thead><tr><th>Address</th><th>Type</th><th>Value</th><th /></tr></thead>
           <tbody>
             {w.watches.map((e) => (
@@ -100,6 +181,9 @@ export default function WatchPanel() {
                 </td>
                 <td><CommitInput value={values[e.id] ? decode(values[e.id]!, 0, e.type) : "??"} onCommit={(v) => void write(e, v)} /></td>
                 <td>
+                  <IconButton tip={pinned.has(addrKey(e.address)) ? "Unpin from overlay" : "Pin to overlay"} disabled={!ext} onClick={() => void togglePin(e)}>
+                    <Pin size={12} className={pinned.has(addrKey(e.address)) ? "accent" : undefined} />
+                  </IconButton>
                   <IconButton tip={e.frozen ? "Unfreeze" : "Freeze"} onClick={() => void toggleFreeze(e)}>{e.frozen ? <Lock size={12} className="accent" /> : <LockOpen size={12} />}</IconButton>
                   <IconButton tip="Remove" onClick={() => w.removeWatch(e.id)}><X size={12} /></IconButton>
                 </td>
@@ -108,6 +192,37 @@ export default function WatchPanel() {
           </tbody>
         </table>
         {w.watches.length === 0 && <div className="panel-section faint">No watches. Add one above or from the scanner / inspector.</div>}
+        <div className="panel-head"><div className="panel-title">Alerts</div></div>
+        <div className="panel-section">
+          <div className="row">
+            <input className="input mono grow" placeholder="address or module+0x…" value={al.address} onChange={(e) => setAl({ ...al, address: e.target.value })} />
+            <select className="select" value={al.type} onChange={(e) => setAl({ ...al, type: e.target.value })}>
+              {kAlertTypes.map((t) => <option key={t}>{t}</option>)}
+            </select>
+          </div>
+          <div className="row">
+            <select className="select" value={al.cond} onChange={(e) => setAl({ ...al, cond: e.target.value })}>
+              {kConds.map((c) => <option key={c}>{c}</option>)}
+            </select>
+            {al.cond !== "changed" && <input className="input mono grow" placeholder="value" value={al.value} onChange={(e) => setAl({ ...al, value: e.target.value })} onKeyDown={(e) => e.key === "Enter" && void addAlert()} />}
+            {al.cond === "changed" && <span className="grow" />}
+            <label className="row" title="Remove the alert after it fires once"><input type="checkbox" checked={al.once} onChange={(e) => setAl({ ...al, once: e.target.checked })} />once</label>
+            <IconButton tip="Add alert" disabled={!ext} onClick={() => void addAlert()}><Plus size={14} /></IconButton>
+          </div>
+        </div>
+        <table className="table">
+          <tbody>
+            {alerts.map((a) => (
+              <tr key={a.alert_id}>
+                <td><span className="link mono" onClick={() => ui.goMemory(a.address)}>{a.label || labelAddr(a.address, modules)}</span></td>
+                <td className="mono">{a.value_type} {a.condition}{a.value ? ` ${a.value}` : ""}{a.once ? " · once" : ""}</td>
+                <td style={{ width: 70 }} className={a.fired ? "warn" : "faint"}>{a.fired} fired</td>
+                <td style={{ width: 28 }}><IconButton tip="Remove alert" onClick={() => void removeAlert(a.alert_id)}><X size={12} /></IconButton></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {alerts.length === 0 && <div className="panel-section faint">{ext ? "No alerts. Fired alerts are logged to Output with a memory snapshot." : "Alerts need the Echo agent."}</div>}
         <div className="panel-head"><div className="panel-title">Bookmarks</div></div>
         <table className="table">
           <tbody>

@@ -1,7 +1,7 @@
 // relay / agent / target state, fed by the client's status broadcasts
 import { create } from "zustand";
 import { client, request, type Frame } from "@/lib/client";
-import { type Module } from "@/lib/hex";
+import { hexDump, type Module } from "@/lib/hex";
 import { hostOs, relayInfo } from "@/lib/tauri";
 import { clearImages } from "@/lib/memory";
 import { log } from "./output";
@@ -87,6 +87,7 @@ export const useConn = create<ConnStore>((set, get) => ({
           log("info", "agent", `EchoDebug agent v${f.version} connected (user ${f.user ?? "?"})`);
           if (f.version && f.version !== pkg.version) log("warn", "agent", `agent v${f.version} differs from app v${pkg.version}; reload echo_debug.as in Echo`);
         } else if (ev === "freeze_error") log("warn", "freeze", `write failed at ${f.address}`);
+        else if (ev === "alert_event") logAlert(f);
         else if (ev === "attached" || ev === "detached") log("info", "agent", ev);
         for (const l of eventListeners) l(f);
       }
@@ -125,6 +126,14 @@ export const useConn = create<ConnStore>((set, get) => ({
     set({ target: null, modules: [] });
   },
 }));
+
+/** A fired conditional alert: one Output line, its memory snapshot as the clickable detail. */
+function logAlert(f: Frame): void {
+  const snap = f.snapshot as { address?: string; data?: string } | undefined;
+  const name = f.label ? `${f.label} (${f.address})` : String(f.address);
+  const detail = snap?.address && snap.data ? hexDump(snap.address, snap.data) : undefined;
+  log("warn", "alert", `#${f.alert_id} ${name} ${f.condition}: ${f.old || "?"} → ${f.new} (${f.value})${f.once ? " · one-shot, removed" : ""}`, detail);
+}
 
 function applyStatus(f: Frame): void {
   const s = useConn.getState();
