@@ -41,9 +41,9 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 ## Linux / Ubuntu (preview build)
 
 Releases also ship `EchoDebug_x.y.z_amd64.deb` (install with `sudo dpkg -i …` or the Software app)
-and `EchoDebug.AppImage`. **Auto-update works on the AppImage** (the Tauri updater updates AppImages,
-not .deb installs) — use the AppImage if you want the in-app "Restart to update" flow; `latest.json`
-on each release carries the signed `linux-x86_64` updater artifact.
+and `EchoDebug_x.y.z_amd64.AppImage`. **Both auto-update**: the updater installs the same format
+you installed (a .deb install asks for your password via pkexec to run `dpkg -i`). `latest.json`
+on each release carries signed `linux-x86_64-deb` and `linux-x86_64-appimage` entries.
 
 On Linux the Echo agent is unavailable (it runs inside Echo's Discord overlay on Windows), so the
 relay serves a **local `/proc` backend** itself: attach by pid/name from Targets, then read/write
