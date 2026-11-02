@@ -1136,6 +1136,7 @@ void mark_detached(const string &in why)
     publish_scan(null);
     clear_freeze();
     clear_watch();
+    emud_mark_stale();
     console::log(LOG_PREFIX + "detached (" + why + ")");
     alert::show_tag("EchoDebug: detached (" + why + ")", TAG, 255, 160, 40);
     send_json(new_event("detached"));
@@ -2666,6 +2667,498 @@ void run_emulate(int64 id, EmuJob@ e)
     send_json(o);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Emulated debugger: one persistent Unicorn session (emu_start / emu_step / emu_run / emu_break /
+// emu_set / emu_read / emu_state / emu_close). Process-backed sessions fault pages in from the
+// target on demand and never modify it. Only the ws thread touches the session handle; runs are
+// bounded by timeout_us (<= 5 s), so a long run delays other verbs by at most that much.
+// ---------------------------------------------------------------------------------------------
+
+uint64 g_emud = 0;                 // session handle (0 = none)
+bool g_emud_blank = false;
+array<uint64> g_emud_bps;          // breakpoint addresses
+uint64 g_emud_skip = 0;            // a resumed run does not stop on the breakpoint it sits on
+bool g_emud_skip_on = false;
+uint64 g_emud_hit = 0;
+bool g_emud_hit_on = false;
+uint64 g_emud_count = 0;           // instructions executed over the session's lifetime
+uint64 g_emud_last = 0;            // address of the last instruction the hook saw
+uint64 g_emud_stack = 0;
+array<uint64> g_emud_dirty;        // pages written through emu_set
+mutex@ g_emud_mx = create_mutex();
+bool g_emud_stale = false;         // set by mark_detached (any thread); the ws thread closes the handle
+
+const uint64 EMUD_RET = 0x1000;    // a ret from the start function lands here ("returned")
+
+int u64_index(const array<uint64> &in a, uint64 v)
+{
+    for (uint i = 0; i < a.length(); i++)
+        if (a[i] == v) return int(i);
+    return -1;
+}
+
+bool emud_hook(uint64 h, uint64 address, uint32 size)
+{
+    if (g_emud_skip_on && address == g_emud_skip) { g_emud_skip_on = false; }
+    else if (u64_index(g_emud_bps, address) >= 0)
+    {
+        g_emud_hit = address;
+        g_emud_hit_on = true;
+        g_emud_last = address;
+        uc::stop(h);
+        return false;
+    }
+    g_emud_skip_on = false;
+    g_emud_count++;
+    g_emud_last = address;
+    return true;
+}
+
+void emud_close()
+{
+    if (g_emud != 0) uc::close(g_emud);
+    g_emud = 0;
+    g_emud_bps.resize(0);
+    g_emud_dirty.resize(0);
+    g_emud_count = 0;
+}
+
+void emud_mark_stale()
+{
+    g_emud_mx.lock();
+    g_emud_stale = true;
+    g_emud_mx.unlock();
+}
+
+// Closes a session invalidated by a detach; true when a session is usable.
+bool emud_ready(int64 id)
+{
+    g_emud_mx.lock();
+    bool stale = g_emud_stale;
+    g_emud_stale = false;
+    g_emud_mx.unlock();
+    if (stale && !g_emud_blank) emud_close();
+    if (g_emud == 0) { send_error(id, E_FAILED, "operation failed", "no emulator session: emu_start first"); return false; }
+    return true;
+}
+
+bool emud_ensure(uint64 a, uint64 n)
+{
+    if (uc::mem_query(g_emud, a) >= 0 && uc::mem_query(g_emud, a + n - 1) >= 0)
+    {
+        array<uint8> probe;
+        if (uc::mem_read(g_emud, a, 1, probe)) return true;
+    }
+    if (!g_emud_blank)
+    {
+        // process-backed: a read through the emulator faults the page in; fall back to mapping a copy
+        array<uint8>@ src = process::read_bytes(a & ~uint64(0xFFF), uint(align_up(a + n, 0x1000) - (a & ~uint64(0xFFF))));
+        if (src !is null && uc::mem_map(g_emud, a & ~uint64(0xFFF), src.length(), uint(uc::prot::all)))
+            return uc::mem_write(g_emud, a & ~uint64(0xFFF), src);
+    }
+    uint64 page = a & ~uint64(0xFFF);
+    return uc::mem_map(g_emud, page, align_up(a + n, 0x1000) - page, uint(uc::prot::all));
+}
+
+json_obj@ emud_state(const string &in verb, int64 id, json_obj@ stop)
+{
+    json_obj@ o = ok_reply(verb, id);
+    array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
+    json_obj@ regs = json_obj();
+    uint64 rip = 0;
+    uint64 rsp = 0;
+    for (uint i = 0; i < names.length(); i++)
+    {
+        x86_reg reg;
+        emu_reg(names[i], reg);
+        uint64 v = 0;
+        uc::reg_read64(g_emud, reg, v);
+        if (names[i] == "rip") rip = v;
+        if (names[i] == "rsp") rsp = v;
+        regs.set(names[i], hex_addr(v));
+    }
+    o.set("regs", regs);
+    o.set("rip", hex_addr(rip));
+    o.set("instructions", g_emud_count);
+    o.set("stop", stop);
+    json_obj@ next = json::array();
+    array<uint8> code;
+    if (rip != EMUD_RET && uc::mem_read(g_emud, rip, 64, code))
+    {
+        array<disasm_insn@> insns;
+        if (zydis::disasm(code, rip, insns))
+        {
+            uint off = 0;
+            for (uint i = 0; i < insns.length() && i < 6; i++)
+            {
+                json_obj@ x = json_obj();
+                x.set("address", hex_addr(rip + off));
+                x.set("bytes", hex_of(code, off, insns[i].length));
+                x.set("text", insns[i].text);
+                next.push(x);
+                off += insns[i].length;
+            }
+        }
+    }
+    o.set("next", next);
+    json_obj@ stack = json::array();
+    array<uint8> sb;
+    if (uc::mem_read(g_emud, rsp, 64, sb))
+        for (uint i = 0; i < 8; i++)
+        {
+            uint64 v = 0;
+            for (uint k = 0; k < 8; k++) v |= uint64(sb[i * 8 + k]) << (8 * k);
+            json_obj@ x = json_obj();
+            x.set("address", hex_addr(rsp + i * 8));
+            x.set("value", hex_addr(v));
+            stack.push(x);
+        }
+    o.set("stack", stack);
+    json_obj@ bps = json::array();
+    for (uint i = 0; i < g_emud_bps.length(); i++) bps.push(hex_addr(g_emud_bps[i]));
+    o.set("breakpoints", bps);
+    json_obj@ dirty = json::array();
+    for (uint i = 0; i < g_emud_dirty.length(); i++) dirty.push(hex_addr(g_emud_dirty[i]));
+    o.set("dirty_pages", dirty);
+    return o;
+}
+
+json_obj@ emud_stop(const string &in reason)
+{
+    json_obj@ s = json_obj();
+    s.set("reason", reason);
+    return s;
+}
+
+// Applies "regs" and "write" from r; "" on success, else the problem.
+string emud_apply(json_obj@ r)
+{
+    if (has_key(r, "regs"))
+    {
+        if (r.type("regs") != json_type::object) return "regs must be an object";
+        json_obj@ regs = r.get_obj("regs");
+        array<string>@ keys = regs.keys();
+        for (uint i = 0; i < keys.length(); i++)
+        {
+            x86_reg reg;
+            uint64 v;
+            if (!emu_reg(keys[i], reg)) return "unknown register: " + keys[i];
+            if (!get_addr(regs, keys[i], v)) return "register values must be hex strings: " + keys[i];
+            if (!uc::reg_write64(g_emud, reg, v)) return "cannot write " + keys[i];
+        }
+    }
+    if (has_key(r, "write"))
+    {
+        if (r.type("write") != json_type::array) return "write must be an array";
+        json_obj@ arr = r.get_obj("write");
+        if (arr.length() > EMU_MAX_BLOBS) return "at most 64 write blobs";
+        for (uint i = 0; i < arr.length(); i++)
+        {
+            json_obj@ blob = arr.get_obj_at(i);
+            if (blob is null) return "write entries must be objects";
+            uint64 a;
+            string hex;
+            array<uint8> bytes;
+            if (!get_addr(blob, "address", a) || !opt_str(blob, "data", "", hex) || !parse_hex_bytes(hex, bytes) || bytes.length() == 0)
+                return "each write needs an address and non-empty hex data";
+            if (bytes.length() > EMU_MAX_BLOB_BYTES) return "a write blob is limited to 64 KiB";
+            if (!emud_ensure(a, bytes.length()) || !uc::mem_write(g_emud, a, bytes)) return "cannot write at " + hex_addr(a);
+            for (uint64 p = a & ~uint64(0xFFF); p < a + bytes.length(); p += 0x1000)
+                if (u64_index(g_emud_dirty, p) < 0) g_emud_dirty.insertLast(p);
+        }
+        uc::flush_code(g_emud);   // patched code must not run from a stale translation
+    }
+    return "";
+}
+
+void h_emu_start(json_obj@ r, int64 id)
+{
+    uint64 start;
+    if (!get_addr(r, "start", start)) { bad_args(id, "emu_start requires 'start'"); return; }
+    string codehex;
+    if (!opt_str(r, "code", "", codehex)) { bad_args(id, "code must be a hex string"); return; }
+    array<uint8> code;
+    bool blank = codehex != "";
+    if (blank && (!parse_hex_bytes(codehex, code) || code.length() == 0 || code.length() > EMU_CODE_MAX)) { bad_args(id, "code must be hex, up to 1 MiB"); return; }
+    if (!blank && !require_attached(id)) return;
+    emud_close();
+    g_emud_mx.lock();
+    g_emud_stale = false;
+    g_emud_mx.unlock();
+    g_emud = blank ? uc::create() : uc::create_process();
+    if (g_emud == 0) { send_error(id, E_FAILED, "emulator creation failed"); return; }
+    g_emud_blank = blank;
+    bool ok = true;
+    if (blank)
+    {
+        uint64 page = start & ~uint64(0xFFF);
+        ok = uc::mem_map(g_emud, page, align_up(start + code.length(), 0x1000) - page, uint(uc::prot::all)) && uc::mem_write(g_emud, start, code);
+    }
+    g_emud_stack = pick_stack_base(blank);
+    // the return address is a mapped, never-executed page: reaching it ends the function cleanly
+    ok = ok && uc::setup_stack(g_emud, g_emud_stack, EMU_STACK_SIZE, EMUD_RET);
+    if (ok && uc::mem_query(g_emud, EMUD_RET) < 0) ok = uc::mem_map(g_emud, EMUD_RET, 0x1000, uint(uc::prot::read | uc::prot::exec));
+    ok = ok && uc::reg_write64(g_emud, x86_reg::rip, start) && uc::hook_code(g_emud, @emud_hook);
+    if (!ok) { emud_close(); send_error(id, E_FAILED, "emulator setup failed", "mapping code/stack failed"); return; }
+    string problem = emud_apply(r);
+    if (problem != "") { emud_close(); bad_args(id, problem); return; }
+    if (has_key(r, "breakpoints") && r.type("breakpoints") == json_type::array)
+    {
+        json_obj@ arr = r.get_obj("breakpoints");
+        for (uint i = 0; i < arr.length(); i++)
+        {
+            uint64 a;
+            if (parse_hex_u64(arr.get_string_at(i), a) && u64_index(g_emud_bps, a) < 0) g_emud_bps.insertLast(a);
+        }
+    }
+    g_emud_count = 0;
+    g_emud_last = start;
+    send_json(emud_state("emu_start", id, emud_stop("start")));
+}
+
+// emu_step (count, default 1) and emu_run (until, max_insns): run from rip, stopping at breakpoints.
+void h_emu_go(json_obj@ r, int64 id, bool step)
+{
+    if (!emud_ready(id)) return;
+    int64 count = 1;
+    int64 timeout = 2000000;
+    uint64 until = 0;
+    if (step) { if (!opt_int(r, "count", 1, count)) { bad_args(id, "count must be a number"); return; } }
+    else
+    {
+        if (!opt_int(r, "max_insns", 1000000, count) || !opt_addr(r, "until", 0, until)) { bad_args(id, "max_insns must be a number, until an address"); return; }
+    }
+    if (!opt_int(r, "timeout_us", 2000000, timeout)) { bad_args(id, "timeout_us must be a number"); return; }
+    if (count < 1) count = 1;
+    if (count > EMU_MAX_INSNS * 10) count = EMU_MAX_INSNS * 10;
+    if (timeout < 1000) timeout = 1000;
+    if (timeout > EMU_MAX_TIMEOUT_US) timeout = EMU_MAX_TIMEOUT_US;
+    uint64 rip = 0;
+    uc::reg_read64(g_emud, x86_reg::rip, rip);
+    if (rip == EMUD_RET) { send_json(emud_state(step ? "emu_step" : "emu_run", id, emud_stop("returned"))); return; }
+    g_emud_skip = rip;
+    g_emud_skip_on = true;
+    g_emud_hit_on = false;
+    uint64 before = g_emud_count;
+    int res = uc::start(g_emud, rip, until == 0 ? EMUD_RET : until, uint64(timeout), uint64(count));
+    uint64 now = 0;
+    uc::reg_read64(g_emud, x86_reg::rip, now);
+    uint64 ran = g_emud_count - before;
+    json_obj@ stop;
+    if (g_emud_hit_on) { @stop = emud_stop("breakpoint"); stop.set("address", hex_addr(g_emud_hit)); uc::reg_write64(g_emud, x86_reg::rip, g_emud_hit); }
+    else if (now == EMUD_RET) @stop = emud_stop("returned");
+    else if (res != uc::error::ok)
+    {
+        @stop = emud_stop("fault");
+        stop.set("error_name", uc_error_name(res));
+        stop.set("fault_address", hex_addr(uc::fault_address(g_emud)));
+        stop.set("fault_rip", hex_addr(g_emud_last));
+        uc::reg_write64(g_emud, x86_reg::rip, g_emud_last);
+    }
+    else if (until != 0 && now == until) { @stop = emud_stop("until"); stop.set("address", hex_addr(until)); }
+    else if (int64(ran) >= count) @stop = emud_stop(count == 1 ? "step" : "count");
+    else @stop = emud_stop("timeout");
+    stop.set("ran", ran);
+    send_json(emud_state(step ? "emu_step" : "emu_run", id, stop));
+}
+
+void h_emu_break(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    bool clear = false;
+    bool on = true;
+    if (!opt_bool(r, "clear", false, clear) || !opt_bool(r, "enabled", true, on)) { bad_args(id, "clear/enabled must be bools"); return; }
+    if (clear) g_emud_bps.resize(0);
+    if (has_key(r, "address"))
+    {
+        uint64 a;
+        if (!get_addr(r, "address", a)) { bad_args(id, "address must be a 0x address"); return; }
+        int at = u64_index(g_emud_bps, a);
+        if (on && at < 0) g_emud_bps.insertLast(a);
+        if (!on && at >= 0) g_emud_bps.removeAt(uint(at));
+    }
+    send_json(emud_state("emu_break", id, emud_stop("edit")));
+}
+
+void h_emu_set(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    string problem = emud_apply(r);
+    if (problem != "") { bad_args(id, problem); return; }
+    send_json(emud_state("emu_set", id, emud_stop("edit")));
+}
+
+void h_emu_read(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    uint64 a;
+    uint64 n = 256;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "size", 256, n)) { bad_args(id, "emu_read requires 'address' (and a numeric size)"); return; }
+    if (n == 0 || n > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "size must be 1..65536"); return; }
+    array<uint8> b;
+    if (!uc::mem_read(g_emud, a, uint(n), b))
+    {
+        if (!emud_ensure(a, n) || !uc::mem_read(g_emud, a, uint(n), b)) { send_error(id, E_FAILED, "operation failed", hex_addr(a) + " is not mapped in the emulator or the process"); return; }
+    }
+    json_obj@ o = ok_reply("emu_read", id);
+    o.set("address", hex_addr(a));
+    o.set("size", n);
+    o.set("data", hex_of(b, 0, uint(n)));
+    send_json(o);
+}
+
+void h_emu_state(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    send_json(emud_state("emu_state", id, emud_stop("state")));
+}
+
+void h_emu_close(json_obj@ r, int64 id)
+{
+    bool had = g_emud != 0;
+    emud_close();
+    json_obj@ o = ok_reply("emu_close", id);
+    o.set("closed", had);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Batch / bulk verbs: one round trip for work the app otherwise does with many small requests.
+// ---------------------------------------------------------------------------------------------
+
+const uint SIGB_MAX_PATTERNS = 512;
+const uint SIGB_MAX_HITS = 64;
+const uint64 DISFN_MAX_BYTES = 0x4000;
+const uint RF_MAX_FIELDS = 1024;
+
+uint64 module_or_main(const string &in mod)
+{
+    if (mod == "") return g_base;
+    return process::get_module_base(mod);
+}
+
+// sig_scan_batch: every IDA pattern scanned in Echo (process::find_signatures) in one request.
+void h_sig_scan_batch(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    string mod;
+    int64 max_hits = 16;
+    if (!opt_str(r, "module", "", mod) || !opt_int(r, "max_hits", 16, max_hits)) { bad_args(id, "module must be a string, max_hits a number"); return; }
+    if (!has_key(r, "patterns") || r.type("patterns") != json_type::array) { bad_args(id, "sig_scan_batch requires 'patterns' (array of IDA patterns)"); return; }
+    json_obj@ pats = r.get_obj("patterns");
+    if (pats.length() > SIGB_MAX_PATTERNS) { send_error(id, E_LIMIT, "limit exceeded", "at most 512 patterns"); return; }
+    if (max_hits < 1) max_hits = 1;
+    if (max_hits > SIGB_MAX_HITS) max_hits = SIGB_MAX_HITS;
+    uint64 base = module_or_main(mod);
+    if (base == 0) { send_error(id, E_FAILED, "module not found", mod); return; }
+    json_obj@ out = json::array();
+    for (uint i = 0; i < pats.length(); i++)
+    {
+        string p = pats.get_string_at(i);
+        json_obj@ e = json_obj();
+        e.set("pattern", p);
+        json_obj@ hits = json::array();
+        uint total = 0;
+        array<uint64>@ found = p == "" ? null : process::find_signatures(base, p);
+        if (found !is null)
+        {
+            total = found.length();
+            for (uint k = 0; k < found.length() && k < uint(max_hits); k++) hits.push(hex_addr(found[k]));
+        }
+        e.set("count", total);
+        e.set("results", hits);
+        out.push(e);
+    }
+    json_obj@ o = ok_reply("sig_scan_batch", id);
+    o.set("module_base", hex_addr(base));
+    o.set("results", out);
+    send_json(o);
+}
+
+// disasm_function: decode from `address` to the first ret (zydis::disasm_func), one read.
+void h_disasm_function(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    uint64 n = 0x1000;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "max_bytes", 0x1000, n)) { bad_args(id, "disasm_function requires 'address' (max_bytes optional)"); return; }
+    if (n == 0 || n > DISFN_MAX_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "max_bytes must be 1..16384"); return; }
+    array<uint8>@ b = process::read_bytes(a, uint(n));
+    if (b is null || b.length() == 0) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    array<disasm_insn@> insns;
+    bool complete = zydis::disasm_func(b, a, insns);
+    json_obj@ arr = json::array();
+    uint off = 0;
+    for (uint i = 0; i < insns.length(); i++)
+    {
+        json_obj@ x = json_obj();
+        x.set("address", hex_addr(a + off));
+        x.set("length", insns[i].length);
+        x.set("bytes", hex_of(b, off, insns[i].length));
+        x.set("text", insns[i].text);
+        arr.push(x);
+        off += insns[i].length;
+    }
+    json_obj@ o = ok_reply("disasm_function", id);
+    o.set("count", insns.length());
+    o.set("size", off);
+    o.set("complete", complete);
+    o.set("results", arr);
+    send_json(o);
+}
+
+// read_fields: many typed fields of one struct from a single process::read_buffer snapshot.
+void h_read_fields(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    uint64 size = 0;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "size", 0, size)) { bad_args(id, "read_fields requires 'address'"); return; }
+    if (!has_key(r, "fields") || r.type("fields") != json_type::array) { bad_args(id, "read_fields requires 'fields' ([{offset, type}])"); return; }
+    json_obj@ fs = r.get_obj("fields");
+    if (fs.length() > RF_MAX_FIELDS) { send_error(id, E_LIMIT, "limit exceeded", "at most 1024 fields"); return; }
+    // the snapshot covers every field (u64 width for the last one when size is not given)
+    for (uint i = 0; i < fs.length(); i++)
+    {
+        json_obj@ f = fs.get_obj_at(i);
+        uint64 off = 0;
+        if (f is null || !get_addr(f, "offset", off)) { bad_args(id, "each field needs a numeric offset"); return; }
+        if (off + 8 > size) size = off + 8;
+    }
+    if (size == 0 || size > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "fields must lie within 64 KiB"); return; }
+    memory_buffer@ mb = process::read_buffer(a, size);
+    if (mb is null) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    json_obj@ out = json::array();
+    for (uint i = 0; i < fs.length(); i++)
+    {
+        json_obj@ f = fs.get_obj_at(i);
+        uint64 off = 0;
+        get_addr(f, "offset", off);
+        string t = "u64";
+        opt_str(f, "type", "u64", t);
+        json_obj@ e = json_obj();
+        e.set("offset", off);
+        e.set("type", t);
+        if (t == "u8") e.set("value", util::format_string("{}", mb.read_uint8(off)));
+        else if (t == "u16") e.set("value", util::format_string("{}", mb.read_uint16(off)));
+        else if (t == "u32") e.set("value", util::format_string("{}", mb.read_uint32(off)));
+        else if (t == "i8") e.set("value", util::format_string("{}", mb.read_int8(off)));
+        else if (t == "i16") e.set("value", util::format_string("{}", mb.read_int16(off)));
+        else if (t == "i32") e.set("value", util::format_string("{}", mb.read_int32(off)));
+        else if (t == "i64") e.set("value", util::format_string("{}", mb.read_int64(off)));
+        else if (t == "f32") e.set("value", util::format_string("{}", mb.read_float(off)));
+        else if (t == "f64") e.set("value", util::format_string("{}", mb.read_double(off)));
+        else if (t == "ptr" || t == "u64") e.set("value", t == "ptr" ? hex_addr(mb.read_uint64(off)) : util::format_string("{}", mb.read_uint64(off)));
+        else { bad_args(id, "unknown field type: " + t + " (u8..u64, i8..i64, f32, f64, ptr)"); return; }
+        out.push(e);
+    }
+    json_obj@ o = ok_reply("read_fields", id);
+    o.set("address", hex_addr(a));
+    o.set("fields", out);
+    send_json(o);
+}
+
 // Re-points Echo's native memory server at the relay. The relay asks for this when its /agent
 // side has no connection but the agent is attached (e.g. after an app restart, the old
 // process::open_socket connection is dead and must be re-opened).
@@ -2851,6 +3344,14 @@ void on_message(string msg)
     else if (type == "scan_clear") h_scan_clear(r, id);
     else if (type == "pointer_scan") h_pointer_scan(r, id);
     else if (type == "emulate") h_emulate(r, id);
+    else if (type == "emu_start") h_emu_start(r, id);
+    else if (type == "emu_step") h_emu_go(r, id, true);
+    else if (type == "emu_run") h_emu_go(r, id, false);
+    else if (type == "emu_break") h_emu_break(r, id);
+    else if (type == "emu_set") h_emu_set(r, id);
+    else if (type == "emu_read") h_emu_read(r, id);
+    else if (type == "emu_state") h_emu_state(r, id);
+    else if (type == "emu_close") h_emu_close(r, id);
     else if (type == "dump") h_dump(r, id);
     else if (type == "freeze") h_freeze(r, id);
     else if (type == "freeze_list") h_freeze_list(r, id);
@@ -2862,6 +3363,9 @@ void on_message(string msg)
     else if (type == "watch_list") h_watch_list(r, id);
     else if (type == "read_typed") h_read_typed(r, id);
     else if (type == "region_stats") h_region_stats(r, id);
+    else if (type == "sig_scan_batch") h_sig_scan_batch(r, id);
+    else if (type == "disasm_function") h_disasm_function(r, id);
+    else if (type == "read_fields") h_read_fields(r, id);
     else send_error(id, E_UNKNOWN_VERB, "unknown verb", type);
 }
 

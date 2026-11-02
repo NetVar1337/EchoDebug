@@ -62,6 +62,31 @@ async fn local_backend_against_a_live_process() {
     let before = call(json!({ "type": "read", "address": a, "size": 4 })).await;
     assert_eq!(before["success"], true, "{before}");
 
+    // page monitor: a write to the watched page is seen on the next tick
+    let pm = call(json!({ "type": "page_monitor", "address": a, "size": 0x1000, "interval_ms": 100 })).await;
+    assert_eq!(pm["readable"], 1, "{pm}");
+    let orig4 = before["data"].as_str().unwrap().to_owned();
+    let flipped: String = if orig4 == "01020304" { "05060708".into() } else { "01020304".into() };
+    call(json!({ "type": "write", "address": a, "data": flipped })).await;
+    let mut seen = 0;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let l = call(json!({ "type": "page_monitor_list" })).await;
+        seen = l["entries"][0]["changes"].as_u64().unwrap_or(0);
+        if seen > 0 {
+            break;
+        }
+    }
+    assert!(seen > 0, "page change detected");
+    call(json!({ "type": "write", "address": a, "data": orig4 })).await;
+    let off = call(json!({ "type": "page_monitor", "address": a, "enabled": false })).await;
+    assert_eq!(off["removed"], true);
+    let mm = call(json!({ "type": "module_monitor", "interval_ms": 200 })).await;
+    assert!(mm["modules"].as_u64().unwrap() >= 2, "{mm}");
+    let tl = call(json!({ "type": "module_timeline" })).await;
+    assert_eq!(tl["enabled"], true);
+    call(json!({ "type": "module_monitor", "enabled": false })).await;
+
     let w = call(json!({ "type": "watch", "address": a, "size": 4, "label": "t" })).await;
     assert_eq!(w["watched"], 1, "{w}");
     let f = call(json!({ "type": "freeze", "address": a, "data": "deadbeef", "enabled": true })).await;
@@ -91,6 +116,32 @@ async fn local_backend_against_a_live_process() {
     // process-backed emulation of real libc code: run getpid's first instruction only
     let emu = call(json!({ "type": "emulate", "start": ex["address"], "end": "0x1", "max_insns": 1 })).await;
     assert_eq!(emu["instructions"], 1, "{emu}");
+
+    // bulk verbs: one request for several patterns / a whole function / many fields
+    let first = call(json!({ "type": "read", "address": ex["address"], "size": 8 })).await;
+    let ida: String = first["data"].as_str().unwrap().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().to_owned()).collect::<Vec<_>>().join(" ");
+    let sb = call(json!({ "type": "sig_scan_batch", "module": libc, "patterns": [ida, "de ad be ef de ad be ef 01 02"] })).await;
+    assert!(sb["results"][0]["count"].as_u64().unwrap() >= 1, "{sb}");
+    assert_eq!(sb["results"][1]["count"], 0);
+    let df = call(json!({ "type": "disasm_function", "address": ex["address"] })).await;
+    assert!(df["count"].as_u64().unwrap() >= 1 && df["size"].as_u64().unwrap() > 0, "{df}");
+    let rf = call(json!({ "type": "read_fields", "address": ex["address"], "fields": [{ "offset": 0, "type": "u8" }, { "offset": "0x1", "type": "ptr" }] })).await;
+    assert_eq!(rf["fields"][0]["value"], u64::from_str_radix(&first["data"].as_str().unwrap()[..2], 16).unwrap().to_string(), "{rf}");
+
+    // emulated debugger over the same code: step twice, edit a register, break, close
+    let es = call(json!({ "type": "emu_start", "start": ex["address"] })).await;
+    assert_eq!(es["success"], true, "{es}");
+    assert_eq!(es["rip"], ex["address"]);
+    assert!(!es["next"].as_array().unwrap().is_empty(), "decodes from process memory: {es}");
+    let st = call(json!({ "type": "emu_step", "count": 1 })).await;
+    assert_eq!(st["stop"]["reason"], "step", "{st}");
+    assert_eq!(st["instructions"], 1);
+    let ed = call(json!({ "type": "emu_set", "regs": { "r15": "0x1234" } })).await;
+    assert_eq!(ed["regs"]["r15"], "0x1234", "{ed}");
+    let rd = call(json!({ "type": "emu_read", "address": ex["address"], "size": 8 })).await;
+    assert_eq!(rd["success"], true, "{rd}");
+    let cl = call(json!({ "type": "emu_close" })).await;
+    assert_eq!(cl["closed"], true);
 
     // pointer scan runs (results depend on the process)
     let ps = call(json!({ "type": "pointer_scan", "target": a, "max_depth": 1, "max_results": 10 })).await;

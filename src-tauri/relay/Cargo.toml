@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std", "io-util"] }
 serde_json = "1"
 futures-util = "0.3"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }

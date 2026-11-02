@@ -23,7 +23,10 @@ pub mod auth;
 pub mod local;
 pub mod local_dbg;
 pub mod local_emu;
+pub mod local_emudbg;
 pub mod local_ext;
+pub mod mcp;
+pub mod monitor;
 pub mod symbols;
 
 pub const DEFAULT_PORT: u16 = 47110;
@@ -144,6 +147,10 @@ struct Inner {
     local_backend: AtomicBool,
     /// shared secret for /client and /mcp (None: authentication off)
     token: Mutex<Option<String>>,
+    /// what MCP clients may call (set by the app)
+    policy: Mutex<mcp::Policy>,
+    /// module / page monitors (monitor.rs)
+    monitors: Mutex<monitor::Monitors>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -165,6 +172,8 @@ impl Relay {
             mcp_log: Mutex::new(VecDeque::new()),
             local_backend: AtomicBool::new(local::available()),
             token: Mutex::new(None),
+            policy: Mutex::new(mcp::Policy::default()),
+            monitors: Mutex::new(monitor::Monitors::default()),
         }))
     }
 
@@ -172,6 +181,14 @@ impl Relay {
     pub fn with_token(self, token: Option<String>) -> Self {
         *self.0.token.lock().unwrap_or_else(|e| e.into_inner()) = token;
         self
+    }
+
+    pub(crate) fn monitors(&self) -> &Mutex<monitor::Monitors> {
+        &self.0.monitors
+    }
+
+    pub fn policy(&self) -> mcp::Policy {
+        self.0.policy.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn token(&self) -> Option<String> {
@@ -278,6 +295,37 @@ impl Relay {
                 let entries: Vec<Value> = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
                 return json!({ "type": "mcp_log_result", "id": orig, "success": true, "entries": entries });
             }
+            // Monitors built on modules/read, so they work with every backend.
+            "module_monitor" | "page_monitor" | "module_timeline" | "page_monitor_list" => {
+                let mut v = match verb.as_str() {
+                    "module_monitor" => monitor::module_monitor(self, &req).await,
+                    "page_monitor" => monitor::page_monitor(self, &req).await,
+                    "module_timeline" => monitor::module_timeline(self),
+                    _ => monitor::page_monitor_list(self),
+                };
+                v["id"] = orig;
+                return v;
+            }
+            // The app's MCP policy: {mode, allow, deny, audit}; any omitted field keeps its value.
+            "mcp_policy" => {
+                let cur = self.policy();
+                let next = match mcp::Policy::from_json(&Value::Object(req.clone()), &cur) {
+                    Ok(p) => p,
+                    Err(e) => return error(orig, 2000, &e),
+                };
+                *self.0.policy.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
+                let mut v = next.to_json();
+                v["type"] = json!("mcp_policy_result");
+                v["id"] = orig;
+                v["success"] = json!(true);
+                return v;
+            }
+            // The in-memory call log as JSONL text (the panel's export), plus the audit file's contents.
+            "mcp_audit_export" => {
+                let entries: Vec<String> = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner()).iter().map(Value::to_string).collect();
+                let file = std::fs::read_to_string(mcp::audit_path()).unwrap_or_default();
+                return json!({ "type": "mcp_audit_export_result", "id": orig, "success": true, "jsonl": entries.join("\n"), "audit_file": file, "audit_path": mcp::audit_path().display().to_string() });
+            }
             "mcp_meta" => {
                 return json!({
                     "type": "mcp_meta_result", "id": orig, "success": true,
@@ -286,7 +334,9 @@ impl Relay {
                     "capabilities": capabilities(),
                     "prompts": *PROMPTS,
                     "resources": *RESOURCES,
+                    "resourceTemplates": mcp::templates(),
                     "tools": TOOLS.len(),
+                    "policy": self.policy().to_json(),
                 });
             }
             v if v.starts_with(PROVIDER_PREFIX) => Kind::Provider,
@@ -603,11 +653,7 @@ impl Relay {
                 "instructions": "Reverse-engineering tools over Echo's hypervisor-backed memory API. Attach with the attach tool before reading/writing memory. Addresses are 0x-prefixed hex strings; byte payloads are lowercase hex. See prompts/list for canned workflows and resources/read for live status.",
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": TOOLS.iter().map(|t| json!({
-                "name": t["name"],
-                "description": t["description"],
-                "inputSchema": t["input_schema"],
-            })).collect::<Vec<_>>() })),
+            "tools/list" => Ok(json!({ "tools": TOOLS.iter().map(tool_entry).collect::<Vec<_>>() })),
             "tools/call" => self.call_tool(&params).await,
             "prompts/list" => Ok(json!({ "prompts": *PROMPTS })),
             "prompts/get" => {
@@ -621,6 +667,8 @@ impl Relay {
                 Ok(prompt_messages(p, &args))
             }
             "resources/list" => Ok(json!({ "resources": *RESOURCES })),
+            "resources/templates/list" => Ok(json!({ "resourceTemplates": mcp::templates() })),
+            "completion/complete" => self.complete(&params).await,
             // Updates go out on the GET /mcp event stream to every listener; subscribing is an ack.
             "resources/subscribe" | "resources/unsubscribe" | "logging/setLevel" => Ok(json!({})),
             "resources/read" => {
@@ -651,12 +699,44 @@ impl Relay {
             _ => return Err((-32602, "arguments must be an object".to_owned())),
         };
         req.remove("id");
+        let verb_s = tool["verb"].as_str().unwrap_or_default().to_owned();
         req.insert("type".into(), tool["verb"].clone());
         let t0 = SystemTime::now();
         let args_str = serde_json::to_string(&req).unwrap_or_default();
         let verb = tool["verb"].clone();
-        let mut reply = self.request(Value::Object(req)).await;
+        let policy = self.policy();
+        let mut outcome = "ok";
+        let mut reply = match mcp::decide(&policy, name, &verb_s) {
+            mcp::Decision::Allow => self.request(Value::Object(req)).await,
+            mcp::Decision::Deny(why) => {
+                outcome = "denied";
+                error(Value::Null, 4003, &why)
+            }
+            mcp::Decision::Ask => {
+                // the app window shows an approve/deny dialog; no window → refuse
+                let mut ask = Map::new();
+                ask.insert("type".into(), json!("ui_approve"));
+                ask.insert("tool".into(), json!(name));
+                ask.insert("verb".into(), verb.clone());
+                ask.insert("arguments".into(), Value::Object(req.clone()));
+                let r = self.request(Value::Object(ask)).await;
+                if r["approved"] == true {
+                    self.request(Value::Object(req)).await
+                } else {
+                    outcome = "denied";
+                    let why = if r["type"] == "error" {
+                        format!("'{name}' needs approval in the EchoDebug window (policy: ask), which did not answer: {}", r["message"].as_str().unwrap_or("no window"))
+                    } else {
+                        format!("the user denied '{name}' in the EchoDebug window")
+                    };
+                    error(Value::Null, 4003, &why)
+                }
+            }
+        };
         let is_error = reply["type"] == "error";
+        if is_error && outcome == "ok" {
+            outcome = "error";
+        }
         // Ring-buffer the call for the app's MCP panel and the echodebug://mcp/log resource.
         let entry = json!({
             "ts": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
@@ -664,8 +744,13 @@ impl Relay {
             "verb": verb,
             "args": truncate_str(&args_str, 400),
             "ok": !is_error,
+            "outcome": outcome,
             "ms": t0.elapsed().map(|d| d.as_millis()).unwrap_or(0),
         });
+        if policy.audit {
+            let e = entry.clone();
+            tokio::task::spawn_blocking(move || mcp::append_audit(&e));
+        }
         {
             let mut log = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner());
             if log.len() >= MCP_LOG_CAP {
@@ -678,7 +763,42 @@ impl Relay {
             m.remove("id");
         }
         let text = serde_json::to_string_pretty(&reply).unwrap_or_default();
-        Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }))
+        // structuredContent mirrors the text (outputSchema: an object) so clients can skip parsing
+        Ok(json!({ "content": [{ "type": "text", "text": text }], "structuredContent": reply, "isError": is_error }))
+    }
+
+    /// completion/complete for prompt and resource-template arguments.
+    async fn complete(&self, params: &Value) -> Result<Value, (i32, String)> {
+        let arg = params["argument"]["name"].as_str().unwrap_or_default();
+        let prefix = params["argument"]["value"].as_str().unwrap_or_default();
+        let kind = mcp::completion_kind(arg);
+        let strings = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let values: Vec<String> = match kind {
+            Some("value_type") => strings(mcp::VALUE_TYPES),
+            Some("format") => strings(&["cpp", "c", "ida", "ghidra", "binja", "reclass"]),
+            Some("module") => self.module_names().await,
+            Some("address") => {
+                // named addresses from the app window, then module names (module+0x… is accepted everywhere)
+                let mut out = Vec::new();
+                let mut req = Map::new();
+                req.insert("type".into(), json!("ui_names"));
+                let r = self.request(Value::Object(req)).await;
+                if let Some(list) = r["names"].as_array() {
+                    out.extend(list.iter().filter_map(|n| n["name"].as_str().map(str::to_owned)));
+                }
+                out.extend(self.module_names().await.into_iter().map(|m| format!("{m}+0x")));
+                out
+            }
+            _ => Vec::new(),
+        };
+        Ok(mcp::rank(values, prefix))
+    }
+
+    async fn module_names(&self) -> Vec<String> {
+        let mut req = Map::new();
+        req.insert("type".into(), json!("modules"));
+        let r = self.request(Value::Object(req)).await;
+        r["modules"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_owned)).collect()).unwrap_or_default()
     }
 
     async fn read_resource(&self, uri: &str) -> Result<Value, (i32, String)> {
@@ -699,7 +819,20 @@ impl Relay {
                 req.insert("type".into(), json!("modules"));
                 self.request(Value::Object(req)).await
             }
-            other => return Err((-32602, format!("unknown resource: {other}"))),
+            other => {
+                let Some(req) = mcp::template_request(other) else {
+                    return Err((-32602, format!("unknown resource: {other}")));
+                };
+                let mut r = self.request(Value::Object(req)).await;
+                if r["type"] == "error" {
+                    return Err((-32000, r["message"].as_str().unwrap_or("request failed").to_owned()));
+                }
+                if let Some(m) = r.as_object_mut() {
+                    m.remove("type");
+                    m.remove("id");
+                }
+                r
+            }
         };
         Ok(json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }] }))
     }
@@ -773,7 +906,23 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
 }
 
 fn capabilities() -> Value {
-    json!({ "tools": {}, "prompts": {}, "resources": { "subscribe": true }, "logging": {} })
+    json!({ "tools": { "listChanged": false }, "prompts": {}, "resources": { "subscribe": true }, "logging": {}, "completions": {} })
+}
+
+/// One tools/list entry: schema, annotations from the verb, and a generic object outputSchema
+/// (every reply is a JSON object, also sent as structuredContent).
+fn tool_entry(t: &Value) -> Value {
+    let verb = t["verb"].as_str().unwrap_or_default();
+    let name = t["name"].as_str().unwrap_or_default();
+    let title = name.replace('_', " ");
+    json!({
+        "name": name,
+        "title": title,
+        "description": t["description"],
+        "inputSchema": t["input_schema"],
+        "outputSchema": { "type": "object", "additionalProperties": true },
+        "annotations": mcp::annotations(verb, &title),
+    })
 }
 
 /// Maps one relay broadcast onto the MCP notifications it implies (sent on `GET /mcp` streams).
@@ -785,6 +934,10 @@ fn notifications_for(frame: &Value) -> Vec<Value> {
             note("notifications/resources/updated", json!({ "uri": "echodebug://target/modules" })),
         ],
         (Some("event"), Some("progress")) => vec![],
+        (Some("event"), Some(ev @ ("module_loaded" | "module_unloaded"))) => vec![
+            note("notifications/resources/updated", json!({ "uri": "echodebug://target/modules" })),
+            note("notifications/message", json!({ "level": "info", "logger": ev, "data": frame })),
+        ],
         (Some("event"), Some(ev)) => {
             let level = match frame["level"].as_str() {
                 Some("error") => "error",
@@ -1034,6 +1187,121 @@ pub fn bind(port: u16) -> std::io::Result<TcpListener> {
 /// Serves the relay on an already-bound listener (must be called inside a tokio runtime).
 pub async fn run(listener: TcpListener, relay: Relay) -> std::io::Result<()> {
     axum::serve(tokio::net::TcpListener::from_std(listener)?, router(relay)).await
+}
+
+/// MCP over stdio (`echodebug-relay --stdio`): newline-delimited JSON-RPC on stdin/stdout, for
+/// clients that launch servers as subprocesses. A relay already listening on `port` (the desktop
+/// app, or a headless relay) is used through its /mcp endpoint with the token from the config
+/// directory; otherwise this process becomes the relay on `port` (Echo and the app connect to it as
+/// usual) and also forwards resource/log notifications to stdout.
+pub async fn serve_stdio(port: u16, app_version: String) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = out_rx.recv().await {
+            if stdout.write_all(line.as_bytes()).await.is_err() || stdout.write_all(b"\n").await.is_err() {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
+    let token = auth::default_token()?;
+    let embedded = match bind(port) {
+        Ok(listener) => {
+            let relay = Relay::new(app_version, DEFAULT_TIMEOUT).with_token(token.clone());
+            eprintln!("echodebug: stdio MCP with an embedded relay on ws://127.0.0.1:{port}");
+            tokio::spawn(run(listener, relay.clone()));
+            let mut events = relay.0.events.subscribe();
+            let tx = out_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(text) => {
+                            let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+                            for n in notifications_for(&frame) {
+                                if tx.send(n.to_string()).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return,
+                    }
+                }
+            });
+            Some(relay)
+        }
+        Err(_) => {
+            eprintln!("echodebug: stdio MCP bridged to the relay on http://127.0.0.1:{port}/mcp");
+            None
+        }
+    };
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = out_tx.send(rpc_error(Value::Null, -32700, format!("parse error: {e}")).to_string());
+                continue;
+            }
+        };
+        let tx = out_tx.clone();
+        match &embedded {
+            Some(relay) => {
+                let relay = relay.clone();
+                tokio::spawn(async move {
+                    if let Some(r) = relay.rpc(msg).await {
+                        let _ = tx.send(r.to_string());
+                    }
+                });
+            }
+            None => {
+                let (url, token) = (url.clone(), token.clone());
+                tokio::task::spawn_blocking(move || {
+                    let id = msg.get("id").cloned();
+                    match bridge_post(&url, token.as_deref(), &msg) {
+                        Ok(Some(r)) => {
+                            let _ = tx.send(r);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if let Some(id) = id {
+                                let _ = tx.send(rpc_error(id, -32000, format!("relay at {url}: {e}")).to_string());
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    drop(out_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// One JSON-RPC message POSTed to a running relay; `None` for a 202 (notification).
+fn bridge_post(url: &str, token: Option<&str>, msg: &Value) -> Result<Option<String>, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(DEFAULT_TIMEOUT + Duration::from_secs(5)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut req = agent.post(url).header("Content-Type", "application/json").header("Accept", "application/json");
+    if let Some(t) = token {
+        req = req.header("Authorization", &format!("Bearer {t}"));
+    }
+    let mut resp = req.send(msg.to_string()).map_err(|e| e.to_string())?;
+    match resp.status().as_u16() {
+        202 => Ok(None),
+        200 => resp.body_mut().read_to_string().map(Some).map_err(|e| e.to_string()),
+        401 => Err("401: the relay token in the config directory does not match the running relay (set ECHODEBUG_TOKEN)".into()),
+        s => Err(format!("HTTP {s}")),
+    }
 }
 
 /// Headless entry point: binds, loads (or creates) the relay token and serves.

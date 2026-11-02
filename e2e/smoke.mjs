@@ -162,6 +162,24 @@ await step("debugger stops at a breakpoint and detaches", async () => {
   await until(async () => (await page.locator("button", { hasText: "Attach debugger" }).count()) > 0);
 });
 
+await step("emulated debugger steps classify and runs it to its return", async () => {
+  await tab("Emu Debugger");
+  await page.locator('input[placeholder="function address · game.exe+0x1234"]').fill(`e2e-target+${sym("classify")}`);
+  await page.locator("button", { hasText: "Start session" }).click();
+  await until(async () => (await page.locator("text=session started").count()) > 0);
+  await page.locator("[aria-label='Step one instruction']").click();
+  await until(async () => (await page.locator("text=stepped 1 instruction").count()) > 0);
+  await page.locator("[aria-label='Run to a breakpoint, a return or a fault']").click();
+  await until(async () => (await page.locator("text=the function returned").count()) > 0);
+});
+
+await step("page monitor sees the counter's page change", async () => {
+  await tab("Monitors");
+  await page.locator('input[placeholder="address · module+0x…"]').last().fill(`e2e-target+${sym("counter")}`);
+  await page.locator("button.primary", { hasText: /^Watch$/ }).click();
+  await until(async () => (await page.locator("text=/[1-9][0-9]* changes/").count()) > 0, 15000);
+});
+
 await step("YARA matches the greeting", async () => {
   await tab("YARA");
   await page.locator("textarea").fill('rule greeting { strings: $g = "hello from the EchoDebug" condition: $g }');
