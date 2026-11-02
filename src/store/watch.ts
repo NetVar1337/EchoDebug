@@ -1,10 +1,11 @@
 // watchlist + bookmarks, persisted locally
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { migrateAnchored, type Anchor } from "@/lib/projects";
 import type { ValueType } from "@/lib/analysis/values";
 
 export type WatchEntry = { id: string; address: string; label: string; type: ValueType; frozen: boolean };
-export type Bookmark = { id: string; address: string; label: string };
+export type Bookmark = { id: string; address: string; label: string; anchor?: Anchor };
 
 type WatchStore = {
   watches: WatchEntry[];
@@ -34,6 +35,6 @@ export const useWatch = create<WatchStore>()(
       removeBookmark: (id) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.id !== id) })),
       setWatches: (watches, bookmarks) => set({ watches, bookmarks }),
     }),
-    { name: "echodebug.watch" },
+    { name: "echodebug.watch", version: 1, migrate: migrateAnchored("bookmarks") },
   ),
 );

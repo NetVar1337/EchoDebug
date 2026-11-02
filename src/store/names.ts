@@ -3,8 +3,9 @@
 // writes an IDC-style script for IDA and a .json sidecar.
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { migrateAnchored, type Anchor } from "@/lib/projects";
 
-export type NameEntry = { address: string; name: string; comment: string };
+export type NameEntry = { address: string; name: string; comment: string; anchor?: Anchor };
 
 type NamesStore = {
   names: NameEntry[];
@@ -21,7 +22,7 @@ type NamesStore = {
   list: () => NameEntry[];
 };
 
-const norm = (a: string) => a.toLowerCase().replace(/^0x/, "").padStart(16, "0");
+export const norm = (a: string) => a.toLowerCase().replace(/^0x/, "").padStart(16, "0");
 
 export const useNames = create<NamesStore>()(
   persist(
@@ -33,7 +34,7 @@ export const useNames = create<NamesStore>()(
           const rest = s.names.filter((n) => norm(n.address) !== key);
           if (!name.trim()) return { names: rest };
           const prev = s.names.find((n) => norm(n.address) === key);
-          return { names: [...rest, { address: key, name: name.trim(), comment: prev?.comment ?? "" }] };
+          return { names: [...rest, { ...prev, address: key, name: name.trim(), comment: prev?.comment ?? "" }] };
         }),
       comment: (address, text) =>
         set((s) => {
@@ -43,7 +44,7 @@ export const useNames = create<NamesStore>()(
           return {
             names: [
               ...s.names.filter((n) => norm(n.address) !== key),
-              { address: key, name: prev?.name ?? "", comment: text.trim() },
+              { ...prev, address: key, name: prev?.name ?? "", comment: text.trim() },
             ],
           };
         }),
@@ -53,7 +54,7 @@ export const useNames = create<NamesStore>()(
       commentOf: (address) => get().names.find((n) => norm(n.address) === norm(address))?.comment ?? "",
       list: () => get().names,
     }),
-    { name: "echodebug.names" },
+    { name: "echodebug.names", version: 1, migrate: migrateAnchored("names") },
   ),
 );
 

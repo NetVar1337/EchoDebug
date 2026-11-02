@@ -1,10 +1,13 @@
 // Names & comments panel: the user's own symbol names and annotations,
 // with IDA / Ghidra script export.
 import { useMemo, useState } from "react";
-import { Download, Search, Trash2 } from "lucide-react";
+import { Download, Save, Search, Trash2, Upload } from "lucide-react";
 import { labelAddr } from "@/lib/hex";
 import { toGhidra, toIdc, useNames } from "@/store/names";
 import { useConn } from "@/store/conn";
+import { attempt } from "@/store/output";
+import { acceptBuild, exportProject, importProject, relocate, saveProject, useProjects } from "@/store/projects";
+import { countRelocation } from "@/lib/projects";
 import { useUi } from "@/store/ui";
 import { copy, IconButton, Panel } from "../ui";
 
@@ -13,6 +16,8 @@ export default function NamesPanel() {
   const modules = useConn((s) => s.modules);
   const ui = useUi();
   const [filter, setFilter] = useState("");
+  const project = useProjects();
+  const counts = project.last && countRelocation(project.last.map((r) => r.status));
 
   const shown = useMemo(() => {
     const f = filter.toLowerCase();
@@ -41,6 +46,31 @@ export default function NamesPanel() {
           </button>
           <button className="btn small" disabled={!names.names.length} onClick={() => void copy(JSON.stringify(names.names, null, 2))}>Copy JSON</button>
         </div>
+        <div className="label">Project · saved per module as RVAs</div>
+        <div className="row wrap">
+          <button className="btn small" disabled={!modules.length || !!project.busy} title="Make a relocation signature for every name, comment and bookmark, and remember each module's build"
+            onClick={() => void attempt("project", saveProject())}><Save size={12} /> Save</button>
+          <button className="btn small" onClick={() => void attempt("project", exportProject())}><Download size={12} /> Export</button>
+          <button className="btn small" onClick={() => void attempt("project", importProject())}><Upload size={12} /> Import</button>
+          {project.busy && <span className="faint" style={{ fontSize: 12 }}>{project.busy}…</span>}
+        </div>
+        {project.changed.map((c) => (
+          <div key={c.module} className="row wrap" style={{ fontSize: 12 }}>
+            <span className="warn grow">{c.module} is a different build (size 0x{c.from.size.toString(16)} → 0x{c.to.size.toString(16)}{c.from.timestamp !== c.to.timestamp ? ", new timestamp" : ""})</span>
+            <button className="btn small primary" disabled={!!project.busy} onClick={() => void attempt("project", relocate(c))}>Re-locate</button>
+            <button className="btn small" disabled={!!project.busy} onClick={() => acceptBuild(c.module, c.to)}>Keep RVAs</button>
+          </div>
+        ))}
+        {project.last && counts && (
+          <div style={{ fontSize: 12 }}>
+            <span className="faint">Last re-locate: </span>{counts.matched} matched · {counts.moved} moved · <span className={counts.lost ? "warn" : ""}>{counts.lost} lost</span>
+            {project.last.filter((r) => r.status !== "same").map((r, i) => (
+              <div key={i} className="mono faint ellipsis" title={r.status}>
+                {r.kind} {r.label}: {r.oldRva} {r.status === "moved" ? `→ ${r.newRva}` : `(${r.status === "nosig" ? "no signature" : r.status})`}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="faint" style={{ fontSize: 12 }}>
           Press <span className="mono">N</span> in the disassembly to rename the current function, <span className="mono">;</span> to comment it.
         </div>

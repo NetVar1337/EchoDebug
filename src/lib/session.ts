@@ -46,24 +46,34 @@ export function buildSession(): SessionFile {
 }
 
 export async function exportSession(): Promise<string | null> {
-  const data = buildSession();
-  const text = JSON.stringify(data, null, 2);
-  if (!isTauri()) {
-    // Browser fallback: download the file.
-    const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
-    const a = Object.assign(document.createElement("a"), { href: url, download: "echodebug-session.json" });
-    a.click();
-    URL.revokeObjectURL(url);
-    return "echodebug-session.json";
-  }
-  const path = await save({ defaultPath: "echodebug-session.json", filters: [{ name: "EchoDebug session", extensions: ["json"] }] });
-  if (!path) return null;
-  await invoke("write_text_file", { path, contents: text });
-  log("info", "session", `exported to ${path}`);
+  const path = await saveTextFile("echodebug-session.json", JSON.stringify(buildSession(), null, 2), "EchoDebug session");
+  if (path) log("info", "session", `exported to ${path}`);
   return path;
 }
 
 export async function importSession(): Promise<boolean> {
+  const text = await openTextFile("EchoDebug session");
+  return text !== null && applySession(JSON.parse(text) as SessionFile);
+}
+
+/** Saves a JSON text file: Tauri save dialog, or a browser download. Returns the path, or null if cancelled. */
+export async function saveTextFile(name: string, text: string, filterName: string): Promise<string | null> {
+  if (!isTauri()) {
+    // Browser fallback: download the file.
+    const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    const a = Object.assign(document.createElement("a"), { href: url, download: name });
+    a.click();
+    URL.revokeObjectURL(url);
+    return name;
+  }
+  const path = await save({ defaultPath: name, filters: [{ name: filterName, extensions: ["json"] }] });
+  if (!path) return null;
+  await invoke("write_text_file", { path, contents: text });
+  return path;
+}
+
+/** Picks a JSON text file: Tauri open dialog, or a browser file input. Returns its text, or null if cancelled. */
+export async function openTextFile(filterName: string): Promise<string | null> {
   if (!isTauri()) {
     const input = document.createElement("input");
     input.type = "file";
@@ -72,14 +82,11 @@ export async function importSession(): Promise<boolean> {
     input.onchange = () => resolve(input.files?.[0] ?? null);
     input.click();
     const file = await promise;
-    if (!file) return false;
-    return applySession(JSON.parse(await file.text()) as SessionFile);
+    return file ? file.text() : null;
   }
-  const picked = await open({ multiple: false, filters: [{ name: "EchoDebug session", extensions: ["json"] }] });
+  const picked = await open({ multiple: false, filters: [{ name: filterName, extensions: ["json"] }] });
   const path = Array.isArray(picked) ? picked[0] : picked;
-  if (!path) return false;
-  const text = await invoke<string>("read_text_file", { path });
-  return applySession(JSON.parse(text) as SessionFile);
+  return path ? invoke<string>("read_text_file", { path }) : null;
 }
 
 export function applySession(data: SessionFile): boolean {
