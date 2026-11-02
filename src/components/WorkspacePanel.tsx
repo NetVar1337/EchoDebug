@@ -26,6 +26,7 @@ import YaraView from "./views/YaraView";
 import BinDiffView from "./views/BinDiffView";
 import UnpackView from "./views/UnpackView";
 import DecryptView from "./views/DecryptView";
+import ScriptView from "./views/ScriptView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -54,6 +55,7 @@ const kViews: Record<TabId, () => JSX.Element> = {
   bindiff: BinDiffView,
   unpack: UnpackView,
   decrypt: DecryptView,
+  script: ScriptView,
 };
 
 export default function WorkspacePanel() {

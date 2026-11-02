@@ -26,6 +26,10 @@ import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
 import { Boundary } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
+import { redo, undo } from "@/lib/history";
+import { startProjects } from "@/lib/projects";
+import { applyLayout, startWorkspace } from "@/lib/workspace";
+import { startAutoPatches } from "@/lib/patchsets";
 
 const kLeft = { targets: TargetsPanel, modules: ModulesPanel, watch: WatchPanel, names: NamesPanel, mcp: McpPanel };
 
@@ -37,6 +41,10 @@ export default function App() {
     log("info", "app", `EchoDebug v${useConn.getState().appVersion}${isTauri() ? "" : " (browser mode)"}`);
     void useConn.getState().init();
     startProvider();
+    startProjects();
+    startWorkspace();
+    startAutoPatches();
+    if (appRef.current) applyLayout(appRef.current);
     if (isTauri()) {
       void hostOs().then((os) => {
         if (os !== "windows") {
@@ -71,6 +79,13 @@ export default function App() {
       if (mod && e.key.toLowerCase() === "g") {
         e.preventDefault();
         useUi.getState().set({ gotoOpen: true });
+      }
+      const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement;
+      if (mod && !typing && (e.key.toLowerCase() === "z" || e.key.toLowerCase() === "y")) {
+        e.preventDefault();
+        const isRedo = e.key.toLowerCase() === "y" || e.shiftKey;
+        const label = isRedo ? redo() : undo();
+        log("info", "edit", label ? `${isRedo ? "redo" : "undo"}: ${label}` : `nothing to ${isRedo ? "redo" : "undo"}`);
       }
     };
     window.addEventListener("keydown", k);

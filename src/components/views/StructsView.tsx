@@ -36,6 +36,12 @@ export default function StructsView() {
   const size = lay.length ? lay[lay.length - 1].offset + lay[lay.length - 1].size : 0;
   const base = ui.structAt;
 
+  // Undo/redo changes the catalog: pick that up in the editor.
+  const stored = catalog.types.find((t) => t.id === activeId);
+  useEffect(() => {
+    if (stored && (stored.name !== cls.name || JSON.stringify(stored.fields) !== JSON.stringify(cls.fields))) setCls(stored);
+  }, [stored]);
+
   // Keep the edited class in the catalog so it survives a reload.
   useEffect(() => {
     if (!activeId) return;

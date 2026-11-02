@@ -6,7 +6,7 @@ export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt";
+  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -35,6 +35,7 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "bindiff", label: "BinDiff" },
   { id: "unpack", label: "Unpack" },
   { id: "decrypt", label: "Decrypt" },
+  { id: "script", label: "Script" },
   { id: "debugger", label: "Debugger" },
 ];
 
@@ -57,6 +58,15 @@ type UiStore = {
   sigAt: string | null;
   chainAt: { base: string; offsets: number[] } | null;
   module: string | null; // module focused for PE / strings
+  /** splitter sizes (CSS variables on the app root), restored on start */
+  layout: Record<string, string>;
+  /** last place per view, module-relative so it survives ASLR */
+  places: Partial<Record<"disasm" | "memory" | "struct", { module: string; rva: number }>>;
+  /** reattach to the last target by name when the app starts */
+  reattach: boolean;
+  lastTarget: string | null;
+  /** recently attached process names, most recent first (target switcher) */
+  recentTargets: string[];
   setRail: (r: RailView) => void;
   setTab: (t: TabId) => void;
   set: (p: Partial<UiStore>) => void;
@@ -88,6 +98,11 @@ export const useUi = create<UiStore>()(
       sigAt: null,
       chainAt: null,
       module: null,
+      layout: {},
+      places: {},
+      reattach: false,
+      lastTarget: null,
+      recentTargets: [],
       setRail: (rail) => set({ rail }),
       setTab: (tab) => set({ tab }),
       set: (p) => set(p),
@@ -100,7 +115,7 @@ export const useUi = create<UiStore>()(
     }),
     {
       name: "echodebug.ui",
-      partialize: (s) => ({ rail: s.rail, tab: s.tab, theme: s.theme, accent: s.accent, autoUpdate: s.autoUpdate }),
+      partialize: (s) => ({ rail: s.rail, tab: s.tab, theme: s.theme, accent: s.accent, autoUpdate: s.autoUpdate, module: s.module, layout: s.layout, places: s.places, reattach: s.reattach, lastTarget: s.lastTarget, recentTargets: s.recentTargets }),
     },
   ),
 );

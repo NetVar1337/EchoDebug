@@ -63,6 +63,13 @@ export function provide(verb: string, h: Handler): void {
   handlers.set(verb, h);
 }
 
+/** Runs a ui_* analysis directly (scripts in the app). */
+export async function callProvider(verb: string, args: Args = {}): Promise<unknown> {
+  const h = handlers.get(verb);
+  if (!h) throw new Error(`unknown app verb: ${verb} (known: ${providedVerbs().join(", ")})`);
+  return h(args);
+}
+
 export function providedVerbs(): string[] {
   return [...handlers.keys()].sort();
 }
@@ -430,6 +437,7 @@ provide("ui_batch_decrypt", async (args) => {
 provide("ui_binary_diff", async (args) => {
   const m = pickModule(args);
   if (typeof args.old_path !== "string") throw new Error("missing 'old_path' (an older build of the module on this machine)");
+  if (!/\.(exe|dll|sys)$/i.test(args.old_path)) throw new Error("old_path must be a .exe, .dll or .sys file");
   const raw = new Uint8Array(await invoke<number[]>("read_binary_file", { path: args.old_path }));
   const oldImg = mapPeFile(raw);
   const oldPe = parsePe(oldImg);
