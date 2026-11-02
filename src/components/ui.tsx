@@ -1,6 +1,6 @@
 // shared primitives: panel chrome, tabs, empty states, small inputs
 import { Component, type ReactNode, useEffect, useState } from "react";
-import { PlugZap } from "lucide-react";
+import { Check, Copy, PlugZap } from "lucide-react";
 import { useConn } from "@/store/conn";
 
 export function Panel({ title, actions, children, className = "" }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string }) {
@@ -91,6 +91,24 @@ export function Progress({ value }: { value: number }) {
 
 export async function copy(text: string): Promise<void> {
   await navigator.clipboard.writeText(text).catch(() => undefined);
+}
+
+export function useCopy(): [string | null, (text: string) => void] {
+  const [copied, setCopied] = useState<string | null>(null);
+  return [copied, (text) => {
+    void navigator.clipboard?.writeText(text).catch(() => undefined);
+    setCopied(text);
+    setTimeout(() => setCopied((c) => (c === text ? null : c)), 1200);
+  }];
+}
+
+export function CopyChip({ text, copied, onCopy }: { text: string; copied: string | null; onCopy: (t: string) => void }) {
+  return (
+    <button className="mono selectable chip" data-copied={copied === text} onClick={() => onCopy(text)} title="Copy">
+      <span className="ellipsis">{text}</span>
+      {copied === text ? <Check size={11} /> : <Copy size={11} />}
+    </button>
+  );
 }
 
 /** Keeps one broken view from blanking the whole window. */

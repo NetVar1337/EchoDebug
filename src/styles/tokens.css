@@ -1,5 +1,6 @@
 /* palette values match reverse-slop's three themes; layout metrics below */
 :root {
+  color-scheme: dark; /* every theme is dark: native selects, checkboxes and scrollbars follow */
   --pad-xs: 4px;
   --pad-sm: 6px;
   --pad-md: 10px;

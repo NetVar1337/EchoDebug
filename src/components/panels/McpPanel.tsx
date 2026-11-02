@@ -6,7 +6,7 @@ import tools from "@/lib/tools.json";
 import { request } from "@/lib/client";
 import { useConn } from "@/store/conn";
 import { attempt } from "@/store/output";
-import { IconButton, Panel } from "../ui";
+import { CopyChip, IconButton, Panel, useCopy } from "../ui";
 
 type Tool = { name: string; verb: string; description: string; input_schema: { required?: string[] } };
 type Prompt = { name: string; description: string; arguments?: { name: string; description: string; required?: boolean }[] };
@@ -15,24 +15,6 @@ type Meta = { serverInfo: { name: string; version: string }; prompts: Prompt[]; 
 type LogEntry = { ts: number; tool: string; verb: string; args: string; ok: boolean; ms: number };
 
 const kTools = tools as unknown as Tool[];
-
-function useCopy(): [string | null, (text: string) => void] {
-  const [copied, setCopied] = useState<string | null>(null);
-  return [copied, (text) => {
-    void navigator.clipboard?.writeText(text).catch(() => undefined);
-    setCopied(text);
-    setTimeout(() => setCopied((c) => (c === text ? null : c)), 1200);
-  }];
-}
-
-function CopyChip({ text, copied, onCopy }: { text: string; copied: string | null; onCopy: (t: string) => void }) {
-  return (
-    <button className="mono selectable chip" data-copied={copied === text} onClick={() => onCopy(text)} title="Copy">
-      {text}
-      {copied === text ? <Check size={11} /> : <Copy size={11} />}
-    </button>
-  );
-}
 
 export default function McpPanel() {
   const c = useConn();
