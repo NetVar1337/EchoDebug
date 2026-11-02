@@ -80,6 +80,37 @@ class mutex
 
 mutex@ create_mutex() { return mutex(); }
 
+void on_render(thread_callback@ cb) {}   // render callbacks never run in tests
+
+// ---------------------------------------------------------------------------------------------
+// Render, menu (ui::)
+// ---------------------------------------------------------------------------------------------
+
+namespace render
+{
+    void draw_text_outlined(int x, int y, string text, int r, int g, int b, int a) {}
+}
+
+funcdef void checkbox_callback(bool value);
+funcdef void button_callback();
+
+class checkbox { bool value = false; }
+class button {}
+
+namespace ui
+{
+    void add_tab(string label) {}
+    void add_category(string label) {}
+    checkbox add_checkbox(string label, bool default_value) { checkbox c; c.value = default_value; return c; }
+    checkbox add_checkbox(string label, bool default_value, checkbox_callback@ callback) { return add_checkbox(label, default_value); }
+    checkbox add_checkbox(string label, bool default_value, string config_key) { return add_checkbox(label, default_value); }
+    checkbox add_checkbox(string label, bool default_value, checkbox_callback@ callback, string config_key) { return add_checkbox(label, default_value); }
+    button add_button(string label, button_callback@ callback) { return button(); }
+    void add_tooltip(checkbox cb, string text) {}
+    void set(checkbox cb, bool value) { cb.value = value; }
+    bool get(checkbox cb) { return cb.value; }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Logging, alerts, util
 // ---------------------------------------------------------------------------------------------
@@ -285,7 +316,16 @@ enum x86_reg
     rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, rip, eflags,
     r8, r9, r10, r11, r12, r13, r14, r15,
     cs, ds, es, fs, gs, ss,
-    fs_base, gs_base
+    fs_base, gs_base,
+    xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15,
+    ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15
+}
+
+class uc_memory_region
+{
+    uint64 address;
+    uint64 end;
+    uint32 perms;
 }
 
 funcdef bool code_hook_fn(uint64 h, uint64 address, uint32 size);
@@ -332,6 +372,10 @@ namespace uc
     }
 
     uint64 create() { return 1; }
+    // vector registers and the region list are not modelled: reads fail, no regions
+    bool reg_read128(uint64 h, x86_reg reg, array<uint8> &out data) { return false; }
+    bool reg_read256(uint64 h, x86_reg reg, array<uint8> &out data) { return false; }
+    bool mem_regions(uint64 h, array<uc_memory_region> &out regions) { regions.resize(0); return true; }
     uint64 create_process() { return 2; }
     void close(uint64 h) {}
     bool setup_stack(uint64 h, uint64 base, uint64 size, uint64 stop_address)
