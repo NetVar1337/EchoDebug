@@ -342,3 +342,9 @@ html[data-motion="off"] *::after {
   .insn-row { grid-template-columns: 136px minmax(0, 1fr); }
   .insn-row .insn-bytes { display: none; }
 }
+
+/* memory view: selection range, labels, bookmarks */
+.hex-cell[data-range="true"] { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.hex-cell[data-named="true"] { text-decoration: underline dotted var(--accent); text-underline-offset: 3px; }
+.hex-addr[data-bookmark="true"] { color: var(--accent); }
+.hex-addr[data-bookmark="true"]::before { content: "●"; margin-right: 4px; font-size: 8px; vertical-align: middle; }

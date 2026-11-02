@@ -22,6 +22,10 @@ import { pdataFunctions, searchModuleCode, xrefsTo } from "./live";
 import { buildCfg, type CfgLine } from "./analysis/cfg";
 import { resolveSwitch } from "./analysis/jumptables";
 import { assemble } from "./analysis/asm";
+import { buildNeedle, formatAs, inspect, type CopyFormat, type NeedleMode } from "./analysis/bytes";
+import { floatScanFields, groupMatches, groupSpan, parseGroup } from "./analysis/scancmp";
+import { searchMemory } from "./memsearch";
+import { readManyChunked } from "./batch";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 
@@ -253,6 +257,46 @@ provide("ui_functions", async (args) => {
   const m = pickModule(args);
   const pdata = await pdataFunctions(m).catch(() => []);
   return { module: m.name, source: ".pdata", ...limitList(pdata, args, 2000) };
+});
+
+provide("ui_find_memory", async (args) => {
+  const from = addrArg(args, "from");
+  const mode = (typeof args.mode === "string" ? args.mode : "hex") as NeedleMode;
+  if (typeof args.query !== "string") throw new Error("missing 'query'");
+  const needle = buildNeedle(args.query, mode);
+  const dir = args.backward ? -1 : 1;
+  const hits: string[] = [];
+  let cur = from;
+  for (let i = 0; i < num(args, "count", 1, 100); i++) {
+    const hit = await searchMemory(cur, needle, dir, { maxBytes: num(args, "max_mib", 512, 4096) * 1024 * 1024 });
+    if (hit === null) break;
+    hits.push(labelAddr(hit, modules()));
+    cur = hit;
+  }
+  return { query: args.query, mode, count: hits.length, results: hits };
+});
+
+provide("ui_group_scan", async (args) => {
+  if (typeof args.spec !== "string") throw new Error("missing 'spec', e.g. 'i32:100; +4 f32:1.5'");
+  const g = parseGroup(args.spec);
+  const a = g[0];
+  const fields: Record<string, unknown> = { value_type: a.type, compare: "exact", value: a.value, writable_only: args.writable_only !== false, ...(typeof args.module === "string" ? { module: args.module } : {}) };
+  if (a.type === "f32" || a.type === "f64") Object.assign(fields, floatScanFields(a.value!, "rounded"));
+  const r = await request<{ count: number }>("scan_new", fields);
+  if (r.count > 200_000) throw new Error(`${r.count} anchors; make the first member more specific or pass a module`);
+  const anchors: string[] = [];
+  for (let off = 0; off < r.count; off += 2000) anchors.push(...(await request<{ results: { address: string }[] }>("scan_results", { offset: off, limit: 2000 })).results.map((h) => h.address));
+  const bytes = await readManyChunked(anchors.map((x) => ({ address: x, size: groupSpan(g) })));
+  const matches = anchors.filter((_, i) => bytes[i] && groupMatches(g, bytes[i]!));
+  return { anchors: anchors.length, count: matches.length, results: matches.slice(0, num(args, "limit", 500, 20000)).map((x) => labelAddr(x, modules())) };
+});
+
+provide("ui_inspect", async (args) => {
+  const a = addrArg(args);
+  const b = await readBytes(a, num(args, "size", 64, 4096));
+  if (!b) throw new Error("not readable");
+  const fmt = (typeof args.format === "string" ? args.format : "spaced") as CopyFormat;
+  return { address: labelAddr(a, modules()), little_endian: inspect(b, true), big_endian: inspect(b, false), bytes: formatAs(b, fmt) };
 });
 
 // ------------------------------------------------------------------------------------------------

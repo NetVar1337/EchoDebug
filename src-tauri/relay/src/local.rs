@@ -459,6 +459,12 @@ fn region_bounds(mem: &impl MemIo, req: &Map<String, Value>) -> (u64, u64) {
             }
         }
     }
+    // explicit range (scan_new start/end)
+    if let (Some(lo), Some(hi)) = (arg_addr(req, "start"), arg_addr(req, "end")) {
+        if hi > lo {
+            return (lo, hi);
+        }
+    }
     (0x1000, u64::MAX >> 12 << 12)
 }
 
@@ -1303,6 +1309,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
 
+    /// The scanner keeps its candidates in the global STATE: tests that scan take turns.
+    static SCAN_TESTS: StdMutex<()> = StdMutex::new(());
+
     struct FakeMem {
         data: StdMutex<BTreeMap<u64, u8>>, // sparse bytes
     }
@@ -1395,6 +1404,7 @@ mod tests {
 
     #[test]
     fn scanner_numeric() {
+        let _turn = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mem = FakeMem::new();
         mem.put(0x1000, &42u32.to_le_bytes());
         mem.put(0x1004, &7u32.to_le_bytes());
@@ -1419,6 +1429,19 @@ mod tests {
         assert_eq!(r["count"], 1);
         assert_eq!(r["results"][0]["value"], hex_bytes(&8u32.to_le_bytes()));
         assert_eq!(r["results"][0]["previous"], hex_bytes(&8u32.to_le_bytes()), "previous = value at the last scan");
+    }
+
+    #[test]
+    fn scan_honours_start_end() {
+        let _turn = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mem = FakeMem::new();
+        mem.put(0x1000, &7u32.to_le_bytes());
+        mem.put(0x3000, &7u32.to_le_bytes());
+        *STATE.lock().unwrap() = Some(LocalState { pid: 1, scan: None });
+        let req = match json!({ "value_type": "u32", "compare": "exact", "value": 7, "start": "0x2000", "end": "0x4000" }) { Value::Object(m) => m, _ => unreachable!() };
+        let r = ext_scan_new(&mem, &req);
+        assert_eq!(r["count"], 1, "{r}");
+        assert_eq!(r["sample"][0]["address"], "0x3000");
     }
 
     #[test]

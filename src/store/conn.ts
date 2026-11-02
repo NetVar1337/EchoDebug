@@ -22,6 +22,10 @@ type ConnStore = {
   provider: boolean;
   /** the relay can attach on its own (Linux local backend) */
   localAvailable: boolean;
+  /** memory verbs work: Echo's memory server, or the local backend */
+  mem: boolean;
+  /** agent verbs work: the Echo agent, or the local backend */
+  extOk: boolean;
   extVersion: string;
   appVersion: string;
   /** "echo" (Windows memory server), "local" (Linux /proc backend) or "none" */
@@ -63,6 +67,8 @@ export const useConn = create<ConnStore>((set, get) => ({
   ext: false,
   provider: false,
   localAvailable: false,
+  mem: false,
+  extOk: false,
   extVersion: "",
   appVersion: pkg.version,
   backend: "none",
@@ -141,7 +147,7 @@ function applyStatus(f: Frame): void {
   const backend = String(f.backend ?? (agent ? "echo" : "none"));
   const target = targetFrom(f) ?? (agent || backend === "local" ? s.target : null);
   const changed = agent !== s.agent || target?.pid !== s.target?.pid;
-  useConn.setState({ agent, provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
+  useConn.setState({ agent, mem: agent || backend === "local", extOk: Boolean(f.ext) || backend === "local", provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
   if (changed) {
     clearImages();
     void s.refreshModules();
