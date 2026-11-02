@@ -4,6 +4,19 @@ import { useUi, kTabs, type Theme } from "@/store/ui";
 import { useConn } from "@/store/conn";
 import { useUpdate } from "@/store/update";
 import { openUrl } from "@/lib/tauri";
+import { exportProjects, importProjects, useProjects } from "@/lib/projects";
+import { saveText } from "@/lib/save";
+import { redo, undo } from "@/lib/history";
+import { log } from "@/store/output";
+
+async function pickJson(): Promise<unknown> {
+  const input = Object.assign(document.createElement("input"), { type: "file", accept: ".json,.edproj" });
+  const { promise, resolve } = Promise.withResolvers<File | null>();
+  input.onchange = () => resolve(input.files?.[0] ?? null);
+  input.click();
+  const f = await promise;
+  return f ? JSON.parse(await f.text()) : null;
+}
 
 type Cmd = { id: string; label: string; group: string; hint?: string; run: () => void };
 
@@ -65,6 +78,11 @@ export default function CommandPalette() {
       { id: "names", label: "Open names & comments", group: "Target", run: () => ui.setRail("names") },
       { id: "mcp", label: "Open MCP server panel", group: "Target", run: () => ui.setRail("mcp") },
       { id: "export", label: "Export session to file", group: "Session", run: () => ui.set({ sessionExportOpen: true }) },
+      { id: "undo", label: "Undo last name / comment / type edit", group: "Session", hint: "Ctrl+Z", run: () => log("info", "edit", `undo: ${undo() ?? "nothing"}`) },
+      { id: "redo", label: "Redo", group: "Session", hint: "Ctrl+Y", run: () => log("info", "edit", `redo: ${redo() ?? "nothing"}`) },
+      { id: "proj-export", label: "Export module projects (names, comments, bookmarks by RVA)", group: "Session", run: () => void saveText("echodebug-projects.edproj", JSON.stringify(exportProjects(), null, 1)) },
+      { id: "proj-import", label: "Import module projects", group: "Session", run: () => void pickJson().then((f) => f && log("info", "project", `imported ${importProjects(f as never)} module projects`)).catch((e) => log("error", "project", String(e))) },
+      { id: "proj-toggle", label: `${useProjects.getState().enabled ? "Disable" : "Enable"} automatic module projects`, group: "Session", run: () => useProjects.getState().setEnabled(!useProjects.getState().enabled) },
       { id: "import", label: "Import session from file", group: "Session", run: () => ui.set({ sessionImportOpen: true }) },
       { id: "settings", label: "Open settings", group: "App", run: () => ui.set({ settingsOpen: true }) },
       { id: "update", label: "Check for updates", group: "App", run: () => void upd.check({ manual: true }) },

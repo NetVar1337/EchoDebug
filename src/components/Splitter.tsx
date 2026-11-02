@@ -1,5 +1,6 @@
 // drag handle that writes a CSS custom property on the app root
 import { type RefObject, useState } from "react";
+import { useUi } from "@/store/ui";
 
 type Props = { axis: "x" | "y"; variable: string; target: RefObject<HTMLElement>; min: number; max: number; invert?: boolean };
 
@@ -21,6 +22,8 @@ export default function Splitter({ axis, variable, target, min, max, invert }: P
     };
     const up = () => {
       setDragging(false);
+      const v = el.style.getPropertyValue(variable);
+      if (v) useUi.getState().set({ layout: { ...useUi.getState().layout, [variable]: v } });
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
     };

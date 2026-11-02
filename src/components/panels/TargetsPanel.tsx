@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { RefreshCw, Search, Unplug } from "lucide-react";
 import { request } from "@/lib/client";
 import { useConn } from "@/store/conn";
-import { attempt } from "@/store/output";
+import { attempt, log } from "@/store/output";
+import { useUi } from "@/store/ui";
 import { IconButton, Panel } from "../ui";
 
 type Proc = { pid: number; name: string; path: string; memory: number };
@@ -31,6 +32,15 @@ export default function TargetsPanel() {
     await attempt("attach", c.attach({ pid: p.pid, name: p.name }));
     setBusy(null);
   };
+  const recent = useUi((s) => s.recentTargets);
+  /** One target is attached at a time (Echo and the local backend hold a single process): switching detaches first. */
+  const switchTo = async (name: string) => {
+    const list = procs.length ? procs : ((await request<{ processes: Proc[] }>("processes").catch(() => null))?.processes ?? []);
+    const p = list.find((x) => x.name.toLowerCase() === name.toLowerCase());
+    if (!p) return log("warn", "targets", `${name} is not running`);
+    if (c.target) await attempt("detach", c.detach());
+    await attach(p);
+  };
 
   return (
     <Panel
@@ -42,6 +52,16 @@ export default function TargetsPanel() {
         </>
       }
     >
+      {recent.length > 0 && (
+        <div className="panel-section">
+          <div className="label">Switch target</div>
+          <div className="row wrap">
+            {recent.map((n) => (
+              <button key={n} className="pill" data-active={c.target?.name?.toLowerCase() === n.toLowerCase()} disabled={busy !== null || c.target?.name?.toLowerCase() === n.toLowerCase()} onClick={() => void switchTo(n)} title={`detach and attach ${n}; names and places come back from its module projects`}>{n}</button>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="panel-section">
         <div className="row"><span className="dot" data-state={c.relay ? "ok" : "bad"} /> Relay {c.relay ? "running" : "offline"}{c.relayError && <span className="danger"> · {c.relayError}</span>}</div>
         {c.os === "windows" ? (
@@ -54,7 +74,7 @@ export default function TargetsPanel() {
           <>
             <div className="row"><span className="dot" data-state={c.backend === "local" ? "ok" : "warn"} /> Backend {c.backend === "local" ? "local /proc (Linux)" : "none — attach below"}</div>
             <div className="faint" style={{ fontSize: 12 }}>
-              The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze / emulate / pointer-scan need the Windows agent.
+              The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze, watch, pointer scan, Unicorn emulation, exports, the loader's module list, Itanium RTTI and a ptrace debugger all run locally.
             </div>
           </>
         )}
@@ -69,7 +89,7 @@ export default function TargetsPanel() {
               <tr key={p.pid} data-selected={c.target?.pid === p.pid} onDoubleClick={() => void attach(p)} title={p.path}>
                 <td className="mono dim">{p.pid}</td>
                 <td>{p.name}</td>
-                <td><button className="row-action" disabled={!c.ext || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
+                <td><button className="row-action" disabled={(!c.ext && !c.localAvailable) || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
               </tr>
             ))}
           </tbody>

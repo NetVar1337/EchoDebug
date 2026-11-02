@@ -55,12 +55,34 @@ replies immediately with:
 
 **Local backend (Linux):** on non-Windows hosts, when no `/agent` or `/ext` upstream is connected, the
 relay serves the verbs itself from `/proc/<pid>` (`mem`/`maps`, ELF symbols via `object`, iced-x86 for
-disassembly): native verbs `ping`, `read`, `read_batch`, `modules`, `sig_scan`, `sig_scan_ida`,
-`string_scan`, `disassemble`, `enumerate_functions`, `resolve_relative`; ext verbs `attach`, `detach`,
+disassembly, Unicorn for emulation, ptrace for debugging): native verbs `ping`, `read`, `read_batch`,
+`modules`, `sig_scan`, `sig_scan_ida`, `string_scan`, `disassemble`, `enumerate_functions` (ELF symbols,
+rebased by the load bias), `resolve_relative`, and `rtti_resolve` / `rtti_resolve_batch` (Itanium C++ ABI:
+`vptr[-1]` → `type_info` → mangled name, demangled, with base classes); ext verbs `attach`, `detach`,
 `alive`, `write`, `query`, `regions`, `chain`, `scan_new`/`scan_next`/`scan_results`/`scan_clear`,
-`read_typed`, `region_stats`, `dump`. Agent-only verbs (freeze, watch, emulate, pointer_scan,
-peb_walk, resolve_export, reopen_socket) and RTTI answer with a clear "requires the Echo agent"
-error. Status frames carry `"backend": "echo" | "local" | "none"` and `"local": bool`.
+`read_typed`, `region_stats`, `dump`, `freeze`/`freeze_list` (20 Hz relay ticker, pre-freeze bytes restored
+on unfreeze and detach), `watch`/`unwatch`/`watch_list` (10 Hz `watch_event`s), `pointer_scan`,
+`resolve_export` (ELF `.dynsym`/`.symtab`), `peb_walk` (the dynamic loader's `r_debug` → `link_map` list,
+found through `AT_PHDR` → `PT_DYNAMIC` → `DT_DEBUG`; reply adds `source: "link_map" | "maps"` and per
+module `l_addr`/`dynamic`), `emulate` (same request/reply as the agent; pages fault in from the process),
+plus the Linux-only verbs below. Only `reopen_socket` answers with an error. Status frames carry
+`"backend": "echo" | "local" | "none"` and `"local": bool`.
+
+| Linux-only verb | request | reply |
+|---|---|---|
+| `itanium_classes` | `module?` | `classes:[{name, mangled, typeinfo, vtable (first virtual slot), slots, bases}]` from `_ZTI*`/`_ZTV*` symbols |
+| `module_file` | `module`, `offset?`, `size?` (≤ 1 MiB) | `path`, `base`, `file_size`, `data` (hex) — the module's file on disk, for the ELF browser |
+| `dbg_attach` | `pid?` (default: attached process) | `pid`, `threads`, `state:"stopped"` — PTRACE_SEIZE of every thread (+TRACECLONE), all-stop |
+| `dbg_detach` | – | – (breakpoints and DR7 restored first; `detach` also ends the session) |
+| `dbg_status` | – | `active`, `state` (`running`\|`stopped`), `focus`, `threads`, `breakpoints`, `hardware`, `last` |
+| `dbg_break` | `address`, `enabled?` | `breakpoints` — int3, written through `/proc/<pid>/mem` |
+| `dbg_hwbreak` | `slot` (0-3), `address`, `kind` (`exec`\|`write`\|`rw`), `len` (1/2/4/8), `enabled?` | status — DR0-DR3/DR7 on every thread |
+| `dbg_continue` / `dbg_pause` | – | `state` (steps over a breakpoint under rip first) |
+| `dbg_step` | `tid?` | `tid`, `from`, `address`, `regs`. A thread blocked in a system call only finishes the step when the call returns: the step is cancelled with an explanation instead of hanging |
+| `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base) |
+
+Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause", "tid", "address", "regs", "slot?", "watch?", "signal?" }`
+and `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`.
 
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
@@ -129,6 +151,21 @@ enable so clients can journal the pre-freeze bytes; frozen values are restored o
 The agent restores the pre-freeze bytes of every frozen address on `detach`, on target exit and in
 `on_unload`, and calls `process::detach()` in `on_unload` (Echo docs teardown rule).
 
+## Provider verbs (`ui_*`) and authentication
+
+Verbs that start with `ui_` are answered by the desktop app window, because the analyses behind them
+(PE parsing, strings, xrefs, crypto, FLIRT, YARA, CFG, IL, …) live in the UI's TypeScript. The app
+registers with `{ "type":"provide", "verbs":[...] }` on its `/client` socket. The relay forwards each call as
+`{ "type":"provider_call", "call":<n>, "verb", "args" }` and the app answers
+`{ "type":"provider_reply", "call":<n>, "verb", "result":{...} }` or `{ ..., "error":"..." }`. Without an app
+window the call fails with code `2005`. Status frames carry `"provider": bool`.
+
+`/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
+WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
+(`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere; created with mode 0600);
+`ECHODEBUG_TOKEN` overrides it and `ECHODEBUG_AUTH=0` disables the check. `/agent`, `/ext` and `/health`
+stay open (Echo cannot send headers; those endpoints only receive requests).
+
 ## Versioning
 
 `protocol` is bumped on incompatible changes. The app shows a warning when the agent's `version`
@@ -137,9 +174,16 @@ differs from the app version and (re)installs the bundled agent into `%APPDATA%\
 ## MCP surface
 
 `POST /mcp` speaks JSON-RPC 2.0 (single messages and batches; notifications get `202 Accepted`).
-Supported methods: `initialize` (advertises `tools`, `prompts` and `resources` capabilities plus
-`instructions`), `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
-`resources/list`, `resources/read`. Every tool in `src/lib/tools.json` maps one-to-one onto a verb
+Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (with `subscribe`) and
+`logging` capabilities plus `instructions`), `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
+`resources/list`, `resources/read`, `resources/subscribe`/`unsubscribe`, `logging/setLevel`.
+
+**Server-sent events.** `GET /mcp` with `Accept: text/event-stream` opens a notification stream:
+`notifications/resources/updated` for `echodebug://status` and `echodebug://target/modules` on every status
+change, and `notifications/message` (logger = event name) for agent and debugger events such as
+`watch_event`, `patched`, `dbg_stop`. A single `tools/call` sent with `Accept: text/event-stream` and
+`params._meta.progressToken` is answered as an event stream: `notifications/progress` for each agent
+`progress` event (scans, pointer scans), then the JSON-RPC result. Every tool in `src/lib/tools.json` maps one-to-one onto a verb
 above; the tool's `verb` becomes the request `type`, the tool's `input_schema` is passed through as
 the request body, and the reply is returned as pretty-printed JSON in a single text content block
 (`isError` is set when the relay replied with an error frame). Each `tools/call` is appended to a
@@ -147,7 +191,9 @@ the request body, and the reply is returned as pretty-printed JSON in a single t
 
 Prompts (`prompts/get` returns ready-to-use user messages with arguments substituted):
 `explain_function` (address), `find_pattern` (pattern, module?), `find_string` (text, module?),
-`pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module).
+`pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module),
+`find_vtable` (class, module?), `make_signature` (address), `diff_snapshots` (address, size?),
+`unpack_module` (module), `decrypt_strings` (address).
 
 Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
 `echodebug://target/modules` (fails when no memory server is connected).

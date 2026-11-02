@@ -43,7 +43,7 @@ export default function StatusBar() {
       )}
       <UpdatePill />
       <Pill state={c.relay ? "ok" : "bad"} label={`Relay :${c.port}`} />
-      <Pill state={c.agent ? "ok" : "idle"} label={c.agent ? "Memory: ready" : "Memory: idle"} />
+      <Pill state={c.mem ? "ok" : "idle"} label={c.agent ? "Memory: ready" : c.mem ? "Memory: local /proc" : "Memory: idle"} />
       <Pill state={c.modules.length ? "ok" : "idle"} label={c.modules.length ? `Modules: ${c.modules.length}` : "Modules: none"} />
       <Pill state={c.ext ? (mismatch ? "busy" : "ok") : "bad"} label={c.ext ? `Agent v${c.extVersion}${mismatch ? ` ≠ app v${c.appVersion}` : ""}` : "Agent: offline"} />
       <button className="icon-button" data-tip={`Theme: ${theme}`} onClick={cycleTheme}><SunMoon size={13} /></button>

@@ -3,11 +3,20 @@ import { invoke, isTauri as coreIsTauri } from "@tauri-apps/api/core";
 
 export const isTauri = (): boolean => typeof window !== "undefined" && coreIsTauri();
 
-export type RelayInfo = { port: number; error?: string | null };
+export type RelayInfo = { port: number; error?: string | null; token?: string | null };
 export type InstallResult = { path: string; changed: boolean };
 
 export async function relayInfo(): Promise<RelayInfo> {
-  if (!isTauri()) return { port: Number(new URLSearchParams(location.search).get("port")) || 47110 }; // ?port= for browser dev
+  if (!isTauri()) {
+    // Browser dev: ?port=&token= on the URL, else the token saved in Settings.
+    const q = new URLSearchParams(location.search);
+    let token = q.get("token");
+    try {
+      if (token) localStorage.setItem("echodebug.token", token);
+      else token = localStorage.getItem("echodebug.token");
+    } catch { /* storage blocked */ }
+    return { port: Number(q.get("port")) || 47110, token };
+  }
   return invoke<RelayInfo>("relay_info");
 }
 

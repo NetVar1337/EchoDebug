@@ -11,8 +11,11 @@ import { attempt } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress, Tabs } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
+import ElfView from "./ElfView";
+import { PeDetails, PeResources } from "./PeDetails";
+import { isElf } from "@/lib/analysis/elf";
 
-type Sub = "headers" | "sections" | "exports" | "imports" | "analysis" | "iat";
+type Sub = "headers" | "sections" | "exports" | "imports" | "analysis" | "iat" | "details" | "resources";
 const kLimit = 3000;
 const hx = (n: number | bigint) => "0x" + n.toString(16).toUpperCase();
 
@@ -30,16 +33,19 @@ export default function PeView() {
   const [iat, setIat] = useState<IatMap | null>(null);
   const [importRefs, setImportRefs] = useState<Record<string, LiveXref[]>>({});
   const [importRefsSel, setImportRefsSel] = useState<IatEntry | null>(null);
+  const [elf, setElf] = useState(false);
 
   useEffect(() => {
     if (!m) return;
     let live = true;
     setPe(null);
     setErr("");
+    setElf(false);
     setProgress(0);
     void attempt("pe", loadImage(m, (d, t) => live && setProgress(d / t))).then((img) => {
       if (!live || !img) return;
       setProgress(1);
+      if (isElf(img)) return setElf(true);
       try {
         const parsed = parsePe(img);
         setPe(parsed);
@@ -66,6 +72,8 @@ export default function PeView() {
   };
 
   const body = () => {
+    if (pe && m && sub === "details") return <PeDetails m={m} />;
+    if (pe && m && sub === "resources") return <PeResources m={m} />;
     if (!pe) return <div className="empty"><div className="empty-title">{err ? "Not a readable PE image." : "Reading image…"}</div>{err && <div className="empty-hint">{err}</div>}</div>;
     if (sub === "headers")
       return (
@@ -198,6 +206,8 @@ export default function PeView() {
     );
   };
 
+  if (elf && m) return <NeedsAgent><ElfView m={m} /></NeedsAgent>;
+
   return (
     <NeedsAgent>
       <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
@@ -208,7 +218,7 @@ export default function PeView() {
           {pe && <span className="faint" style={{ fontSize: 12 }}>{pe.sections.length} sections · {pe.exports.length} exports · {pe.imports.reduce((n, d) => n + d.funcs.length, 0)} imports</span>}
         </div>
         {progress < 1 && <Progress value={progress} />}
-        <Tabs tabs={[{ id: "headers", label: "Headers" }, { id: "sections", label: "Sections" }, { id: "exports", label: "Exports" }, { id: "imports", label: "Imports" }, { id: "iat", label: "IAT" }, { id: "analysis", label: "Analysis" }]} active={sub} onSelect={setSub} />
+        <Tabs tabs={[{ id: "headers", label: "Headers" }, { id: "sections", label: "Sections" }, { id: "exports", label: "Exports" }, { id: "imports", label: "Imports" }, { id: "iat", label: "IAT" }, { id: "analysis", label: "Analysis" }, { id: "details", label: "Details" }, { id: "resources", label: "Resources" }]} active={sub} onSelect={setSub} />
         <div className="vlist">{body()}</div>
       </div>
     </NeedsAgent>

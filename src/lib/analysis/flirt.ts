@@ -397,14 +397,23 @@ function isPrintableRun(buf: Uint8Array, at: number, length: number): boolean {
   return true;
 }
 
-/** CRC-16/ARC over a byte range, the checksum FLIRT stores for the function tail. */
+/**
+ * The checksum FLIRT stores for the bytes after the pattern: FLAIR's crc16.cpp (as carried by
+ * radare2's flirt.c): reflected CRC-16 with polynomial 0x8408, init 0xFFFF, complemented, then the
+ * two bytes swapped. Files store it big-endian. An empty range checks as 0.
+ */
 export function crc16(bytes: Uint8Array): number {
-  let crc = 0;
-  for (const b of bytes) {
-    crc ^= b;
-    for (let i = 0; i < 8; i++) crc = (crc & 1) !== 0 ? (crc >>> 1) ^ 0xa001 : crc >>> 1;
+  if (bytes.length === 0) return 0;
+  let crc = 0xffff;
+  for (const byte of bytes) {
+    let data = byte;
+    for (let i = 0; i < 8; i++) {
+      crc = ((crc ^ data) & 1) !== 0 ? (crc >>> 1) ^ 0x8408 : crc >>> 1;
+      data >>>= 1;
+    }
   }
-  return crc & 0xffff;
+  crc = ~crc & 0xffff;
+  return ((crc << 8) | (crc >>> 8)) & 0xffff;
 }
 
 export type FlirtMatch = {
@@ -424,23 +433,27 @@ export type FlirtMatch = {
 
 type Candidate = { module: FlirtModule; patternLength: number };
 
-/** Walks the signature tree against one byte position and collects the leaves. */
-function walk(root: FlirtNode, data: Uint8Array, at: number, out: Candidate[], depth = 0): void {
+/**
+ * Walks the signature tree against one byte position and collects the leaves. Each level matches
+ * the bytes right after its parent's, so a leaf's pattern length is the sum along the path.
+ */
+function walk(root: FlirtNode, data: Uint8Array, at: number, out: Candidate[], depth = 0, consumed = 0): void {
   if (depth > 32) return;
   for (const node of root.children) {
+    const pos = at + consumed;
     if (node.length > 0) {
-      if (at + node.length > data.length) continue;
+      if (pos + node.length > data.length) continue;
       let ok = true;
       for (let i = 0; i < node.length; i++) {
         const p = node.pattern[i];
-        if (p >= 0 && data[at + i] !== p) { ok = false; break; }
+        if (p >= 0 && data[pos + i] !== p) { ok = false; break; }
       }
       if (!ok) continue;
     }
     if (node.children.length > 0) {
-      walk(node, data, at, out, depth + 1);
+      walk(node, data, at, out, depth + 1, consumed + node.length);
     } else if (node.module) {
-      out.push({ module: node.module, patternLength: node.length });
+      out.push({ module: node.module, patternLength: consumed + node.length });
     }
   }
 }
@@ -470,10 +483,11 @@ export function matchFlirt(sig: FlirtSignature, img: Uint8Array, base?: bigint, 
           // The pattern covers the bytes from the start; the CRC covers the
           // bytes that follow it, as many as the signature recorded.
           const tailStart = at + c.patternLength;
-          const crcBytes = Math.min(c.module.crcLength, c.module.length - c.patternLength);
+          // crcLength is exactly what FLAIR checksummed (it never runs past the function).
+          const crcBytes = c.module.crcLength;
           let crcVerified = false;
-          if (crcBytes > 0 && tailStart + crcBytes <= img.length) {
-            crcVerified = crc16(img.subarray(tailStart, tailStart + crcBytes)) === c.module.crc;
+          if (tailStart + crcBytes <= img.length) {
+            crcVerified = crcBytes > 0 && crc16(img.subarray(tailStart, tailStart + crcBytes)) === c.module.crc;
           }
           out.push({
             rva: at,

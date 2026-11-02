@@ -51,6 +51,10 @@ pub trait MemIo: Send + Sync {
         Ok(out)
     }
     fn alive(&self) -> bool;
+    /// Path of the main executable, when known (`/proc/<pid>/exe`).
+    fn exe(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -96,6 +100,9 @@ impl MemIo for ProcIo {
     }
     fn alive(&self) -> bool {
         std::path::Path::new(&format!("/proc/{}", self.pid)).exists()
+    }
+    fn exe(&self) -> Option<String> {
+        std::fs::read_link(format!("/proc/{}/exe", self.pid)).ok().map(|p| p.display().to_string())
     }
 }
 
@@ -184,7 +191,7 @@ pub fn available() -> bool {
     }
 }
 
-fn with_state<R>(f: impl FnOnce(&mut LocalState) -> R) -> Option<R> {
+pub(crate) fn with_state<R>(f: impl FnOnce(&mut LocalState) -> R) -> Option<R> {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     g.as_mut().map(f)
 }
@@ -193,19 +200,19 @@ pub fn attached_pid() -> Option<u32> {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.pid)
 }
 
-fn io(pid: u32) -> Option<ProcIo> {
+pub(crate) fn io(pid: u32) -> Option<ProcIo> {
     ProcIo::open(pid).ok()
 }
 
-fn err(id: &Value, code: i64, message: &str, detail: &str) -> Value {
+pub(crate) fn err(id: &Value, code: i64, message: &str, detail: &str) -> Value {
     json!({ "type": "error", "id": id, "code": code, "message": message, "detail": detail })
 }
 
-fn hex_addr(v: u64) -> String {
+pub(crate) fn hex_addr(v: u64) -> String {
     format!("0x{v:x}")
 }
 
-fn hex_bytes(b: &[u8]) -> String {
+pub(crate) fn hex_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -236,9 +243,9 @@ pub async fn handle_native(_relay: &Relay, req: Map<String, Value>, orig: &Value
         "disassemble" => native_disassemble(&mem, &req),
         "enumerate_functions" => native_functions(&mem, &req),
         "resolve_relative" => native_resolve_relative(&mem, &req),
-        "rtti_resolve" | "rtti_resolve_batch" => {
-            return Some(err(orig, 1008, "not supported by the local Linux backend", "RTTI is an MSVC/Windows concept"));
-        }
+        // GCC/Clang objects carry Itanium C++ ABI type info instead of MSVC RTTI.
+        "rtti_resolve" => crate::local_ext::itanium_resolve(&mem, &req),
+        "rtti_resolve_batch" => crate::local_ext::itanium_resolve_batch(&mem, &req),
         _ => return Some(err(orig, 1000, "unknown message type", &verb)),
     };
     let mut r = match reply {
@@ -266,14 +273,15 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
         "reopen_socket" => {
             return Some(err(orig, 3003, "operation failed", "no Echo memory socket on the local Linux backend"));
         }
-        "freeze" | "freeze_list" | "emulate" | "pointer_scan" | "peb_walk" | "watch" | "unwatch"
-        | "watch_list" | "resolve_export" => {
-            return Some(err(
-                orig,
-                3003,
-                "requires the Echo agent",
-                "this verb only exists in the Windows AngelScript agent (echo_debug.as)",
-            ));
+        v if v.starts_with("dbg_") => {
+            let (relay2, req2) = (relay.clone(), req.clone());
+            let mut r = tokio::task::spawn_blocking(move || crate::local_dbg::handle(&relay2, &req2))
+                .await
+                .unwrap_or_else(|e| err(orig, 3003, "debugger failed", &e.to_string()));
+            if let Value::Object(m) = &mut r {
+                m.insert("id".into(), orig.clone());
+            }
+            return Some(r);
         }
         _ => {
             let Some(pid) = attached_pid() else {
@@ -294,6 +302,29 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
                 "read_typed" => ext_read_typed(&mem, &req),
                 "region_stats" => ext_region_stats(&mem, &req),
                 "dump" => ext_dump(&mem, &req),
+                "freeze" => crate::local_ext::freeze(relay, &mem, &req),
+                "freeze_list" => crate::local_ext::freeze_list(),
+                "watch" => crate::local_ext::watch(relay, &mem, &req),
+                "unwatch" => crate::local_ext::unwatch(&req),
+                "watch_list" => crate::local_ext::watch_list(),
+                "pointer_scan" => {
+                    let req2 = req.clone();
+                    let relay2 = relay.clone();
+                    tokio::task::spawn_blocking(move || crate::local_ext::pointer_scan(&relay2, &mem, &req2))
+                        .await
+                        .unwrap_or_else(|e| json!({ "type": "error", "code": 3003, "message": "pointer scan failed", "detail": e.to_string() }))
+                }
+                "resolve_export" => crate::local_ext::resolve_export(&mem, &req),
+                // Linux stand-in for the PEB walk: the dynamic loader's r_debug/link_map chain.
+                "peb_walk" | "link_map" => crate::local_ext::link_map_walk(&mem, pid),
+                "itanium_classes" => crate::local_ext::itanium_classes(&mem, &req),
+                "module_file" => crate::local_ext::module_file(&mem, &req),
+                "emulate" => {
+                    let req2 = req.clone();
+                    tokio::task::spawn_blocking(move || crate::local_emu::emulate(&mem, &req2))
+                        .await
+                        .unwrap_or_else(|e| json!({ "type": "error", "code": 3003, "message": "emulation failed", "detail": e.to_string() }))
+                }
                 _ => return Some(err(orig, 3000, "unknown verb", &verb)),
             }
         }
@@ -306,19 +337,27 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
     Some(Value::Object(r))
 }
 
+/// The main program: the module backed by `/proc/<pid>/exe`, else the largest module.
+pub(crate) fn main_module(mem: &impl MemIo) -> Option<(String, u64, u64)> {
+    let mods = mem.modules().ok()?;
+    if let Some(exe) = mem.exe() {
+        let name = exe.rsplit('/').next().unwrap_or(&exe).trim_end_matches(" (deleted)").to_owned();
+        if let Some(m) = mods.iter().find(|(n, _, _)| *n == name) {
+            return Some(m.clone());
+        }
+    }
+    mods.into_iter().max_by_key(|(_, _, sz)| *sz)
+}
+
 fn modules_base(mem: &impl MemIo) -> Value {
-    mem.modules()
-        .ok()
-        .and_then(|m| m.iter().max_by_key(|(_, _, sz)| *sz).map(|(_, b, _)| hex_addr(*b)))
-        .map(Value::String)
-        .unwrap_or(Value::String("0x0".into()))
+    Value::String(main_module(mem).map(|(_, b, _)| hex_addr(b)).unwrap_or_else(|| "0x0".into()))
 }
 
 // ---------------------------------------------------------------------------------------------
 // Native verbs
 // ---------------------------------------------------------------------------------------------
 
-fn arg_addr(req: &Map<String, Value>, k: &str) -> Option<u64> {
+pub(crate) fn arg_addr(req: &Map<String, Value>, k: &str) -> Option<u64> {
     match req.get(k)? {
         Value::String(s) => u64::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
         Value::Number(n) => n.as_u64(),
@@ -335,7 +374,10 @@ fn native_read(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     }
     let mut buf = vec![0u8; size as usize];
     match mem.read_at(addr, &mut buf) {
-        Ok(n) if n == size as usize => json!({ "type": "read_result", "success": true, "address": hex_addr(addr), "size": size, "data": hex_bytes(&buf) }),
+        Ok(n) if n == size as usize => {
+            crate::local_dbg::unshadow(addr, &mut buf);
+            json!({ "type": "read_result", "success": true, "address": hex_addr(addr), "size": size, "data": hex_bytes(&buf) })
+        }
         _ => json!({ "type": "read_result", "success": false, "address": hex_addr(addr), "size": 0, "data": "" }),
     }
 }
@@ -355,7 +397,10 @@ fn native_read_batch(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
             }
             let mut buf = vec![0u8; size as usize];
             match mem.read_at(addr.unwrap(), &mut buf) {
-                Ok(n) if n == size as usize => json!({ "success": true, "address": hex_addr(addr.unwrap()), "data": hex_bytes(&buf) }),
+                Ok(n) if n == size as usize => {
+                    crate::local_dbg::unshadow(addr.unwrap(), &mut buf);
+                    json!({ "success": true, "address": hex_addr(addr.unwrap()), "data": hex_bytes(&buf) })
+                }
                 _ => json!({ "success": false, "address": hex_addr(addr.unwrap()), "data": "" }),
             }
         })
@@ -412,6 +457,12 @@ fn region_bounds(mem: &impl MemIo, req: &Map<String, Value>) -> (u64, u64) {
             if let Some((_, base, size)) = mods.iter().find(|(n, _, _)| n == mod_name) {
                 return (*base, base + size);
             }
+        }
+    }
+    // explicit range (scan_new start/end)
+    if let (Some(lo), Some(hi)) = (arg_addr(req, "start"), arg_addr(req, "end")) {
+        if hi > lo {
+            return (lo, hi);
         }
     }
     (0x1000, u64::MAX >> 12 << 12)
@@ -491,10 +542,20 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let Some(addr) = arg_addr(req, "address") else {
         return json!({ "type": "error", "code": 1002, "message": "invalid or missing arguments", "detail": "disassemble requires 'address'" });
     };
-    let size = req.get("size").and_then(Value::as_u64).unwrap_or(0).clamp(1, 1_048_576) as usize;
+    // size 0 = "the function here": decode up to the first ret (or int3 padding), at most 64 KiB
+    let want = req.get("size").and_then(Value::as_u64).unwrap_or(0);
+    let function_mode = want == 0;
+    let mut size = if function_mode { 0x10000 } else { want.clamp(1, 1_048_576) as usize };
     let mut buf = vec![0u8; size];
-    if !mem.read_at(addr, &mut buf).map(|n| n == size).unwrap_or(false) {
+    let n = mem.read_at(addr, &mut buf).unwrap_or(0);
+    if n == 0 || (!function_mode && n != size) {
         return json!({ "type": "error", "code": 1005, "message": "memory read failed" });
+    }
+    crate::local_dbg::unshadow(addr, &mut buf);
+    if function_mode {
+        // keep what was readable: a function near the end of a mapping is shorter than 64 KiB
+        size = n;
+        buf.truncate(n);
     }
     let mut out = Vec::new();
     let mut ip = addr;
@@ -502,9 +563,14 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     while off < size {
         match disasm_one(&buf[off..], ip) {
             Some((len, text)) => {
+                let stop = function_mode && (text.starts_with("ret") || text.starts_with("int3") || text.starts_with("ud2"));
                 out.push(json!({ "address": hex_addr(ip), "length": len, "bytes": hex_bytes(&buf[off..off + len]), "text": text }));
                 ip += len as u64;
                 off += len;
+                if stop {
+                    size = off;
+                    break;
+                }
             }
             None => break,
         }
@@ -576,7 +642,7 @@ pub fn resolve_rip_relative(code: &[u8], ip: u64, off: usize, inst_size: usize) 
 fn native_functions(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let module = req.get("module").and_then(Value::as_str).unwrap_or("");
     let mods = mem.modules().unwrap_or_default();
-    let picked = if module.is_empty() { mods.iter().max_by_key(|(_, _, s)| *s).cloned() } else { mods.iter().find(|(n, _, _)| *n == module || n.ends_with(module) || n.rsplit('/').next() == Some(module)).cloned() };
+    let picked = if module.is_empty() { main_module(mem) } else { mods.iter().find(|(n, _, _)| *n == module || n.ends_with(module) || n.rsplit('/').next() == Some(module)).cloned() };
     let Some((name, base, size)) = picked else {
         return json!({ "type": "error", "code": 1003, "message": "module not found", "detail": module });
     };
@@ -590,15 +656,24 @@ fn native_functions(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     }
 }
 
+/// Load bias of an ELF mapped at `base`: symbol addresses are file vaddrs, so a shared object
+/// (lowest PT_LOAD vaddr 0) lives at `base + vaddr` and a non-PIE executable at `vaddr` itself.
+pub fn load_bias(file: &object::File, base: u64) -> u64 {
+    use object::{Object, ObjectSegment};
+    let lowest = file.segments().map(|s| s.address()).min().unwrap_or(0) & !0xfff;
+    base.wrapping_sub(lowest)
+}
+
 /// ELF symbol table (.symtab + .dynsym) functions inside [base, base+size). Best-effort preview data.
 pub fn functions_in_file(path: &str, base: u64, size: u64) -> Result<Vec<(u64, u64)>, String> {
     use object::{Object, ObjectSymbol};
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let file = object::File::parse(&*data).map_err(|e| e.to_string())?;
+    let bias = load_bias(&file, base);
     let mut out = Vec::new();
     let push = |sym: object::Symbol, out: &mut Vec<(u64, u64)>| {
-        if sym.kind() == object::SymbolKind::Text {
-            let addr = sym.address();
+        if sym.kind() == object::SymbolKind::Text && sym.address() != 0 {
+            let addr = sym.address().wrapping_add(bias);
             if addr >= base && addr < base + size {
                 out.push((addr, sym.size().max(1)));
             }
@@ -632,25 +707,33 @@ fn local_attach(relay: &Relay, req: &Map<String, Value>, orig: &Value) -> Value 
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = Some(LocalState { pid, scan: None });
     }
-    relay.broadcast_status();
+    crate::local_ext::start_ticker(relay, pid);
     let mem = io(pid).unwrap();
     let base = modules_base(&mem);
-    let name = req.get("name").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| {
-        mem.modules().ok().and_then(|m| m.iter().max_by_key(|(_, _, s)| *s).map(|(n, _, _)| n.clone())).unwrap_or_default()
-    });
+    let name = req.get("name").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| main_module(&mem).map(|(n, _, _)| n).unwrap_or_default());
+    relay.set_target(json!({ "pid": pid, "base": base, "name": name }));
+    relay.broadcast_status();
     json!({ "type": "attach_result", "id": orig, "success": true, "pid": pid, "base": base, "name": name, "native_socket": false })
 }
 
 fn local_detach(relay: &Relay, orig: &Value) -> Value {
+    if let Some(pid) = attached_pid() {
+        if let Some(mem) = io(pid) {
+            crate::local_ext::restore_frozen(&mem);
+        }
+    }
+    crate::local_ext::stop_ticker();
+    crate::local_dbg::detach_all();
     {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = None;
     }
+    relay.set_target(Value::Null);
     relay.broadcast_status();
     json!({ "type": "detach_result", "id": orig, "success": true })
 }
 
-fn find_pid_by_name(name: &str) -> Option<u32> {
+pub(crate) fn find_pid_by_name(name: &str) -> Option<u32> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
@@ -677,7 +760,7 @@ fn ext_write(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     }
 }
 
-fn region_of(mem: &impl MemIo, addr: u64) -> Value {
+pub(crate) fn region_of(mem: &impl MemIo, addr: u64) -> Value {
     let maps = mem.maps().unwrap_or_default();
     for m in &maps {
         if addr >= m.start && addr < m.end {
@@ -839,7 +922,7 @@ fn ext_dump(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
             Some((_, b, s)) => (b, s),
             None => return json!({ "type": "error", "code": 3003, "message": "dump failed", "detail": format!("module not found: {m}") }),
         },
-        _ => match mem.modules().ok().and_then(|v| v.into_iter().max_by_key(|(_, _, s)| *s)) {
+        _ => match main_module(mem) {
             Some((_, b, s)) => (b, s),
             None => return json!({ "type": "error", "code": 3003, "message": "dump failed", "detail": "no modules" }),
         },
@@ -1226,6 +1309,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
 
+    /// The scanner keeps its candidates in the global STATE: tests that scan take turns.
+    static SCAN_TESTS: StdMutex<()> = StdMutex::new(());
+
     struct FakeMem {
         data: StdMutex<BTreeMap<u64, u8>>, // sparse bytes
     }
@@ -1295,6 +1381,17 @@ mod tests {
     }
 
     #[test]
+    fn disassemble_function_mode_stops_at_ret() {
+        let mem = FakeMem::new();
+        // push rbp ; ret ; nop
+        mem.put(0x1000, &[0x55, 0xc3, 0x90]);
+        let req = match json!({ "address": "0x1000", "size": 0 }) { Value::Object(m) => m, _ => unreachable!() };
+        let r = native_disassemble(&mem, &req);
+        assert_eq!(r["count"], 2, "{r}");
+        assert_eq!(r["complete"], true);
+    }
+
+    #[test]
     fn disasm_and_relative() {
         // sub rsp, 0x28 ; call qword ptr [rip+0x10]
         let code = [0x48u8, 0x83, 0xec, 0x28, 0xff, 0x15, 0x10, 0x00, 0x00, 0x00];
@@ -1307,6 +1404,7 @@ mod tests {
 
     #[test]
     fn scanner_numeric() {
+        let _turn = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mem = FakeMem::new();
         mem.put(0x1000, &42u32.to_le_bytes());
         mem.put(0x1004, &7u32.to_le_bytes());
@@ -1331,6 +1429,19 @@ mod tests {
         assert_eq!(r["count"], 1);
         assert_eq!(r["results"][0]["value"], hex_bytes(&8u32.to_le_bytes()));
         assert_eq!(r["results"][0]["previous"], hex_bytes(&8u32.to_le_bytes()), "previous = value at the last scan");
+    }
+
+    #[test]
+    fn scan_honours_start_end() {
+        let _turn = SCAN_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mem = FakeMem::new();
+        mem.put(0x1000, &7u32.to_le_bytes());
+        mem.put(0x3000, &7u32.to_le_bytes());
+        *STATE.lock().unwrap() = Some(LocalState { pid: 1, scan: None });
+        let req = match json!({ "value_type": "u32", "compare": "exact", "value": 7, "start": "0x2000", "end": "0x4000" }) { Value::Object(m) => m, _ => unreachable!() };
+        let r = ext_scan_new(&mem, &req);
+        assert_eq!(r["count"], 1, "{r}");
+        assert_eq!(r["sample"][0]["address"], "0x3000");
     }
 
     #[test]
