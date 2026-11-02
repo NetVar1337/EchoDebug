@@ -58,9 +58,9 @@ relay serves the verbs itself from `/proc/<pid>` (`mem`/`maps`, ELF symbols via 
 disassembly): native verbs `ping`, `read`, `read_batch`, `modules`, `sig_scan`, `sig_scan_ida`,
 `string_scan`, `disassemble`, `enumerate_functions`, `resolve_relative`; ext verbs `attach`, `detach`,
 `alive`, `write`, `query`, `regions`, `chain`, `scan_new`/`scan_next`/`scan_results`/`scan_clear`,
-`read_typed`, `region_stats`, `dump`. Agent-only verbs (freeze, watch, emulate, pointer_scan,
-peb_walk, resolve_export, reopen_socket) and RTTI answer with a clear "requires the Echo agent"
-error. Status frames carry `"backend": "echo" | "local" | "none"` and `"local": bool`.
+`read_typed`, `region_stats`, `dump`. Agent-only verbs (freeze, watch, overlay, alert_add/
+alert_remove/alert_list, emulate, pointer_scan, peb_walk, resolve_export, reopen_socket) and RTTI
+answer with a clear "requires the Echo agent" error. Status frames carry `"backend": "echo" | "local" | "none"` and `"local": bool`.
 
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
@@ -96,9 +96,13 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `reopen_socket` | – | `ok` (bool: `process::open_socket` result) |
 | `resolve_export` | `module`, `name` | `address`, `module_base` |
 | `peb_walk` | – | `count`, `modules:[{base,entry,size,name}]` (PEB Ldr walk via a process-backed Unicorn emulator; runs on the job slot) |
-| `watch` | `address`, `size?` (1–16, default 4), `label?` | `watched` (count). The agent samples the address at 10 tps and emits `watch_event` on change |
+| `watch` | `address`, `size?` (1–16, default 4), `label?`, `overlay?` (bool: pin to the in-game overlay, at most 32 pinned), `type?` (overlay display: `u8..u64`,`i8..i64`,`f32`,`f64`,`ptr`,`ascii`,`utf16`,`string`,`wstring`,`bytes`; default `bytes` = hex) | `watched` (count), `pinned` (count). The agent samples the address at 10 tps and emits `watch_event` on change. Calling `watch` again on the same address updates size/label/overlay/type |
 | `unwatch` | `address` | `watched` (count) |
-| `watch_list` | – | `entries:[{address,size,label,last}]` (last = hex of the most recent sample) |
+| `watch_list` | – | `entries:[{address,size,label,last,overlay,type}]` (last = hex of the most recent sample), `overlay_enabled` |
+| `overlay` | `enabled?` (bool; omit to only read) | `enabled`, `pinned`. Pinned entries are drawn as outlined text in the game window's top-left corner every frame (`on_render` + `render::draw_text_outlined`). The render callback never reads target memory: it draws the text the 10 tps watch sampler last formatted |
+| `alert_add` | `address`, `value_type` (`u8..u64`,`i8..i64`,`f32`,`f64`,`bytes`,`string`,`wstring`), `condition` (`equals`\|`not_equals`\|`changed`\|`greater`\|`less`; patterns only `equals`/`not_equals`/`changed`), `value?` (as in `scan_new`; not for `changed`), `size?` (patterns + `changed`: bytes compared, 1–256, default 16), `once?` (default false), `snapshot?` (bytes captured around the address, 0–1024, default 64), `label?`, `float_epsilon?` | `alert_id`, `alerts` (count). At most 64 alerts; checked at 50 tps |
+| `alert_remove` | `alert_id` | `removed` (bool), `alerts` |
+| `alert_list` | – | `entries:[{alert_id,address,value_type,condition,value,size,label,once,snapshot,fired,last}]` |
 | `read_typed` | `address`, `type` (`u8..u64`,`i8..i64`,`f32`,`f64`,`string`,`wstring`,`bytes`), `length?` (bytes/string/wstring cap, ≤ 4096) | `ok`, `value` (decoded string / hex), `raw` (hex bits) |
 | `region_stats` | `start?`, `end?` | region counts and byte totals split by present/writable/executable, `truncated` |
 | `query` | `address` | `region: {base,size,present,writable,executable}` |
@@ -109,7 +113,7 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `scan_results` | `offset`, `limit` (≤ 2000) | `count`, `results:[{address, value, previous}]` (hex bytes) |
 | `scan_clear` | – | – |
 | `pointer_scan` | `target` (address), `max_depth?` (1–5, default 3), `max_offset?` (default 0x400), `max_results?` (default 500), `module_only_roots?` (default true) | `results:[{module, module_offset, offsets:[n...]}]`, `truncated` |
-| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `write?` (array of `{address, data}` — bytes injected into the emulator before the run; the page is mapped on demand), `read?` (array of `{address, size}` — bytes read back after the run), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000), `mem_log?` (bool; every explicit memory operand is decoded with Zydis before the instruction runs), `mem_log_limit?` (default 2000, max 20000) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `mem:[{address,size,ok,data}]`, `mem_log?:[{rip,address,size,access:"r"\|"w"\|"rw",before,after?}]` (hex values; `after` only for writes; `size` comes from the operand's `ptr` width; implicit stack accesses such as push/pop/call are not logged), `mem_log_truncated?`, `instructions`, `reached_end` (bool) |
+| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `write?` (array of `{address, data}` — bytes injected into the emulator before the run; the page is mapped on demand), `read?` (array of `{address, size}` — bytes read back after the run), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000), `mem_log?` (bool; every explicit memory operand is decoded with Zydis before the instruction runs), `mem_log_limit?` (default 2000, max 20000) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `mem:[{address,size,ok,data}]`, `mem_log?:[{rip,address,size,access:"r"\|"w"\|"rw",before,after?}]` (hex values; `after` only for writes; `size` comes from the operand's `ptr` width; implicit stack accesses such as push/pop/call are not logged), `mem_log_truncated?`, `instructions`, `reached_end` (bool), `steps?:[{rax..r15,rip,eflags}]` (with `step_regs?` (bool) — the 18 GPRs *before* each instruction runs, capped by `step_regs_limit?` (default 1000, max 10000)), `steps_truncated?`, `xmm:{xmm0..xmm15}` and `ymm:{ymm0..ymm15}` (little-endian hex; ymm only where the emulated CPU exposes it), `regions:[{address,end,perms:"rwx"}]` (`uc::mem_regions` after the run: code, stack and every page faulted in; ≤ 4096), `regions_truncated` |
 | `dump` | `module?`, `filename` | `path` (relative to the Echo scripts `dmp` folder) |
 | `freeze` | `address`, `data` (hex), `enabled` (bool) | `frozen` (count) — agent rewrites `data` at 20 Hz while enabled |
 | `freeze_list` | – | `entries:[{address,data}]` |
@@ -124,7 +128,16 @@ Other events: `log` (`level`, `message`), `attached` (`pid`,`base`,`name` — al
 `detached`, `freeze_error` (`address`), `patched` (`address`,`old`,`new` — emitted once per `freeze`
 enable so clients can journal the pre-freeze bytes; frozen values are restored on detach/unload),
 `native_socket` (`ok` — health of Echo's native memory socket after a `reopen_socket` poke),
-`watch_event` (`address`,`label?`,`old`,`new` — hex bytes before/after a watched address changed).
+`watch_event` (`address`,`label?`,`old`,`new` — hex bytes before/after a watched address changed),
+`alert_event` (`alert_id`,`address`,`label?`,`value_type`,`condition`,`old`,`new` (hex),`value` (decoded),
+`once`,`snapshot?:{address,data}` — a conditional alert fired; the agent also shows an in-game
+`alert::show_tag`). A condition fires on its false→true edge (immediately if it already holds when
+added), `changed` on every change; each alert fires at most every 200 ms, and a `once` alert is
+removed after its first event. Watches and alerts are cleared on attach/detach.
+
+**Echo menu.** The agent registers an *EchoDebug* tab in Echo's menu (`ui::`): read-only
+*App connected* / *Target attached* checkboxes (re-synced every second), *Show status* (an alert
+with the attached process), *Reconnect*, *Detach* and a *Draw pinned watches* overlay toggle.
 
 The agent restores the pre-freeze bytes of every frozen address on `detach`, on target exit and in
 `on_unload`, and calls `process::detach()` in `on_unload` (Echo docs teardown rule).
@@ -158,6 +171,8 @@ The tool set covers the whole backend: process control (`status`, `list_processe
 `signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
 `resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
 `value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
+watching (`watch_add`, `watch_remove`, `list_watched`, `overlay`), alerts (`alert_add`,
+`alert_remove`, `alert_list`),
 dumping (`dump_module`) and socket housekeeping (`reopen_native_socket`).
 
 Because the relay routes by verb, an MCP client gets exactly the same behaviour as the desktop UI.

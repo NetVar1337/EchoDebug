@@ -15,10 +15,15 @@
 //   * emulate and peb_walk also run through the job slot: the slot serialises them, so the
 //     code-hook globals (g_emu_*) are only ever touched by one job thread at a time.
 //   * Ticking threads (only creatable from main): keepalive at 1 tps (reconnect with backoff,
-//     process-exit detection, AUTO_ATTACH retries, job watchdog) and freeze at 20 tps.
+//     process-exit detection, AUTO_ATTACH retries, job watchdog, menu status sync), freeze at
+//     20 tps, watch at 10 tps and alerts at 50 tps.
+//   * The render callback (on_render) draws the overlay. It never reads target memory: watch_tick
+//     formats the pinned entries and publishes an OverlayLines handle (g_overlay_mx), so a frame
+//     only copies one handle under a shared lock.
 //   * Shared state: g_state_mx (attach state + job slot incl. the claimed JobParams — claim and
 //     params are written under one lock so the watchdog can never recycle a slot mid-handoff),
-//     g_scan_mx (published scan-state handle), g_freeze_mx (freeze list), g_send_mx (serialises
+//     g_scan_mx (published scan-state handle), g_freeze_mx (freeze list), g_watch_mx (watch list),
+//     g_alert_mx (alert list), g_overlay_mx (published overlay lines), g_send_mx (serialises
 //     ws::send across threads). Locks never nest.
 //   * A published ScanState is never mutated again. Jobs build a new one and swap the handle, so
 //     readers only hold g_scan_mx long enough to copy the handle (pattern from the Echo docs).
@@ -55,6 +60,15 @@ const uint CHAIN_MAX_OFFSETS = 64;
 // Watch list limits (agent-side sampler, emits watch_event on change)
 const uint WATCH_MAX_ENTRIES = 256;
 const uint WATCH_MAX_BYTES = 16;
+const uint OVERLAY_MAX_ENTRIES = 32;           // pinned watch entries drawn on the game window
+
+// Conditional alerts (checked by a 50 tps thread)
+const int ALERT_TPS = 50;
+const uint ALERT_MAX_ENTRIES = 64;
+const uint ALERT_SNAPSHOT_MAX = 1024;          // bytes captured around the address when one fires
+const uint64 ALERT_MIN_GAP_MS = 200;           // a repeating alert on a value that changes every tick would flood the relay
+const int COND_NOT_EQUALS = 100;               // alert-only condition, next to the scanner's OP_* codes
+const string ALERT_TAG = "echodebug_alert";
 const uint64 JOB_TIME_LIMIT_MS = 100000;       // the relay fails requests after 120 s
 const uint64 JOB_WATCHDOG_MS = 125000;         // frees the slot if a job thread died mid-way (just past the relay's 120 s timeout)
 
@@ -82,6 +96,8 @@ const int64 EMU_MAX_TRACE = 100000;
 const int64 EMU_MAX_MEM_LOG = 20000;     // each entry carries before/after hex, so smaller than the trace cap
 const uint EMU_MAX_BLOBS = 64;           // injected / read-back memory blobs
 const uint64 EMU_MAX_BLOB_BYTES = 0x10000; // 64 KiB per blob
+const int64 EMU_MAX_STEP_REGS = 10000;   // per-step snapshots carry 18 registers each
+const uint EMU_MAX_REGIONS = 4096;
 
 // Value types
 const int VT_U8 = 0;
@@ -149,6 +165,22 @@ array<FreezeEntry@> g_freeze;
 // watch list (g_watch_mx): sampled at 10 tps, watch_event emitted on change
 mutex@ g_watch_mx = create_mutex();
 array<WatchEntry@> g_watch;
+bool g_overlay_dirty = false;    // (g_watch_mx) pinned set changed, watch_tick must republish
+
+// overlay: lines published by watch_tick and the on/off flag, read by the render callback (g_overlay_mx)
+mutex@ g_overlay_mx = create_mutex();
+OverlayLines@ g_overlay_lines;
+bool g_overlay_on = true;
+
+// alert list (g_alert_mx)
+mutex@ g_alert_mx = create_mutex();
+array<AlertEntry@> g_alerts;
+uint g_alert_next_id = 1;
+
+// Echo menu elements (assigned once in main, synced by keepalive_tick)
+checkbox g_ui_connected;
+checkbox g_ui_attached;
+checkbox g_ui_overlay;
 
 // keepalive thread only
 uint g_ka_tick = 0;
@@ -166,6 +198,13 @@ bool g_emu_mem_on = false;
 uint g_emu_mem_limit = 0;
 array<MemAccess@> g_emu_mem;
 array<uint> g_emu_mem_pending;   // indexes of writes whose new value is read before the next instruction
+// per-step register snapshots: g_emu_gpr_names.length() values per recorded step, flat
+bool g_emu_step_on = false;
+uint g_emu_step_limit = 0;
+array<uint64> g_emu_steps;
+array<x86_reg> g_emu_gpr;
+array<string> g_emu_gpr_names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                  "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
 
 // g_pow2[e + 1074] == 2^e, used to decode IEEE-754 bits without a reinterpret cast.
 array<double> g_pow2;
@@ -191,7 +230,35 @@ class WatchEntry
     string label;
     array<uint8> prev;    // last sampled bytes
     bool has_prev;
-    WatchEntry() { address = 0; size = 4; has_prev = false; }
+    bool overlay;         // pinned: drawn on the game window
+    string vtype;         // overlay display type (u8..f64, ptr, ascii, utf16, bytes)
+    WatchEntry() { address = 0; size = 4; has_prev = false; overlay = false; vtype = "bytes"; }
+}
+
+// One frame's overlay text. Never mutated after publish (render reads it without a lock).
+class OverlayLines
+{
+    array<string> lines;
+}
+
+class AlertEntry
+{
+    uint id;
+    uint64 address;
+    uint width;
+    int cond;             // OP_EXACT, OP_CHANGED, OP_GREATER, OP_LESS or COND_NOT_EQUALS
+    string cond_name;
+    string vt_name;
+    string label;
+    ScanSpec@ spec;       // value type + target, compared with the scanner's test_num
+    array<uint8> prev;
+    bool has_prev;
+    bool active;          // condition held at the last check (edge trigger)
+    bool once;
+    uint snap;
+    uint64 last_fire;
+    uint fired;
+    AlertEntry() { id = 0; address = 0; width = 0; cond = OP_EXACT; has_prev = false; active = false; once = false; snap = 64; last_fire = 0; fired = 0; }
 }
 
 // One decoded memory operand of an emulated instruction.
@@ -237,11 +304,14 @@ class EmuJob
     int64 trace_limit;
     bool mem_log;
     int64 mem_log_limit;
+    bool step_regs;
+    int64 step_regs_limit;
     EmuJob()
     {
         start = 0; stop = 0; max_insns = 100000; timeout_us = 1000000;
         trace = false; trace_limit = 2000;
         mem_log = false; mem_log_limit = 2000;
+        step_regs = false; step_regs_limit = 1000;
     }
 }
 
@@ -1048,7 +1118,16 @@ void clear_watch()
 {
     g_watch_mx.lock();
     g_watch.resize(0);
+    g_overlay_dirty = false;
     g_watch_mx.unlock();
+    publish_overlay(null);
+}
+
+void clear_alerts()
+{
+    g_alert_mx.lock();
+    g_alerts.resize(0);
+    g_alert_mx.unlock();
 }
 
 // Writes the pre-freeze bytes back to the target and empties the list. Call while still attached.
@@ -1110,6 +1189,7 @@ bool do_attach(const string &in name, uint32 pid, bool &out sock)
     publish_scan(null);
     clear_freeze();
     clear_watch();
+    clear_alerts();
 
     g_state_mx.lock();
     g_attached = true;
@@ -1136,6 +1216,7 @@ void mark_detached(const string &in why)
     publish_scan(null);
     clear_freeze();
     clear_watch();
+    clear_alerts();
     console::log(LOG_PREFIX + "detached (" + why + ")");
     alert::show_tag("EchoDebug: detached (" + why + ")", TAG, 255, 160, 40);
     send_json(new_event("detached"));
@@ -1254,15 +1335,22 @@ void run_attach(int64 id, JobParams@ p)
     send_json(o);
 }
 
-void h_detach(json_obj@ r, int64 id)
+// Shared by the detach verb and the Echo menu button. False while a job runs.
+bool do_detach()
 {
-    if (job_busy()) { send_error(id, E_BUSY, "busy", "wait for the running job to finish"); return; }
+    if (job_busy()) return false;
     g_state_mx.lock();
     g_auto_pending = false;
     g_state_mx.unlock();
     if (was_attached()) restore_freeze();   // undo frozen values before the attach is gone
     process::detach();
     mark_detached("requested");
+    return true;
+}
+
+void h_detach(json_obj@ r, int64 id)
+{
+    if (!do_detach()) { send_error(id, E_BUSY, "busy", "wait for the running job to finish"); return; }
     send_json(ok_reply("detach", id));
 }
 
@@ -1496,8 +1584,23 @@ void h_freeze_list(json_obj@ r, int64 id)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Watch list: the agent samples these addresses at 10 tps and emits watch_event on change
+// Watch list: the agent samples these addresses at 10 tps and emits watch_event on change;
+// entries pinned with overlay:true are also drawn on the game window by the render callback
 // ---------------------------------------------------------------------------------------------
+
+bool overlay_type_ok(const string &in t)
+{
+    return vt_parse(t) >= 0 || t == "ptr" || t == "ascii" || t == "utf16";
+}
+
+// Caller holds g_watch_mx.
+uint overlay_count()
+{
+    uint n = 0;
+    for (uint i = 0; i < g_watch.length(); i++)
+        if (g_watch[i].overlay) n++;
+    return n;
+}
 
 void h_watch(json_obj@ r, int64 id)
 {
@@ -1509,15 +1612,34 @@ void h_watch(json_obj@ r, int64 id)
     if (sz < 1 || sz > int64(WATCH_MAX_BYTES)) { send_error(id, E_LIMIT, "limit exceeded", "watch size must be 1..16"); return; }
     string label;
     if (!opt_str(r, "label", "", label)) { bad_args(id, "label must be a string"); return; }
+    bool has_ov = has_key(r, "overlay");
+    bool ov;
+    if (!opt_bool(r, "overlay", false, ov)) { bad_args(id, "overlay must be a bool"); return; }
+    string vt;
+    if (!opt_str(r, "type", "", vt) || (vt != "" && !overlay_type_ok(vt)))
+    {
+        bad_args(id, "type must be u8..u64, i8..i64, f32, f64, ptr, ascii, utf16, string, wstring or bytes");
+        return;
+    }
 
     g_watch_mx.lock();
     int idx = -1;
     for (uint i = 0; i < g_watch.length(); i++)
         if (g_watch[i].address == addr) { idx = int(i); break; }
+    bool was_pinned = idx >= 0 && g_watch[uint(idx)].overlay;
+    if (has_ov && ov && !was_pinned && overlay_count() >= OVERLAY_MAX_ENTRIES)
+    {
+        g_watch_mx.unlock();
+        send_error(id, E_LIMIT, "limit exceeded", "at most 32 overlay entries");
+        return;
+    }
     if (idx >= 0)
     {
-        g_watch[uint(idx)].size = uint(sz);
-        if (label != "") g_watch[uint(idx)].label = label;
+        WatchEntry@ e = g_watch[uint(idx)];
+        if (e.size != uint(sz)) { e.size = uint(sz); e.has_prev = false; }
+        if (label != "") e.label = label;
+        if (has_ov) e.overlay = ov;
+        if (vt != "") e.vtype = vt;
     }
     else if (g_watch.length() >= WATCH_MAX_ENTRIES)
     {
@@ -1531,15 +1653,20 @@ void h_watch(json_obj@ r, int64 id)
         e.address = addr;
         e.size = uint(sz);
         e.label = label;
+        e.overlay = ov;
+        if (vt != "") e.vtype = vt;
         // seed with the current value so the first event only fires on a real change
         array<uint8>@ b = process::read_bytes(addr, uint(sz));
         if (b !is null && b.length() == uint(sz)) { e.prev = b; e.has_prev = true; }
         g_watch.insertLast(e);
     }
+    g_overlay_dirty = true;
     uint n = g_watch.length();
+    uint pinned = overlay_count();
     g_watch_mx.unlock();
     json_obj@ o = ok_reply("watch", id);
     o.set("watched", n);
+    o.set("pinned", pinned);
     send_json(o);
 }
 
@@ -1549,7 +1676,7 @@ void h_unwatch(json_obj@ r, int64 id)
     if (!get_addr(r, "address", addr)) { bad_args(id, "unwatch requires 'address'"); return; }
     g_watch_mx.lock();
     for (uint i = 0; i < g_watch.length(); i++)
-        if (g_watch[i].address == addr) { g_watch.removeAt(i); break; }
+        if (g_watch[i].address == addr) { g_watch.removeAt(i); g_overlay_dirty = true; break; }
     uint n = g_watch.length();
     g_watch_mx.unlock();
     json_obj@ o = ok_reply("unwatch", id);
@@ -1568,18 +1695,82 @@ void h_watch_list(json_obj@ r, int64 id)
         e.set("size", g_watch[i].size);
         e.set("label", g_watch[i].label);
         e.set("last", g_watch[i].has_prev ? hex_of(g_watch[i].prev, 0, g_watch[i].prev.length()) : "");
+        e.set("overlay", g_watch[i].overlay);
+        e.set("type", g_watch[i].vtype);
         arr.push(e);
     }
     g_watch_mx.unlock_shared();
     json_obj@ o = ok_reply("watch_list", id);
     o.set("entries", arr);
+    o.set("overlay_enabled", overlay_enabled());
     send_json(o);
 }
 
-// 10 tps: sample watched addresses, emit watch_event on change.
+// Display text of a sample for the overlay and in-game alerts (little-endian, like read_typed).
+string overlay_value(const string &in vt, const array<uint8> &in b)
+{
+    uint n = b.length();
+    if (vt == "ascii" || vt == "string")
+    {
+        string s;
+        uint k = 0;
+        while (k < n && b[k] != 0) k++;
+        s.resize(k);
+        for (uint i = 0; i < k; i++) s[i] = (b[i] >= 0x20 && b[i] < 0x7F) ? b[i] : uint8(0x2E);   // non-printable -> "."
+        return s;
+    }
+    if (vt == "utf16" || vt == "wstring") return util::wide_to_string(b, true);
+    int t = vt_parse(vt);
+    uint w = vt == "ptr" ? 8 : vt_width(t);
+    if (w == 0 || w > n) return hex_of(b, 0, n);
+    uint64 bits = 0;
+    for (uint i = 0; i < w; i++) bits |= uint64(b[i]) << (8 * i);
+    if (vt == "ptr") return hex_addr(bits);
+    if (is_float(t))
+    {
+        double v;
+        return flt_decode(w, bits, v) ? util::format_string("{.3}", v) : "NaN/Inf";
+    }
+    if (is_signed(t))
+    {
+        int64 sv = int64(bits);
+        if (w < 8) sv = (sv << (64 - w * 8)) >> (64 - w * 8);   // sign-extend
+        return util::format_string("{}", sv);
+    }
+    return util::format_string("{}", bits);
+}
+
+bool overlay_enabled()
+{
+    g_overlay_mx.lock_shared();
+    bool on = g_overlay_on;
+    g_overlay_mx.unlock_shared();
+    return on;
+}
+
+void set_overlay(bool on)
+{
+    g_overlay_mx.lock();
+    g_overlay_on = on;
+    g_overlay_mx.unlock();
+}
+
+void publish_overlay(OverlayLines@ ov)
+{
+    g_overlay_mx.lock();
+    @g_overlay_lines = ov;
+    g_overlay_mx.unlock();
+}
+
+// 10 tps: sample watched addresses, emit watch_event on change, and republish the overlay text
+// when a pinned value (or the pinned set) changed.
 void watch_tick()
 {
     if (!is_attached()) return;
+    g_state_mx.lock_shared();
+    string target = g_name;
+    g_state_mx.unlock_shared();
+    bool dirty = false;
     g_watch_mx.lock();
     for (uint i = 0; i < g_watch.length(); i++)
     {
@@ -1590,6 +1781,7 @@ void watch_tick()
         string old = e.has_prev ? hex_of(e.prev, 0, e.prev.length()) : "";
         e.prev = cur;
         e.has_prev = true;
+        if (e.overlay) dirty = true;
         g_watch_mx.unlock();
         json_obj@ ev = new_event("watch_event");
         ev.set("address", hex_addr(e.address));
@@ -1599,7 +1791,263 @@ void watch_tick()
         send_json(ev);
         g_watch_mx.lock();
     }
+    OverlayLines@ ov;
+    if (dirty || g_overlay_dirty)
+    {
+        g_overlay_dirty = false;
+        @ov = OverlayLines();
+        ov.lines.insertLast("EchoDebug - " + target);
+        for (uint i = 0; i < g_watch.length(); i++)
+        {
+            WatchEntry@ e = g_watch[i];
+            if (!e.overlay) continue;
+            string name = e.label != "" ? e.label : hex_addr(e.address);
+            ov.lines.insertLast(name + ": " + (e.has_prev ? overlay_value(e.vtype, e.prev) : "??"));
+        }
+        if (ov.lines.length() == 1) ov.lines.resize(0);   // no pinned entries: draw nothing
+    }
     g_watch_mx.unlock();
+    if (ov !is null) publish_overlay(ov);
+}
+
+// Render thread: draws the last published overlay lines. Never reads target memory.
+void render_tick()
+{
+    g_overlay_mx.lock_shared();
+    bool on = g_overlay_on;
+    OverlayLines@ ov = g_overlay_lines;
+    g_overlay_mx.unlock_shared();
+    if (!on || ov is null) return;
+    int y = 40;
+    for (uint i = 0; i < ov.lines.length(); i++)
+    {
+        if (i == 0) render::draw_text_outlined(20, y, ov.lines[i], 80, 200, 255, 255);
+        else render::draw_text_outlined(20, y, ov.lines[i], 255, 255, 255, 255);
+        y += 15;
+    }
+}
+
+void h_overlay(json_obj@ r, int64 id)
+{
+    bool on;
+    if (!opt_bool(r, "enabled", overlay_enabled(), on)) { bad_args(id, "enabled must be a bool"); return; }
+    set_overlay(on);
+    g_watch_mx.lock_shared();
+    uint pinned = overlay_count();
+    g_watch_mx.unlock_shared();
+    json_obj@ o = ok_reply("overlay", id);
+    o.set("enabled", on);
+    o.set("pinned", pinned);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Conditional alerts: a 50 tps thread checks address+type conditions and reports when they fire
+// ---------------------------------------------------------------------------------------------
+
+int cond_parse(const string &in s)
+{
+    if (s == "equals") return OP_EXACT;
+    if (s == "not_equals") return COND_NOT_EQUALS;
+    if (s == "changed") return OP_CHANGED;
+    if (s == "greater") return OP_GREATER;
+    if (s == "less") return OP_LESS;
+    return -1;
+}
+
+void h_alert_add(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    AlertEntry@ a = AlertEntry();
+    if (!get_addr(r, "address", a.address)) { bad_args(id, "alert_add requires 'address'"); return; }
+    if (!opt_str(r, "value_type", "", a.vt_name) || !opt_str(r, "condition", "", a.cond_name) || !opt_str(r, "label", "", a.label))
+    {
+        bad_args(id, "value_type/condition/label must be strings");
+        return;
+    }
+    ScanSpec@ s = ScanSpec();
+    s.vtype = vt_parse(a.vt_name);
+    if (s.vtype < 0) { bad_args(id, "unknown value_type: " + a.vt_name); return; }
+    a.cond = cond_parse(a.cond_name);
+    if (a.cond < 0) { bad_args(id, "condition must be equals, not_equals, changed, greater or less"); return; }
+    bool pattern = is_pattern(s.vtype);
+    if (pattern && (a.cond == OP_GREATER || a.cond == OP_LESS)) { bad_args(id, a.vt_name + " alerts support equals, not_equals and changed"); return; }
+    s.width = vt_width(s.vtype);
+    // the scanner's value parsing; not_equals parses its target like equals
+    s.op = a.cond == COND_NOT_EQUALS ? OP_EXACT : a.cond;
+    string err = parse_targets(r, s);
+    if (err != "") { bad_args(id, err); return; }
+    double eps;
+    if (!opt_double(r, "float_epsilon", 0.0001, eps) || eps < 0) { bad_args(id, "float_epsilon must be >= 0"); return; }
+    s.eps = eps;
+    if (pattern)
+    {
+        int64 sz;
+        if (!opt_int(r, "size", 16, sz)) { bad_args(id, "size must be a number"); return; }
+        if (a.cond != OP_CHANGED) sz = int64(s.pattern.length());
+        if (sz < 1 || sz > int64(MAX_PATTERN)) { send_error(id, E_LIMIT, "limit exceeded", "size must be 1..256"); return; }
+        s.width = uint(sz);
+    }
+    a.width = s.width;
+    @a.spec = s;
+    int64 snap;
+    if (!opt_bool(r, "once", false, a.once) || !opt_int(r, "snapshot", 64, snap)) { bad_args(id, "once must be a bool, snapshot a number"); return; }
+    if (snap < 0 || snap > int64(ALERT_SNAPSHOT_MAX)) { send_error(id, E_LIMIT, "limit exceeded", "snapshot must be 0..1024"); return; }
+    a.snap = uint(snap);
+    // seed the previous value so "changed" only fires on a real change
+    array<uint8>@ b = process::read_bytes(a.address, a.width);
+    if (b !is null && b.length() == a.width) { a.prev = b; a.has_prev = true; }
+
+    g_alert_mx.lock();
+    if (g_alerts.length() >= ALERT_MAX_ENTRIES)
+    {
+        g_alert_mx.unlock();
+        send_error(id, E_LIMIT, "limit exceeded", "at most 64 alerts");
+        return;
+    }
+    a.id = g_alert_next_id++;
+    g_alerts.insertLast(a);
+    uint n = g_alerts.length();
+    g_alert_mx.unlock();
+    json_obj@ o = ok_reply("alert_add", id);
+    o.set("alert_id", a.id);
+    o.set("alerts", n);
+    send_json(o);
+}
+
+void h_alert_remove(json_obj@ r, int64 id)
+{
+    int64 aid;
+    if (!has_key(r, "alert_id") || !opt_int(r, "alert_id", 0, aid)) { bad_args(id, "alert_remove requires 'alert_id'"); return; }
+    bool found = false;
+    g_alert_mx.lock();
+    for (uint i = 0; i < g_alerts.length(); i++)
+        if (int64(g_alerts[i].id) == aid) { g_alerts.removeAt(i); found = true; break; }
+    uint n = g_alerts.length();
+    g_alert_mx.unlock();
+    json_obj@ o = ok_reply("alert_remove", id);
+    o.set("removed", found);
+    o.set("alerts", n);
+    send_json(o);
+}
+
+// The compare target as the request gave it (hex bytes for integers/patterns, decimal for floats).
+string alert_target(AlertEntry@ a)
+{
+    ScanSpec@ s = a.spec;
+    if (a.cond == OP_CHANGED) return "";
+    if (is_pattern(s.vtype)) return hex_of(s.pattern, 0, s.pattern.length());
+    if (is_float(s.vtype)) return util::format_string("{}", s.f1);
+    return bits_hex(s.raw1, s.width);
+}
+
+void h_alert_list(json_obj@ r, int64 id)
+{
+    json_obj@ arr = json::array();
+    g_alert_mx.lock_shared();
+    for (uint i = 0; i < g_alerts.length(); i++)
+    {
+        AlertEntry@ a = g_alerts[i];
+        json_obj@ e = json_obj();
+        e.set("alert_id", a.id);
+        e.set("address", hex_addr(a.address));
+        e.set("value_type", a.vt_name);
+        e.set("condition", a.cond_name);
+        e.set("value", alert_target(a));
+        e.set("size", a.width);
+        e.set("label", a.label);
+        e.set("once", a.once);
+        e.set("snapshot", a.snap);
+        e.set("fired", a.fired);
+        e.set("last", a.has_prev ? hex_of(a.prev, 0, a.width) : "");
+        arr.push(e);
+    }
+    g_alert_mx.unlock_shared();
+    json_obj@ o = ok_reply("alert_list", id);
+    o.set("entries", arr);
+    send_json(o);
+}
+
+bool alert_test(AlertEntry@ a, const array<uint8> &in cur)
+{
+    if (a.cond == OP_CHANGED) return a.has_prev && !bytes_eq(cur, 0, a.prev, 0, a.width);
+    ScanSpec@ s = a.spec;
+    if (is_pattern(s.vtype))
+    {
+        bool eq = bytes_eq(cur, 0, s.pattern, 0, a.width);
+        return a.cond == COND_NOT_EQUALS ? !eq : eq;
+    }
+    uint64 bits = 0;
+    for (uint i = 0; i < a.width; i++) bits |= uint64(cur[i]) << (8 * i);
+    if (a.cond == COND_NOT_EQUALS) return !test_num(OP_EXACT, s, bits, 0);
+    return test_num(a.cond, s, bits, 0);
+}
+
+// 50 tps: evaluate alerts. A condition fires on its false -> true edge (immediately if it already
+// holds when added); "changed" fires on every change. Events and snapshots go out after unlock.
+void alert_tick()
+{
+    if (!is_attached()) return;
+    array<AlertEntry@> fired;
+    array<string> olds;
+    array<string> news;
+    array<string> shown;
+    uint64 now = util::tickcount();
+    g_alert_mx.lock();
+    uint i = 0;
+    while (i < g_alerts.length())
+    {
+        AlertEntry@ a = g_alerts[i];
+        array<uint8>@ cur = process::read_bytes(a.address, a.width);
+        if (cur is null || cur.length() != a.width) { i++; continue; }
+        bool hit = alert_test(a, cur);
+        bool edge = a.cond == OP_CHANGED ? hit : (hit && !a.active);
+        bool fire = edge && (a.last_fire == 0 || now - a.last_fire >= ALERT_MIN_GAP_MS);
+        a.active = hit && (a.active || fire);   // a rate-limited edge is retried on the next tick
+        string old = a.has_prev ? hex_of(a.prev, 0, a.width) : "";
+        a.prev = cur;
+        a.has_prev = true;
+        if (fire)
+        {
+            a.last_fire = now;
+            a.fired++;
+            fired.insertLast(a);
+            olds.insertLast(old);
+            news.insertLast(hex_of(cur, 0, a.width));
+            shown.insertLast(overlay_value(a.vt_name, cur));
+            if (a.once) { g_alerts.removeAt(i); continue; }
+        }
+        i++;
+    }
+    g_alert_mx.unlock();
+
+    for (uint k = 0; k < fired.length(); k++)
+    {
+        AlertEntry@ a = fired[k];
+        string name = a.label != "" ? a.label : hex_addr(a.address);
+        alert::show_tag("EchoDebug alert: " + name + " " + a.cond_name + " (" + shown[k] + ")", ALERT_TAG, 255, 200, 60);
+        json_obj@ ev = new_event("alert_event");
+        ev.set("alert_id", a.id);
+        ev.set("address", hex_addr(a.address));
+        if (a.label != "") ev.set("label", a.label);
+        ev.set("value_type", a.vt_name);
+        ev.set("condition", a.cond_name);
+        ev.set("old", olds[k]);
+        ev.set("new", news[k]);
+        ev.set("value", shown[k]);
+        ev.set("once", a.once);
+        if (a.snap > 0)
+        {
+            uint64 half = uint64(a.snap / 2);
+            uint64 sa = a.address >= half ? a.address - half : uint64(0);
+            array<uint8>@ sb = process::read_bytes(sa, a.snap);
+            json_obj@ snap = json_obj();
+            snap.set("address", hex_addr(sa));
+            snap.set("data", (sb !is null && sb.length() == a.snap) ? hex_of(sb, 0, a.snap) : "");
+            ev.set("snapshot", snap);
+        }
+        send_json(ev);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2348,6 +2796,16 @@ bool emu_hook(uint64 h, uint64 address, uint32 size)
     g_emu_count++;
     if (g_emu_trace_on && g_emu_trace.length() < g_emu_trace_limit) g_emu_trace.insertLast(address);
     if (g_emu_mem_on) emu_log_mem(h, address, size);
+    // registers as they are before the instruction at `address` runs
+    if (g_emu_step_on && g_emu_steps.length() < g_emu_step_limit * g_emu_gpr.length())
+    {
+        for (uint i = 0; i < g_emu_gpr.length(); i++)
+        {
+            uint64 v = 0;
+            uc::reg_read64(h, g_emu_gpr[i], v);
+            g_emu_steps.insertLast(v);
+        }
+    }
     return true;   // the instruction limit is enforced by uc::start's count argument
 }
 
@@ -2470,15 +2928,17 @@ void h_emulate(json_obj@ r, int64 id)
 
     if (!opt_int(r, "max_insns", 100000, e.max_insns) || !opt_int(r, "timeout_us", 1000000, e.timeout_us) ||
         !opt_int(r, "trace_limit", 2000, e.trace_limit) || !opt_bool(r, "trace", false, e.trace) ||
-        !opt_int(r, "mem_log_limit", 2000, e.mem_log_limit) || !opt_bool(r, "mem_log", false, e.mem_log))
+        !opt_int(r, "mem_log_limit", 2000, e.mem_log_limit) || !opt_bool(r, "mem_log", false, e.mem_log) ||
+        !opt_int(r, "step_regs_limit", 1000, e.step_regs_limit) || !opt_bool(r, "step_regs", false, e.step_regs))
     {
-        bad_args(id, "max_insns/timeout_us/trace_limit/mem_log_limit must be numbers, trace/mem_log bools");
+        bad_args(id, "max_insns/timeout_us/trace_limit/mem_log_limit/step_regs_limit must be numbers, trace/mem_log/step_regs bools");
         return;
     }
-    if (e.max_insns < 1 || e.timeout_us < 1 || e.trace_limit < 0 || e.mem_log_limit < 0) { bad_args(id, "max_insns and timeout_us must be >= 1"); return; }
-    if (e.max_insns > EMU_MAX_INSNS || e.timeout_us > EMU_MAX_TIMEOUT_US || e.trace_limit > EMU_MAX_TRACE || e.mem_log_limit > EMU_MAX_MEM_LOG)
+    if (e.max_insns < 1 || e.timeout_us < 1 || e.trace_limit < 0 || e.mem_log_limit < 0 || e.step_regs_limit < 0) { bad_args(id, "max_insns and timeout_us must be >= 1"); return; }
+    if (e.max_insns > EMU_MAX_INSNS || e.timeout_us > EMU_MAX_TIMEOUT_US || e.trace_limit > EMU_MAX_TRACE || e.mem_log_limit > EMU_MAX_MEM_LOG ||
+        e.step_regs_limit > EMU_MAX_STEP_REGS)
     {
-        send_error(id, E_LIMIT, "limit exceeded", "max_insns <= 5000000, timeout_us <= 5000000, trace_limit <= 100000, mem_log_limit <= 20000");
+        send_error(id, E_LIMIT, "limit exceeded", "max_insns <= 5000000, timeout_us <= 5000000, trace_limit <= 100000, mem_log_limit <= 20000, step_regs_limit <= 10000");
         return;
     }
 
@@ -2572,6 +3032,16 @@ void run_emulate(int64 id, EmuJob@ e)
     g_emu_mem_pending.resize(0);
     g_emu_mem_on = e.mem_log;
     g_emu_mem_limit = uint(e.mem_log_limit);
+    g_emu_gpr.resize(0);
+    for (uint i = 0; i < g_emu_gpr_names.length(); i++)
+    {
+        x86_reg reg;
+        emu_reg(g_emu_gpr_names[i], reg);
+        g_emu_gpr.insertLast(reg);
+    }
+    g_emu_steps.resize(0);
+    g_emu_step_on = e.step_regs;
+    g_emu_step_limit = uint(e.step_regs_limit);
     ok = ok && uc::hook_code(h, @emu_hook);
     // Inject the blobs before the run: map the page if the emulator has not faulted it in yet.
     for (uint i = 0; i < e.waddrs.length() && ok; i++)
@@ -2601,20 +3071,54 @@ void run_emulate(int64 id, EmuJob@ e)
     int res = uc::start(h, e.start, e.stop, uint64(e.timeout_us), uint64(e.max_insns));
     emu_flush_writes(h);   // the last instruction's writes
 
-    array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-                            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
     json_obj@ regs_out = json_obj();
     uint64 rip = 0;
-    for (uint i = 0; i < names.length(); i++)
+    for (uint i = 0; i < g_emu_gpr.length(); i++)
     {
-        x86_reg reg;
-        emu_reg(names[i], reg);
         uint64 v = 0;
-        uc::reg_read64(h, reg, v);
-        if (names[i] == "rip") rip = v;
-        regs_out.set(names[i], hex_addr(v));
+        uc::reg_read64(h, g_emu_gpr[i], v);
+        if (g_emu_gpr_names[i] == "rip") rip = v;
+        regs_out.set(g_emu_gpr_names[i], hex_addr(v));
     }
     uint64 fault = uc::fault_address(h);
+
+    // Vector registers as little-endian hex; ymm only where the emulated CPU exposes it.
+    array<x86_reg> xmm = { x86_reg::xmm0, x86_reg::xmm1, x86_reg::xmm2, x86_reg::xmm3, x86_reg::xmm4, x86_reg::xmm5,
+                           x86_reg::xmm6, x86_reg::xmm7, x86_reg::xmm8, x86_reg::xmm9, x86_reg::xmm10, x86_reg::xmm11,
+                           x86_reg::xmm12, x86_reg::xmm13, x86_reg::xmm14, x86_reg::xmm15 };
+    array<x86_reg> ymm = { x86_reg::ymm0, x86_reg::ymm1, x86_reg::ymm2, x86_reg::ymm3, x86_reg::ymm4, x86_reg::ymm5,
+                           x86_reg::ymm6, x86_reg::ymm7, x86_reg::ymm8, x86_reg::ymm9, x86_reg::ymm10, x86_reg::ymm11,
+                           x86_reg::ymm12, x86_reg::ymm13, x86_reg::ymm14, x86_reg::ymm15 };
+    json_obj@ xmm_out = json_obj();
+    json_obj@ ymm_out = json_obj();
+    for (uint i = 0; i < xmm.length(); i++)
+    {
+        array<uint8> b16;
+        b16.resize(16);
+        if (uc::reg_read128(h, xmm[i], b16) && b16.length() == 16) xmm_out.set("xmm" + i, hex_of(b16, 0, 16));
+        array<uint8> b32;
+        b32.resize(32);
+        if (uc::reg_read256(h, ymm[i], b32) && b32.length() == 32) ymm_out.set("ymm" + i, hex_of(b32, 0, 32));
+    }
+
+    // Everything mapped in the emulator by the end of the run (code, stack, faulted-in pages).
+    json_obj@ regions_out = json::array();
+    array<uc_memory_region> mapped;
+    bool regions_trunc = false;
+    if (uc::mem_regions(h, mapped))
+    {
+        for (uint i = 0; i < mapped.length(); i++)
+        {
+            if (i >= EMU_MAX_REGIONS) { regions_trunc = true; break; }
+            uint p = mapped[i].perms;
+            json_obj@ m = json_obj();
+            m.set("address", hex_addr(mapped[i].address));
+            m.set("end", hex_addr(mapped[i].end));
+            m.set("perms", ((p & uint(uc::prot::read)) != 0 ? "r" : "-") + ((p & uint(uc::prot::write)) != 0 ? "w" : "-") +
+                           ((p & uint(uc::prot::exec)) != 0 ? "x" : "-"));
+            regions_out.push(m);
+        }
+    }
 
     // Read the requested blobs back before the handle is closed.
     json_obj@ mem_out = json::array();
@@ -2659,6 +3163,23 @@ void run_emulate(int64 id, EmuJob@ e)
         o.set("mem_log", ml);
         o.set("mem_log_truncated", g_emu_mem.length() >= g_emu_mem_limit && g_emu_mem_limit > 0);
     }
+    if (e.step_regs)
+    {
+        json_obj@ steps = json::array();
+        uint nr = g_emu_gpr.length();
+        for (uint s0 = 0; s0 + nr <= g_emu_steps.length(); s0 += nr)
+        {
+            json_obj@ st = json_obj();
+            for (uint k = 0; k < nr; k++) st.set(g_emu_gpr_names[k], hex_addr(g_emu_steps[s0 + k]));
+            steps.push(st);
+        }
+        o.set("steps", steps);
+        o.set("steps_truncated", g_emu_count > uint64(g_emu_step_limit));
+    }
+    o.set("xmm", xmm_out);
+    o.set("ymm", ymm_out);
+    o.set("regions", regions_out);
+    o.set("regions_truncated", regions_trunc);
     o.set("instructions", g_emu_count);
     o.set("mem", mem_out);
     // Unicorn reports a timeout or instruction-limit stop as "ok"; this tells them apart.
@@ -2860,6 +3381,10 @@ void on_message(string msg)
     else if (type == "watch") h_watch(r, id);
     else if (type == "unwatch") h_unwatch(r, id);
     else if (type == "watch_list") h_watch_list(r, id);
+    else if (type == "overlay") h_overlay(r, id);
+    else if (type == "alert_add") h_alert_add(r, id);
+    else if (type == "alert_remove") h_alert_remove(r, id);
+    else if (type == "alert_list") h_alert_list(r, id);
     else if (type == "read_typed") h_read_typed(r, id);
     else if (type == "region_stats") h_region_stats(r, id);
     else send_error(id, E_UNKNOWN_VERB, "unknown verb", type);
@@ -2877,6 +3402,64 @@ void on_error(string msg)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Echo menu: an EchoDebug tab with the connection state and quick actions
+// ---------------------------------------------------------------------------------------------
+
+void ui_reconnect()
+{
+    ws::reconnect();
+    alert::show_tag("EchoDebug: reconnecting to the app", TAG, 80, 200, 255);
+}
+
+void ui_detach()
+{
+    if (!was_attached()) { alert::show_tag("EchoDebug: not attached", TAG, 255, 160, 40); return; }
+    if (!do_detach()) alert::show_tag("EchoDebug: busy, detach when the running job finishes", TAG, 255, 160, 40);
+}
+
+// The menu has no text element, so the attached process is shown as an alert on demand.
+void ui_status()
+{
+    g_state_mx.lock_shared();
+    bool a = g_attached;
+    uint64 pid = g_pid;
+    string nm = g_name;
+    g_state_mx.unlock_shared();
+    string s = ws::is_connected() ? "app connected" : "app not connected";
+    s += a ? ", attached to " + nm + " (pid " + pid + ")" : ", not attached";
+    alert::show_tag("EchoDebug: " + s, TAG, 80, 200, 255);
+}
+
+void ui_overlay(bool on)
+{
+    set_overlay(on);
+}
+
+void setup_menu()
+{
+    ui::add_tab("EchoDebug");
+    ui::add_category("Connection");
+    // read-only mirrors of the agent state; keepalive_tick re-syncs them every second
+    g_ui_connected = ui::add_checkbox("App connected", false, "echodebug_app_connected");
+    ui::add_tooltip(g_ui_connected, "Connected to the EchoDebug app (read-only)");
+    g_ui_attached = ui::add_checkbox("Target attached", false, "echodebug_target_attached");
+    ui::add_tooltip(g_ui_attached, "A process is attached (read-only)");
+    ui::add_button("Show status", @ui_status);
+    ui::add_button("Reconnect", @ui_reconnect);
+    ui::add_button("Detach", @ui_detach);
+    ui::add_category("Overlay");
+    g_ui_overlay = ui::add_checkbox("Draw pinned watches", true, @ui_overlay);
+    ui::add_tooltip(g_ui_overlay, "Pin entries from the Watch panel or with watch overlay:true");
+}
+
+void sync_menu()
+{
+    ui::set(g_ui_connected, ws::is_connected());
+    ui::set(g_ui_attached, was_attached());
+    ui::set(g_ui_overlay, overlay_enabled());
+}
+
+// ---------------------------------------------------------------------------------------------
 // Ticking threads
 // ---------------------------------------------------------------------------------------------
 
@@ -2890,7 +3473,7 @@ void try_auto_attach()
 }
 
 // 1 tps: reconnect with backoff (the app may start after Echo), detect target exit, retry
-// AUTO_ATTACH, and free the job slot if a job thread died without releasing it.
+// AUTO_ATTACH, free the job slot if a job thread died without releasing it, sync the Echo menu.
 void keepalive_tick()
 {
     g_ka_tick++;
@@ -2918,6 +3501,7 @@ void keepalive_tick()
     }
     if (stuck) emit_log("warn", "job watchdog released a stuck job slot");
     if (auto_try) try_auto_attach();
+    sync_menu();
 }
 
 // 20 tps: rewrite frozen values; report each failing entry once until it succeeds again.
@@ -2977,10 +3561,13 @@ bool main()
         g_auto_pending = true;
         try_auto_attach();
     }
+    setup_menu();
     ws::connect(ext_url(), @on_open, @on_message, @on_disconnect, @on_error);
     create_thread(1, @keepalive_tick);
     create_thread(20, @freeze_tick);
     create_thread(10, @watch_tick);
+    create_thread(ALERT_TPS, @alert_tick);
+    on_render(@render_tick);
     console::log(LOG_PREFIX + "agent v" + AGENT_VERSION + " loaded, relay " + ext_url());
     return true;
 }
@@ -2996,4 +3583,5 @@ void on_unload()
     }
     ws::disconnect();
     alert::dismiss(TAG);
+    alert::dismiss(ALERT_TAG);
 }

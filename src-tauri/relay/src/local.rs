@@ -267,7 +267,7 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
             return Some(err(orig, 3003, "operation failed", "no Echo memory socket on the local Linux backend"));
         }
         "freeze" | "freeze_list" | "emulate" | "pointer_scan" | "peb_walk" | "watch" | "unwatch"
-        | "watch_list" | "resolve_export" => {
+        | "watch_list" | "resolve_export" | "overlay" | "alert_add" | "alert_remove" | "alert_list" => {
             return Some(err(
                 orig,
                 3003,

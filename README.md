@@ -50,7 +50,7 @@ relay serves a **local `/proc` backend** itself: attach by pid/name from Targets
 memory, modules, region map, AoB/string scans, disassembly (iced-x86), ELF function enumeration,
 the value scanner, pointer chains, typed reads, region stats and module dumps all work against the
 local process (`/proc/<pid>/mem` — same user, or set `kernel.yama.ptrace_scope=0`). RTTI, freeze,
-watch-stream, Unicorn emulation and pointer scans are Windows-agent-only and answer with a clear
+watch-stream, overlay, alerts, Unicorn emulation and pointer scans are Windows-agent-only and answer with a clear
 error; the MCP server, all views and the UI/UX are fully available for preview.
 
 ## Features
@@ -65,7 +65,9 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | Structs | ReClass-style typed fields, follow pointers, RTTI class names, C++ header export |
 | RTTI | Every class the module declares, with its base class and the vftables that belong to it; resolve any live object to its vtable and the virtual functions behind it |
 | Scanner | Cheat Engine-style first/next value scan (u8–u64, i8–i64, f32/f64, bytes, string, wstring; exact/unknown/changed/increased/…), AOB (IDA pattern) scan, string scan |
-| Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks |
+| Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks, **Pin to overlay** (up to 32 entries drawn as text on the game window every frame) |
+| Alerts | Conditions on an address + type (equals, not equals, changed, greater, less) checked by the agent at 50 Hz; one-shot or repeating; fires an in-game alert and an `alert_event` with a memory snapshot around the address, logged to Output (click to view the snapshot) |
+| Echo menu | An *EchoDebug* tab inside Echo's own menu: connection and attach state, show status, reconnect, detach, overlay on/off |
 | Strings | ASCII + UTF-16 extraction, category/regex filters, CSV export, xrefs per string |
 | PE browser | Headers, sections, data directories, imports (with IAT slots), exports, **Analysis tab** with per-section entropy and packer/protector heuristics |
 | Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array / x64dbg / YARA output, saved to a catalog; **FLIRT** signature files (IDA `.sig`, versions 5-10) can be loaded and matched against the module, with the CRC of the function tail verified |
@@ -80,8 +82,8 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | Patches | Every write EchoDebug makes is journalled with the bytes that were there before, and can be reverted with one click |
 | Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
 | Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
-| Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 37 tools plus 6 prompts and 4 resources; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
+| Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), a **decrypt oracle** that feeds a buffer into a routine and reads the result back, optional **per-step register snapshots** with a step slider that highlights changed registers, xmm/ymm registers and the regions mapped during the run |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 41 tools plus 6 prompts and 4 resources; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
@@ -90,7 +92,7 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 **Not available on the Echo backend:** the native debugger (breakpoints, stepping, VEH), Frida,
 kernel inspection, network capture/proxy, and Reverse-Slap/AiDA's decompilers and .NET decompiler.
 Echo exposes no API for these, and EchoDebug deliberately ships no driver to replace them.
-**On the Linux local backend**, RTTI/freeze/watch/emulate/pointer-scan are likewise unavailable
+**On the Linux local backend**, RTTI/freeze/watch/overlay/alerts/emulate/pointer-scan are likewise unavailable
 (Windows-agent or MSVC concepts); everything else listed above works via `/proc` + ELF symbols.
 
 ### MCP
