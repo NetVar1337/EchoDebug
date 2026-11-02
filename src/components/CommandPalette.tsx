@@ -68,6 +68,7 @@ export default function CommandPalette() {
       { id: "memory", label: "Show selection in memory", group: "Navigate", run: () => ui.selected && ui.goMemory(ui.selected) },
       { id: "struct", label: "Show selection in struct view", group: "Navigate", run: () => ui.selected && ui.goStruct(ui.selected) },
       { id: "sig", label: "Make signature at selection", group: "Navigate", run: () => ui.selected && ui.goSig(ui.selected) },
+      { id: "lift", label: "Lift / deobfuscate / devirtualize at selection", group: "Navigate", hint: "Lifter", run: () => ui.setTab("lifter") },
     );
     // Every loaded module is a jump target.
     for (const m of conn.modules) {

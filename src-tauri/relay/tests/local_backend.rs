@@ -128,6 +128,16 @@ async fn local_backend_against_a_live_process() {
     let rf = call(json!({ "type": "read_fields", "address": ex["address"], "fields": [{ "offset": 0, "type": "u8" }, { "offset": "0x1", "type": "ptr" }] })).await;
     assert_eq!(rf["fields"][0]["value"], u64::from_str_radix(&first["data"].as_str().unwrap()[..2], 16).unwrap().to_string(), "{rf}");
 
+    // lifting over live code: a block, and a trace the relay emulates itself
+    let lb = call(json!({ "type": "lift_block", "address": ex["address"] })).await;
+    assert_eq!(lb["success"], true, "{lb}");
+    assert!(!lb["instructions"].as_array().unwrap().is_empty(), "{lb}");
+    let lt = call(json!({ "type": "lift_trace", "start": ex["address"], "max_insns": 200 })).await;
+    assert_eq!(lt["success"], true, "{lt}");
+    assert!(lt["executed"].as_u64().unwrap() >= 1, "{lt}");
+    let dv = call(json!({ "type": "devirt", "start": ex["address"], "max_insns": 200 })).await;
+    assert_eq!(dv["success"], true, "{dv}");
+
     // emulated debugger over the same code: step twice, edit a register, break, close
     let es = call(json!({ "type": "emu_start", "start": ex["address"] })).await;
     assert_eq!(es["success"], true, "{es}");

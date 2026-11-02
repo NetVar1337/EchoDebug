@@ -15,6 +15,7 @@ import EmuDebugView from "./views/EmuDebugView";
 import HooksView from "./views/HooksView";
 import MonitorsView from "./views/MonitorsView";
 import EnginesView from "./views/EnginesView";
+import LifterView from "./views/LifterView";
 import GraphView from "./views/GraphView";
 import DotnetView from "./views/DotnetView";
 import CryptoView from "./views/CryptoView";
@@ -48,6 +49,7 @@ const kViews: Record<TabId, () => JSX.Element> = {
   hooks: HooksView,
   monitors: MonitorsView,
   engines: EnginesView,
+  lifter: LifterView,
   graph: GraphView,
   dotnet: DotnetView,
   crypto: CryptoView,
