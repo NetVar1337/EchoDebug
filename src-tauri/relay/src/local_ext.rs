@@ -249,8 +249,8 @@ pub fn pointer_scan(relay: &Relay, mem: &impl MemIo, req: &Map<String, Value>) -
         while pos < m.end {
             let n = ((m.end - pos) as usize).min(0x100000);
             if let Some(buf) = read_vec(mem, pos, n) {
-                for (k, c) in buf.chunks_exact(8).enumerate() {
-                    let v = u64::from_le_bytes(c.try_into().unwrap());
+                for (k, c) in buf.as_chunks::<8>().0.iter().enumerate() {
+                    let v = u64::from_le_bytes(*c);
                     if v >= 0x10000 && readable(v, &maps) {
                         ptrs.push((v, pos + 8 * k as u64));
                         if ptrs.len() >= 50_000_000 {
@@ -352,7 +352,7 @@ const DT_DEBUG: u64 = 21;
 pub fn read_auxv(pid: u32) -> HashMap<u64, u64> {
     let mut out = HashMap::new();
     if let Ok(b) = std::fs::read(format!("/proc/{pid}/auxv")) {
-        for c in b.chunks_exact(16) {
+        for c in b.as_chunks::<16>().0 {
             let k = u64::from_le_bytes(c[..8].try_into().unwrap());
             let v = u64::from_le_bytes(c[8..].try_into().unwrap());
             if k == 0 {
