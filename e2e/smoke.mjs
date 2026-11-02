@@ -210,6 +210,24 @@ await step("lifter devirtualizes the toy VM: dispatcher, handlers, virtual strea
   expect((await page.locator(".vtrace .pill").count()) >= 8, "virtual instruction stream (the bytecode has 9 ops before halt)");
 });
 
+await step("snapshot diff in the backend sees the counter change", async () => {
+  await tab("Monitors");
+  await page.locator('input[placeholder="module name or address"]').fill(`e2e-target+${sym("counter")}`);
+  await page.locator('input[title="size (ignored for a module)"]').fill("0x100");
+  await page.locator("button", { hasText: /^Snapshot$/ }).click();
+  await until(async () => (await page.locator("text=/baseline/").count()) > 0);
+  await wait(300);
+  await page.locator("button", { hasText: "What changed?" }).click();
+  await until(async () => (await page.locator("text=/[1-9][0-9]* bytes changed/").count()) > 0);
+});
+
+await step("xref scan in the backend finds dec's call sites", async () => {
+  await tab("Xrefs");
+  await page.locator('input[placeholder="Address or module+offset…"]').fill(`e2e-target+${sym("dec")}`);
+  await page.locator("button", { hasText: /^Everywhere$/ }).click();
+  await until(async () => (await page.locator(".tag", { hasText: /^call$/ }).count()) >= 2, 20000);
+});
+
 await step("YARA matches the greeting", async () => {
   await tab("YARA");
   await page.locator("textarea").fill('rule greeting { strings: $g = "hello from the EchoDebug" condition: $g }');

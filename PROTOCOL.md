@@ -118,7 +118,7 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `reopen_socket` | – | `ok` (bool: `process::open_socket` result) |
 | `resolve_export` | `module`, `name` | `address`, `module_base` |
 | `peb_walk` | – | `count`, `modules:[{base,entry,size,name}]` (PEB Ldr walk via a process-backed Unicorn emulator; runs on the job slot) |
-| `watch` | `address`, `size?` (1–16, default 4), `label?` | `watched` (count). The agent samples the address at 10 tps and emits `watch_event` on change |
+| `watch` | `address`, `size?` (1–256, default 4), `label?`, `value_type?` (u8..f64), `condition?` (`any` default, `eq`, `ne`, `gt`, `lt`, `delta`), `value?`, `alert?` (Echo alert per hit) | `watched` (count). The agent samples at 10 tps and emits `watch_event` (`old`, `new`, `hits`; with `value_type` also `old_value`/`new_value`) when the value changes and the condition holds; `watch_list` adds `hits` and `history` (last 16 values) |
 | `unwatch` | `address` | `watched` (count) |
 | `watch_list` | – | `entries:[{address,size,label,last}]` (last = hex of the most recent sample) |
 | `read_typed` | `address`, `type` (`u8..u64`,`i8..i64`,`f32`,`f64`,`string`,`wstring`,`bytes`), `length?` (bytes/string/wstring cap, ≤ 4096) | `ok`, `value` (decoded string / hex), `raw` (hex bits) |
@@ -131,9 +131,9 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `scan_results` | `offset`, `limit` (≤ 2000) | `count`, `results:[{address, value, previous}]` (hex bytes) |
 | `scan_clear` | – | – |
 | `pointer_scan` | `target` (address), `max_depth?` (1–5, default 3), `max_offset?` (default 0x400), `max_results?` (default 500), `module_only_roots?` (default true) | `results:[{module, module_offset, offsets:[n...]}]`, `truncated` |
-| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `write?` (array of `{address, data}` — bytes injected into the emulator before the run; the page is mapped on demand), `read?` (array of `{address, size}` — bytes read back after the run), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000), `mem_log?` (bool; every explicit memory operand is decoded with Zydis before the instruction runs), `mem_log_limit?` (default 2000, max 20000) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `mem:[{address,size,ok,data}]`, `mem_log?:[{rip,address,size,access:"r"\|"w"\|"rw",before,after?}]` (hex values; `after` only for writes; `size` comes from the operand's `ptr` width; implicit stack accesses such as push/pop/call are not logged), `mem_log_truncated?`, `instructions`, `reached_end` (bool) |
+| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `write?` (array of `{address, data}` — bytes injected into the emulator before the run; the page is mapped on demand), `read?` (array of `{address, size}` — bytes read back after the run), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000), `mem_log?` (bool; every explicit memory operand is decoded with Zydis before the instruction runs), `mem_log_limit?` (default 2000, max 20000), `trace_regs?` (per-instruction register changes), `stubs?` (API stand-ins), `layers?` (unpacking layers), `on_unmapped?` (`stop` default, `zero`), `xmm?` (`{"xmm0":"<32 hex>"}`) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `mem:[{address,size,ok,data}]`, `mem_log?:[{rip,address,size,access:"r"\|"w"\|"rw",before,after?}]` (hex values; `after` only for writes; `size` comes from the operand's `ptr` width; implicit stack accesses such as push/pop/call are not logged), `mem_log_truncated?`, `instructions`, `reached_end` (bool) |
 | `dump` | `module?`, `filename` | `path` (relative to the Echo scripts `dmp` folder) |
-| `freeze` | `address`, `data` (hex), `enabled` (bool) | `frozen` (count) — agent rewrites `data` at 20 Hz while enabled |
+| `freeze` | `address`, `data` (hex, mode `set`), `enabled` (bool), `mode?` (`set` default, `add`: value += `step` per second, `clamp`: keep within `min`..`max`), `value_type?` (needed by add/clamp), `group?` | `frozen` (count) — applied at 20 Hz while enabled; `freeze_group {group, enabled}` pauses/resumes a group; `freeze_list` shows mode, group and paused |
 | `freeze_list` | – | `entries:[{address,data}]` |
 
 Long jobs (`attach`, `scan_new`, `scan_next`, `pointer_scan`, `emulate`, `peb_walk`, `auto_attach`) run on a
@@ -171,6 +171,47 @@ relay's own thread). The target process is never modified. Every reply carries t
 
 `fault` stops carry `error_name`, `fault_address`, `fault_rip` and leave rip on the faulting instruction.
 A detach closes process-backed sessions.
+
+#### Emulation options (`emulate`, `emu_start`)
+
+- `trace_regs`: `reg_trace:[{rip, changes:{reg:value}}]` (up to `trace_limit`).
+- `stubs`: calls to common APIs are simulated and return to the caller; `api_calls:[{api, address,
+  return_to, result, args, note?}]`, `api_call_count`. Windows (agent): VirtualAlloc/Free/Protect,
+  GetProcAddress (real export address), GetModuleHandleA/W, LoadLibrary*, Heap*/RtlAllocateHeap,
+  malloc/calloc/free, memcpy/memmove/memset, strlen/wcslen, GetTickCount*, QueryPerformanceCounter,
+  IsDebuggerPresent / CheckRemoteDebuggerPresent (report "not debugged"), Sleep and a few more.
+  Linux (local): libc memcpy/memmove/memset/strlen/strcmp/malloc/calloc/free/puts/getpid/sleep,
+  keyed by the export and by every resolved GOT slot (glibc's IFUNCs).
+- `layers`: `layers:[{entry, page}]` — the first execution of a page written during the run.
+- `on_unmapped: "zero"`: unmapped reads map a zero page and continue; `faults`, `fault_count`.
+- `xmm` in, `xmm` out (xmm0..xmm15, 16 bytes each, hex).
+
+Session additions: `emu_watch {address, size?, access? (r|w|rw), enabled?, clear?}` stops with reason
+`watchpoint` (`hit:{rip, address, size, access, watch}`); `emu_break` takes `condition` (`rax==0x10`,
+`!=`, `<`, `>`, `<=`, `>=`, `&` bit test); `emu_snapshot {name}` / `emu_restore {name}` save and restore
+registers, xmm and all emulator memory (8 snapshots, 128 MiB each). `cancel` stops a running emulation.
+
+### Backend extras
+
+| verb | request | reply |
+|---|---|---|
+| `hash_pages` | `ranges:[{address, size}]` (≤ 64 MiB) | `ranges:[{address, pages, hashes}]` (16 hex digits per page, FNV-1a over qwords, 0 = unreadable). The relay's page monitor uses it |
+| `mem_snapshot` | `name?`, `address`+`size` or `module` (≤ 16 MiB) | `name`, `address`, `size` (kept by the backend) |
+| `mem_diff` | `name?`, `update?`, `max_ranges?` | `changed_bytes`, `ranges:[{address, size, old, new}]`, `truncated` |
+| `mem_snapshot_list` | — | `snapshots:[{name, address, size}]` |
+| `ptr_save` | `name` | saves the last `pointer_scan` results (agent: `echodebug/pointers_<name>.json`; local: `<config>/EchoDebug/pointer-maps`) |
+| `ptr_compare` | `names:[...]` (`@last` = last scan) | `common` (paths present in every map), `count` |
+| `find_instances` | `vtable`, `max?` | `instances:[address]`, `class`, `count`, `truncated` |
+| `rtti_name` | `address`, `object?` | `vtable`, `raw`, `name` (MSVC COL on Windows, Itanium type_info on Linux) |
+| `xref_scan` | `target`, `module?`, `max?`, `pointers?` | `results:[{address, kind: call\|jmp\|jump\|riprel\|pointer, text?}]` |
+| `cancel` | — | `cancelling`; long jobs stop at their next check |
+| `stats` | — | `verbs:[{verb, calls, ms}]`, `job`, `job_ms`, `queued_events` |
+| `journal` | `limit?`, `clear?` | `entries:[{t, kind: write\|freeze, target, address, old, new}]` |
+| `agent_config` | `port?`, `auto_attach?`, `alerts?` | agent only: saved to `echodebug/agent.json` (the port applies on the next load) |
+
+The agent also queues events (newest 500) while the app is away and sends them on reconnect, runs
+first scans on four threads, and adds an **EchoDebug** tab to Echo's menu (status, reconnect, cancel,
+pause freezes/watches, restore frozen values and detach, alerts).
 
 ### Batch verbs
 
