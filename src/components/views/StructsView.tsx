@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Code2, Plus, Trash2 } from "lucide-react";
+import { ArrowLeft, Code2, Columns3, Plus, Trash2, Wand2 } from "lucide-react";
 import { request } from "@/lib/client";
 import { fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
 import { readBytes } from "@/lib/memory";
+import { kPresets } from "@/lib/analysis/presets";
 import { fieldValue, kFieldSizes, layout, toCpp, type Field, type FieldType } from "@/lib/analysis/struct";
 import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
 import { useTypes, type TypeDef } from "@/store/types";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
+import AutoDetect from "./structs/AutoDetect";
+import StructDiff from "./structs/StructDiff";
+import UnrealReader from "./structs/UnrealReader";
 
 const kTypes = Object.keys(kFieldSizes) as FieldType[];
 const hexRows = (n: number): Field[] => Array.from({ length: n }, () => ({ type: "hex64", name: "" }));
@@ -24,6 +28,8 @@ export default function StructsView() {
   const [history, setHistory] = useState<string[]>([]);
   const [cpp, setCpp] = useState<string | null>(null);
   const [showCatalog, setShowCatalog] = useState(true);
+  const [tool, setTool] = useState<"none" | "detect" | "diff" | "unreal">("none");
+  const [presetNote, setPresetNote] = useState("");
   const lay = useMemo(() => layout(cls.fields), [cls.fields]);
   const size = lay.length ? lay[lay.length - 1].offset + lay[lay.length - 1].size : 0;
   const base = ui.structAt;
@@ -81,6 +87,15 @@ export default function StructsView() {
     select(t);
   };
 
+  /** Copies an engine preset into the catalog as a new, editable type. */
+  const applyPreset = (id: string) => {
+    const p = kPresets.find((x) => x.id === id);
+    if (!p) return;
+    const tid = catalog.add(p.name, p.fields);
+    select({ id: tid, name: p.name, fields: p.fields });
+    setPresetNote(`${p.engine} · ${p.name}: ${p.description}`);
+  };
+
   /** Applies the RTTI class name of the object as the type's name. */
   const adoptRtti = () => {
     if (!base) return;
@@ -116,6 +131,15 @@ export default function StructsView() {
             <CommitInput value={base ?? ""} placeholder="object address" onCommit={(v) => go(v)} width={200} />
             <CommitInput className="input" value={cls.name} onCommit={(name) => setCls({ ...cls, name })} width={140} />
             {base && rtti[base] && <button className="btn small" onClick={adoptRtti} title="use the RTTI class name">RTTI</button>}
+            <select className="select" value="" onChange={(e) => applyPreset(e.target.value)} title="engine presets" style={{ width: 90 }}>
+              <option value="">Presets…</option>
+              {[...new Set(kPresets.map((p) => p.engine))].map((eng) => (
+                <optgroup key={eng} label={eng}>{kPresets.filter((p) => p.engine === eng).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</optgroup>
+              ))}
+            </select>
+            <IconButton tip="Auto-detect field types" onClick={() => setTool(tool === "detect" ? "none" : "detect")} disabled={!base}><Wand2 size={14} /></IconButton>
+            <IconButton tip="Compare instances" onClick={() => setTool(tool === "diff" ? "none" : "diff")}><Columns3 size={14} /></IconButton>
+            <button className="btn small" onClick={() => setTool(tool === "unreal" ? "none" : "unreal")} title="Unreal GNames / GObjects reader">UE</button>
             <span className="grow mono faint">size 0x{size.toString(16)}</span>
             <button className="btn small" onClick={() => setCls({ ...cls, fields: [...cls.fields, ...hexRows(1)] })}><Plus size={12} />8</button>
             <button className="btn small" onClick={() => setCls({ ...cls, fields: [...cls.fields, ...hexRows(8)] })}><Plus size={12} />64</button>
@@ -128,7 +152,15 @@ export default function StructsView() {
               <pre className="code-block" style={{ maxHeight: 220 }}>{cpp}</pre>
             </div>
           )}
-          {!base ? (
+          {presetNote && (
+            <div className="toolbar"><span className="faint grow ellipsis" title={presetNote}>{presetNote}</span><button className="row-action" onClick={() => setPresetNote("")}>×</button></div>
+          )}
+          {tool === "detect" && base && <AutoDetect base={base} modules={modules} fields={cls.fields} onApply={(fields) => setCls({ ...cls, fields })} onClose={() => setTool("none")} />}
+          {tool === "diff" ? (
+            <StructDiff base={base} modules={modules} fields={cls.fields} onClose={() => setTool("none")} />
+          ) : tool === "unreal" ? (
+            <UnrealReader modules={modules} onClose={() => setTool("none")} />
+          ) : !base ? (
             <div className="empty"><div className="empty-title">Enter an object address.</div><div className="empty-hint">Fields are read live every 500 ms. Retype a row to reinterpret it; pointers can be followed.</div></div>
           ) : (
             <div className="vlist">

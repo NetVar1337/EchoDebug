@@ -62,7 +62,7 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | Targets & modules | Local process list, attach by pid/name, module list, open a module in PE/Strings/Disassembly/Memory, dump to `scripts\dmp` |
 | Disassembly | Function list (`enumerate_functions`), virtualized listing, clickable branch targets with history, xrefs (rel32 + RIP-relative), make-signature, bookmarks, user names and comments |
 | Memory | Live hex/ASCII view with change highlighting, in-place byte writes, region map with r/w/x flags, data inspector |
-| Structs | ReClass-style typed fields, follow pointers, RTTI class names, C++ header export |
+| Structs | ReClass-style typed fields, follow pointers, RTTI class names, C++ header export; **auto-detect** proposes a type per slot (vtable with RTTI name, module/heap/code/string pointers, float/double, small int/bool, inline ASCII/UTF-16, padding) to accept one by one or all at once; **compare instances** shows the layout read at 2–16 objects (or a pointer array such as an entity list) side by side with differing and constant fields marked; **engine presets** for Unreal (UObject, FName, FNamePool/entry, TArray, FString, GUObjectArray, UWorld/ULevel/AActor basics), Unity IL2CPP (object, string, array, class) and Source 2 (entity identity/instance), with version notes and "typical" offsets flagged; **Unreal reader** decodes FNames by index from FNamePool (UE4.23+) or legacy GNames and pages/filters GUObjectArray (index, name, class), addresses typed in or found via editable AOB patterns |
 | RTTI | Every class the module declares, with its base class and the vftables that belong to it; resolve any live object to its vtable and the virtual functions behind it |
 | Scanner | Cheat Engine-style first/next value scan (u8–u64, i8–i64, f32/f64, bytes, string, wstring; exact/unknown/changed/increased/…), AOB (IDA pattern) scan, string scan |
 | Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks |
@@ -122,7 +122,7 @@ Requirements: Node 22+, Rust (stable, 1.90+), and on Windows the WebView2 runtim
 npm ci
 npm run tauri dev            # desktop app with hot reload
 npm run dev                  # UI only in a browser (needs a relay: cargo run -p echo-debug-relay --manifest-path src-tauri/Cargo.toml)
-npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, sessions)
+npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, struct auto-detect, Unreal names/objects, CLR metadata, crypto, caves, entropy, sessions)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 ```
