@@ -30,6 +30,7 @@ mod imp {
 
     const PAGE: u64 = 0x1000;
     const STACK_SIZE: u64 = 0x100000;
+    const TLS_SIZE: u64 = 0x10000;
     /// Returning here ends the emulated function ("returned").
     const RET_SENTINEL: u64 = 0;
 
@@ -39,6 +40,7 @@ mod imp {
         ("r8", RegisterX86::R8), ("r9", RegisterX86::R9), ("r10", RegisterX86::R10), ("r11", RegisterX86::R11),
         ("r12", RegisterX86::R12), ("r13", RegisterX86::R13), ("r14", RegisterX86::R14), ("r15", RegisterX86::R15),
         ("rip", RegisterX86::RIP), ("eflags", RegisterX86::EFLAGS),
+        ("fs_base", RegisterX86::FS_BASE), ("gs_base", RegisterX86::GS_BASE),
     ];
 
     struct Sess {
@@ -255,12 +257,16 @@ mod imp {
         };
         let maps = mem.as_ref().and_then(|m| m.maps().ok()).unwrap_or_default();
         let mut stack_base = 0x7ffe_0000_0000u64;
-        while maps.iter().any(|m| m.end > stack_base && m.start < stack_base + STACK_SIZE) {
+        while maps.iter().any(|m| m.end > stack_base && m.start < stack_base + STACK_SIZE + TLS_SIZE) {
             stack_base -= 0x10_0000_0000;
         }
         let sess = Sess { mem, bps: BTreeSet::new(), skip: None, hit: None, insns: 0, last_rip: start, stack: (stack_base, STACK_SIZE), dirty: BTreeSet::new(), trace: Vec::new() };
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, sess).map_err(|e| format!("{e:?}"))?;
         uc.mem_map(stack_base, STACK_SIZE, Prot::READ | Prot::WRITE).map_err(|e| format!("{e:?}"))?;
+        // a zeroed TLS block for fs:/gs: (stack canaries, errno)
+        uc.mem_map(stack_base + STACK_SIZE, TLS_SIZE, Prot::READ | Prot::WRITE).map_err(|e| format!("{e:?}"))?;
+        let _ = uc.reg_write(RegisterX86::FS_BASE, stack_base + STACK_SIZE + TLS_SIZE / 2);
+        let _ = uc.reg_write(RegisterX86::GS_BASE, stack_base + STACK_SIZE + TLS_SIZE / 2);
         let sp = stack_base + STACK_SIZE - 0x1000;
         uc.reg_write(RegisterX86::RSP, sp).map_err(|e| format!("{e:?}"))?;
         uc.mem_write(sp, &RET_SENTINEL.to_le_bytes()).map_err(|e| format!("{e:?}"))?;

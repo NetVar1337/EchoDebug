@@ -25,6 +25,7 @@ pub mod local_dbg;
 pub mod local_emu;
 pub mod local_emudbg;
 pub mod local_ext;
+pub mod lift;
 pub mod mcp;
 pub mod monitor;
 pub mod symbols;
@@ -76,7 +77,11 @@ static PROMPTS: LazyLock<Vec<Value>> = LazyLock::new(|| {
       { "name": "unpack_module", "description": "Find the original entry point of a packed module with the emulator, then dump it and rebuild its imports.",
         "arguments": [{ "name": "module", "description": "Module name", "required": true }] },
       { "name": "decrypt_strings", "description": "Find a string-decryption routine and run it on every call site with the decrypt oracle.",
-        "arguments": [{ "name": "address", "description": "Address of the decryption routine", "required": true }] }
+        "arguments": [{ "name": "address", "description": "Address of the decryption routine", "required": true }] },
+      { "name": "deobfuscate_function", "description": "Lift an obfuscated function: emulate it, slice away junk, fold opaque predicates and simplify MBA expressions.",
+        "arguments": [{ "name": "address", "description": "Function start", "required": true }, { "name": "end", "description": "Return address or stop address (optional)" }] },
+      { "name": "devirtualize", "description": "Analyze a VM-protected routine: find the dispatcher, lift each handler and explain the virtual instruction stream.",
+        "arguments": [{ "name": "address", "description": "VM entry", "required": true }, { "name": "max_insns", "description": "Emulation budget (default 200000)" }] }
     ]"#).expect("prompts")
 });
 
@@ -294,6 +299,12 @@ impl Relay {
             "mcp_log" => {
                 let entries: Vec<Value> = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
                 return json!({ "type": "mcp_log_result", "id": orig, "success": true, "entries": entries });
+            }
+            // Lifting / deobfuscation / devirtualization over code read through any backend.
+            "lift_block" | "lift_trace" | "devirt" => {
+                let mut v = self.lift_verb(&verb, &req).await;
+                v["id"] = orig;
+                return v;
             }
             // Monitors built on modules/read, so they work with every backend.
             "module_monitor" | "page_monitor" | "module_timeline" | "page_monitor_list" => {
@@ -767,6 +778,81 @@ impl Relay {
         Ok(json!({ "content": [{ "type": "text", "text": text }], "structuredContent": reply, "isError": is_error }))
     }
 
+    /// Reads the 4 KiB pages holding `addrs` (and the next page, for instructions that straddle).
+    async fn code_pages(&self, addrs: impl IntoIterator<Item = u64>) -> lift::Pages {
+        let mut want: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for a in addrs {
+            want.insert(a & !0xfff);
+            want.insert((a + 15) & !0xfff);
+        }
+        let mut pages = HashMap::new();
+        for p in want.into_iter().take(4096) {
+            let mut r = Map::new();
+            r.insert("type".into(), json!("read"));
+            r.insert("address".into(), json!(format!("0x{p:x}")));
+            r.insert("size".into(), json!(0x1000));
+            let v = Box::pin(self.request(Value::Object(r))).await;
+            if let Some(bytes) = v["data"].as_str().and_then(|h| (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()) {
+                pages.insert(p, bytes);
+            }
+        }
+        lift::Pages(pages)
+    }
+
+    /// lift_block / lift_trace / devirt. Traces come from `trace` (addresses) or from an emulated
+    /// run (`start`, `end`, `max_insns`, `regs`), which the relay requests itself.
+    async fn lift_verb(&self, verb: &str, req: &Map<String, Value>) -> Value {
+        let addr = |v: &Value| match v {
+            Value::String(s) => u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok(),
+            Value::Number(n) => n.as_u64(),
+            _ => None,
+        };
+        let fail = |m: &str| json!({ "type": "error", "code": 3002, "message": "bad arguments", "detail": m });
+        if verb == "lift_block" {
+            let Some(start) = req.get("address").and_then(addr) else { return fail("lift_block requires 'address'") };
+            let max = req.get("max_insns").and_then(Value::as_u64).unwrap_or(256) as usize;
+            let pages = self.code_pages((0..max.min(4096) as u64 * 4).step_by(0x800).map(|o| start + o).chain([start])).await;
+            if pages.0.is_empty() { return json!({ "type": "error", "code": 1005, "message": "memory read failed", "detail": format!("0x{start:x}") }); }
+            let mut v = tokio::task::spawn_blocking(move || lift::lift_block(&pages, start, max)).await.unwrap_or_else(|e| json!({ "error": e.to_string() }));
+            v["type"] = json!("lift_block_result");
+            v["success"] = json!(true);
+            return v;
+        }
+        let mut emu_info = Value::Null;
+        let trace: Vec<u64> = match req.get("trace").and_then(Value::as_array) {
+            Some(t) => t.iter().filter_map(addr).collect(),
+            None => {
+                if !req.contains_key("start") {
+                    return fail("pass 'trace' (addresses) or 'start' (and 'end') to emulate one");
+                }
+                let mut e = Map::new();
+                e.insert("type".into(), json!("emulate"));
+                for k in ["start", "end", "regs", "write", "code"] {
+                    if let Some(v) = req.get(k) { e.insert(k.into(), v.clone()); }
+                }
+                if !e.contains_key("end") { e.insert("end".into(), json!("0x1")); }
+                e.insert("max_insns".into(), json!(req.get("max_insns").and_then(Value::as_u64).unwrap_or(200_000).min(2_000_000)));
+                e.insert("trace".into(), json!(true));
+                e.insert("trace_limit".into(), json!(100_000));
+                let r = Box::pin(self.request(Value::Object(e))).await;
+                if r["type"] == "error" { return r; }
+                emu_info = json!({ "error_name": r["error_name"], "instructions": r["instructions"], "reached_end": r["reached_end"], "regs": r["regs"] });
+                r["trace"].as_array().map(|t| t.iter().filter_map(addr).collect()).unwrap_or_default()
+            }
+        };
+        if trace.is_empty() { return fail("the trace is empty"); }
+        let pages = self.code_pages(trace.iter().copied().collect::<std::collections::BTreeSet<u64>>()).await;
+        let verb2 = verb.to_owned();
+        let max = req.get("max_listing").and_then(Value::as_u64).unwrap_or(2000) as usize;
+        let mut v = tokio::task::spawn_blocking(move || if verb2 == "devirt" { lift::devirt(&pages, &trace, max) } else { lift::lift_trace(&pages, &trace, max) })
+            .await
+            .unwrap_or_else(|e| json!({ "error": e.to_string() }));
+        v["type"] = json!(format!("{verb}_result"));
+        v["success"] = json!(true);
+        if !emu_info.is_null() { v["emulation"] = emu_info; }
+        v
+    }
+
     /// completion/complete for prompt and resource-template arguments.
     async fn complete(&self, params: &Value) -> Result<Value, (i32, String)> {
         let arg = params["argument"]["name"].as_str().unwrap_or_default();
@@ -900,6 +986,10 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
             "Unpack {{module}}: call ui_find_oep to emulate from the entry point until execution leaves the unpacking stub, then ui_rebuild_imports to recover the import table, and report the original entry point, the recovered imports and where the rebuilt image was written.")],
         "decrypt_strings" => vec![text("address",
             "Treat {{address}} as a string-decryption routine: call ui_xrefs_to to find its call sites, then ui_batch_decrypt to run the routine on the arguments set up at each site, and list the decrypted strings with their call sites.")],
+        "deobfuscate_function" => vec![text("address",
+            "Deobfuscate the function at {{address}} (stop address: {{end}}). First call lift_block on it to see its blocks and any opaque predicates. Then call lift_trace with start={{address}} (and end if given): it emulates the function against live memory, keeps only the instructions that affect the final registers and memory, and simplifies the expressions (including MBA). Report the cleaned listing, the final register/memory effects as formulas, the opaque predicates, and a short C-like reconstruction.")],
+        "devirtualize" => vec![text("address",
+            "Treat {{address}} as the entry of a virtualized routine. Call devirt with start={{address}} and max_insns={{max_insns}} (default 200000). From the result: name the dispatcher and the VIP register, give each handler a mnemonic from its lifted effects (e.g. vpush, vadd, vload, vjmp), then rewrite virtual_trace as a virtual-instruction listing and summarize what the virtual program computes. If no dispatcher is found, raise max_insns or check that emulation reached the VM loop (see 'emulation').")],
         _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],
     };
     json!({ "description": prompt["description"], "messages": msgs })

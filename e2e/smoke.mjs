@@ -188,6 +188,28 @@ await step("page monitor sees the counter's page change", async () => {
   await until(async () => (await page.locator("text=/[1-9][0-9]* changes/").count()) > 0, 15000);
 });
 
+await step("lifter deobfuscates classify's emulated run and lifts a block", async () => {
+  await tab("Lifter");
+  await page.locator('input[placeholder="start · module+0x…"]').fill(`e2e-target+${sym("classify")}`);
+  await page.locator("button", { hasText: "Emulate & deobfuscate" }).click();
+  await until(async () => (await page.locator("text=/\\d+ kept/").count()) > 0, 20000);
+  expect((await page.locator(".lift-effects").first().innerText()).includes("rax"), "rax is among the effects");
+  await page.locator(".tabs .tab", { hasText: /^Block$/ }).click();
+  await page.locator("button", { hasText: "Lift block" }).click();
+  await until(async () => (await page.locator("th", { hasText: /dead\)/ }).count()) > 0);
+});
+
+await step("lifter devirtualizes the toy VM: dispatcher, handlers, virtual stream", async () => {
+  await page.locator(".tabs .tab", { hasText: /^Devirtualize$/ }).click();
+  await page.locator('input[placeholder="start · module+0x…"]').fill(`e2e-target+${sym("vm_run")}`);
+  await page.locator('input[placeholder="regs: rcx=0x10, rdx=…"]').fill(`rdi=e2e-target+${sym("vm_code")}`);
+  await page.locator("button", { hasText: "Emulate & devirtualize" }).click();
+  const kv = await until(async () => { const t = await page.locator(".kv").first().innerText(); return /dispatcher/.test(t) && t; }, 20000);
+  const n = Number(/(\d+) distinct/.exec(kv)?.[1] ?? 0);
+  expect(n >= 5, `expected at least 5 distinct handlers, got: ${kv}`);
+  expect((await page.locator(".vtrace .pill").count()) >= 8, "virtual instruction stream (the bytecode has 9 ops before halt)");
+});
+
 await step("YARA matches the greeting", async () => {
   await tab("YARA");
   await page.locator("textarea").fill('rule greeting { strings: $g = "hello from the EchoDebug" condition: $g }');

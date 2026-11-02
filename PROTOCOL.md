@@ -180,6 +180,25 @@ A detach closes process-backed sessions.
 | `disasm_function` | `address`, `max_bytes?` (≤ 16 KiB) | `count`, `size`, `complete`, `results:[{address,length,bytes,text}]` (agent: `zydis::disasm_func`) |
 | `read_fields` | `address`, `fields:[{offset, type}]` (u8..u64, i8..i64, f32, f64, ptr; ≤ 1024 within 64 KiB) | `fields:[{offset,type,value}]` from one snapshot (agent: `process::read_buffer`) |
 
+### Lifting, deobfuscation, devirtualization (relay)
+
+Answered by the relay for every backend: code bytes come through `read`, traces through `emulate`.
+
+| verb | request | reply |
+|---|---|---|
+| `lift_block` | `address`, `max_insns?` (default 256) | `instructions:[{address,text,effect,live}]`, `registers:[{register,value}]`, `stores:[{address,size,value}]`, `end:{kind, condition?, taken?, fallthrough?, opaque?}`, `dead`, `unsupported` |
+| `lift_trace` | `trace?:[address]`, or `start`, `end?`, `max_insns?` (default 200000), `regs?`, `write?` (emulated by the relay), `max_listing?` | `registers`, `stores` (strided runs folded: `"rdi + i  for i in 0..0x15"`), `listing` (live instructions; `{loop, times}` markers fold repeated cycles), `conditions:[{address,instruction,condition,taken,opaque}]`, `executed`, `live`, `removed`, `opaque_predicates`, `emulation?` |
+| `devirt` | as `lift_trace` | `dispatcher`, `dispatch_targets`, `handler_executions`, `vip_register`, `handlers:[{id,address,executions,length,registers,stores,body}]`, `virtual_trace:[handler id]` |
+
+Model: GPRs start as symbols (`rax`…), reads of memory not written earlier in the run are `[addr]` loads
+(`.b`/`.w`/`.d` for 1/2/4 bytes), stores at structurally different addresses are assumed not to alias, and
+flags are tracked as the last compare/test. Expressions are simplified structurally (constant folding,
+identities, mask/known-bits rules) and, for final values, by sampling-verified MBA replacement (a smaller
+candidate over the same ≤ 3 inputs that agrees on 96 random and edge-case inputs). Liveness is a backward slice
+from the changed registers and the memory left behind (stack slots below the final `rsp` excluded).
+Instructions outside the model turn their outputs into fresh unknowns and are counted in `unsupported`.
+The local emulators map a zeroed TLS block for `fs:`/`gs:` (`fs_base`/`gs_base` are settable registers).
+
 ### Relay monitors
 
 Built on `modules` / `read`, so they work with every backend:
@@ -258,7 +277,8 @@ Prompts (`prompts/get` returns ready-to-use user messages with arguments substit
 `explain_function` (address), `find_pattern` (pattern, module?), `find_string` (text, module?),
 `pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module),
 `find_vtable` (class, module?), `make_signature` (address), `diff_snapshots` (address, size?),
-`unpack_module` (module), `decrypt_strings` (address).
+`unpack_module` (module), `decrypt_strings` (address), `deobfuscate_function` (address, end?),
+`devirtualize` (address, max_insns?).
 
 Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
 `echodebug://target/modules` (fails when no memory server is connected). Module monitor events also send

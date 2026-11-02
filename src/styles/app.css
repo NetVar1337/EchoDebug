@@ -392,3 +392,7 @@ html[data-motion="off"] *::after {
 .link-button { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .small-label { font-size: var(--type-small); color: var(--text-dim); gap: 5px; }
 .toolbar label.row, .panel-section label.row { font-size: var(--type-small); }
+.lift-effects { display: flex; flex-direction: column; gap: 2px; font-size: var(--type-mono); overflow-wrap: anywhere; }
+.vtrace { display: flex; flex-wrap: wrap; gap: 3px; max-height: 160px; overflow: auto; }
+.vtrace .pill { padding: 0 5px; font-size: 11px; }
+.toolbar.wrap { flex-wrap: wrap; height: auto; padding-top: 6px; padding-bottom: 6px; }
