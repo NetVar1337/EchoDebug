@@ -23,6 +23,9 @@ import DebuggerView from "./views/DebuggerView";
 import CfgView from "./views/CfgView";
 import SigToolsView from "./views/SigToolsView";
 import YaraView from "./views/YaraView";
+import BinDiffView from "./views/BinDiffView";
+import UnpackView from "./views/UnpackView";
+import DecryptView from "./views/DecryptView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -48,6 +51,9 @@ const kViews: Record<TabId, () => JSX.Element> = {
   cfg: CfgView,
   sigtools: SigToolsView,
   yara: YaraView,
+  bindiff: BinDiffView,
+  unpack: UnpackView,
+  decrypt: DecryptView,
 };
 
 export default function WorkspacePanel() {

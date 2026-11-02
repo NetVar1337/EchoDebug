@@ -33,6 +33,18 @@ import { genInput, moduleFunctions } from "./flirtlive";
 import { readRange } from "./memory";
 import { useSigs } from "@/store/sigs";
 import { useNames } from "@/store/names";
+import { imphash, parseDebug, parseRelocs, parseRich, parseTls } from "./analysis/peextra";
+import { summarizeResources } from "./analysis/resources";
+import { openMetadata } from "./analysis/dotnet";
+import { disassembleIl, formatIl, userStringRefs } from "./analysis/cil";
+import { findIat } from "./analysis/unpack";
+import { diffFunctions } from "./analysis/bindiff";
+import { mapPeFile, parseRuntimeFunctions } from "./analysis/pe";
+import { loadPdbSymbols, readModuleFileBytes } from "./modfile";
+import { batchDecrypt, exportIndex, oepCandidates } from "./unpacklive";
+import { functionsFromImage } from "./diffinput";
+import { parseSignature, authenticodeHash } from "./analysis/authenticode";
+import { invoke } from "@tauri-apps/api/core";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 
@@ -347,6 +359,81 @@ provide("ui_flirt_pat", async (args) => {
     .map((f) => ({ ...f, name: f.name || `sub_${(toBig(f.address) - toBig(m.base)).toString(16)}` }));
   const entries = (await genInput(fns)).map(toPatEntry).filter((e) => e !== null);
   return { module: m.name, count: entries.length, pat: toPatFile(entries) };
+});
+
+provide("ui_pe_details", async (args) => {
+  const { m, img, base } = await moduleImage(args);
+  const pe = parsePe(img);
+  const out: Record<string, unknown> = { module: m.name, imphash: imphash(pe), rich: parseRich(img), tls: parseTls(img, base, pe), relocations: (() => { const r = parseRelocs(img, pe, 0); return { total: r.total, byType: r.byType }; })(), debug: parseDebug(img, pe) };
+  if (args.signature) {
+    const f = await readModuleFileBytes(m);
+    const sig = parseSignature(f.bytes);
+    out.signature = sig ? { ...sig, fileDigest: await authenticodeHash(f.bytes, sig.digestAlgorithm === "sha1" ? "sha1" : "sha256"), path: f.path } : null;
+  }
+  return out;
+});
+
+provide("ui_resources", async (args) => {
+  const { m, img } = await moduleImage(args);
+  const r = summarizeResources(img);
+  return { module: m.name, version: r.version, manifest: r.manifest, strings: r.strings.slice(0, 2000), dialogs: r.dialogs, icons: r.icons.length, resources: r.leaves.length };
+});
+
+provide("ui_load_symbols", async (args) => {
+  const m = pickModule(args);
+  return { module: m.name, ...(await loadPdbSymbols(m, { overwrite: Boolean(args.overwrite) })) };
+});
+
+provide("ui_il", async (args) => {
+  const { m, img } = await moduleImage(args);
+  const md = openMetadata(img);
+  if (!md) throw new Error(`${m.name} has no CLR metadata`);
+  const want = typeof args.method === "string" ? args.method.toLowerCase() : "";
+  const hits = md.methods.filter((x) => `${x.type}::${x.name}`.toLowerCase().includes(want) || x.token === Number(args.token));
+  if (!hits.length) throw new Error(`no method matches '${args.method ?? args.token}'`);
+  return { module: m.name, methods: hits.slice(0, num(args, "limit", 5, 50)).map((x) => { try { return { method: `${x.type}::${x.name}`, token: x.token, il: formatIl(disassembleIl(img, x.rva, md.tokenName)) }; } catch (e) { return { method: `${x.type}::${x.name}`, token: x.token, error: String(e) }; } }) };
+});
+
+provide("ui_user_strings", async (args) => {
+  const { m, img } = await moduleImage(args);
+  const md = openMetadata(img);
+  if (!md) throw new Error(`${m.name} has no CLR metadata`);
+  const refs = userStringRefs(img, md.methods);
+  const f = typeof args.filter === "string" ? args.filter.toLowerCase() : "";
+  const list = md.userStrings.filter((u) => !f || u.text.toLowerCase().includes(f)).map((u) => ({ text: u.text, token: u.token, loadedBy: (refs.get(u.token) ?? []).map((r) => `${r.method}+IL_${r.offset.toString(16).padStart(4, "0")}`) }));
+  return { module: m.name, ...limitList(list, args) };
+});
+
+provide("ui_find_oep", async (args) => {
+  const m = pickModule(args);
+  const r = await oepCandidates(m, num(args, "max_insns", 2_000_000, 5_000_000));
+  return { module: m.name, instructions: r.instructions, stop: r.stop, candidates: r.candidates.map((c) => ({ ...c, address: labelAddr(c.address, modules()) })) };
+});
+
+provide("ui_rebuild_imports", async (args) => {
+  const m = pickModule(args);
+  const idx = await exportIndex(modules(), m);
+  const blocks = findIat(await loadImage(m), idx);
+  return { module: m.name, exports_indexed: idx.size, blocks: blocks.map((b) => ({ rva: b.rva, dll: b.dll, imports: b.thunks.map((t) => t.name || `#${t.ordinal}`) })), note: "save the rebuilt PE from the Unpack tab" };
+});
+
+provide("ui_batch_decrypt", async (args) => {
+  const r = await batchDecrypt(addrArg(args), modules(), { limit: num(args, "limit", 100, 1000) });
+  return { count: r.length, decrypted: r.filter((x) => x.result).length, results: r.map((x) => ({ site: labelAddr(x.site, modules()), text: x.result?.text ?? null, encoding: x.result?.encoding, stop: x.stop, error: x.error })) };
+});
+
+provide("ui_binary_diff", async (args) => {
+  const m = pickModule(args);
+  if (typeof args.old_path !== "string") throw new Error("missing 'old_path' (an older build of the module on this machine)");
+  const raw = new Uint8Array(await invoke<number[]>("read_binary_file", { path: args.old_path }));
+  const oldImg = mapPeFile(raw);
+  const oldPe = parsePe(oldImg);
+  const oldFns = parseRuntimeFunctions(oldImg, oldPe).filter((f) => !f.chained).slice(0, 6000).map((f) => ({ rva: f.begin, size: f.end - f.begin, name: "" }));
+  const newImg = await loadImage(m);
+  const nb = toBig(m.base);
+  const newFns = (await moduleFunctions(m)).slice(0, 6000).map((f) => ({ rva: Number(toBig(f.address) - nb), size: f.size, name: useNames.getState().nameOf(f.address) }));
+  const r = diffFunctions(await functionsFromImage(oldImg, oldPe.imageBase, oldFns), await functionsFromImage(newImg, nb, newFns), Number(oldPe.imageBase), Number(nb));
+  return { module: m.name, matched: r.pairs.length, changed: r.pairs.filter((p) => p.changed).map((p) => ({ old_rva: p.old.rva, new: labelAddr(nb + BigInt(p.new.rva), modules()), kind: p.kind, similarity: Number(p.similarity.toFixed(3)) })).slice(0, 2000), added: r.onlyNew.map((f) => labelAddr(nb + BigInt(f.rva), modules())).slice(0, 2000), removed: r.onlyOld.map((f) => f.rva).slice(0, 2000) };
 });
 
 // ------------------------------------------------------------------------------------------------
