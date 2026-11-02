@@ -7,6 +7,7 @@ import { useUi } from "@/store/ui";
 import { NeedsAgent } from "../ui";
 
 type MemBlob = { address: string; size: number; ok: boolean; data: string };
+type MemAccess = { rip: string; address: string; size: number; access: "r" | "w" | "rw"; before: string; after?: string };
 type EmuResult = {
   error: number;
   error_name: string;
@@ -16,6 +17,8 @@ type EmuResult = {
   instructions: number;
   reached_end?: boolean;
   mem?: MemBlob[];
+  mem_log?: MemAccess[];
+  mem_log_truncated?: boolean;
 };
 
 const kRegs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"];
@@ -32,6 +35,7 @@ export default function EmulatorView() {
   const [regs, setRegs] = useState<Record<string, string>>({ rcx: "", rdx: "", r8: "", r9: "" });
   const [maxInsns, setMaxInsns] = useState(100000);
   const [trace, setTrace] = useState(true);
+  const [memLog, setMemLog] = useState(true);
   const [res, setRes] = useState<EmuResult | null>(null);
   const [busy, setBusy] = useState(false);
   // Oracle mode: a buffer that is written before the run and read back after it.
@@ -69,6 +73,7 @@ export default function EmulatorView() {
       regs: r,
       max_insns: maxInsns,
       trace,
+      mem_log: memLog,
       ...(cleanCode ? { code: cleanCode.toLowerCase() } : {}),
       ...(write.length ? { write } : {}),
       ...(read.length ? { read } : {}),
@@ -109,6 +114,7 @@ export default function EmulatorView() {
             <div className="row">
               <span>max insns</span><input className="input mono" style={{ width: 100 }} type="number" value={maxInsns} onChange={(e) => setMaxInsns(Number(e.target.value))} />
               <label className="row"><input type="checkbox" checked={trace} onChange={(e) => setTrace(e.target.checked)} />trace</label>
+              <label className="row" title="Log every explicit memory read/write with its value"><input type="checkbox" checked={memLog} onChange={(e) => setMemLog(e.target.checked)} />memory</label>
               <span className="grow" />
               <button className="btn primary" disabled={busy} onClick={() => void run()}>{busy ? "Running…" : "Emulate"}</button>
             </div>
@@ -160,6 +166,20 @@ export default function EmulatorView() {
                     </div>
                   ))}
                 </div>
+              )}
+              {res.mem_log && res.mem_log.length > 0 && (
+                <table className="table mono">
+                  <colgroup><col style={{ width: "34%" }} /><col style={{ width: 36 }} /><col style={{ width: "30%" }} /><col /></colgroup>
+                  <thead><tr><th>Memory ({res.mem_log.length}{res.mem_log_truncated ? ", limit hit" : ""})</th><th /><th>Address</th><th>Value</th></tr></thead>
+                  <tbody>{res.mem_log.map((m, i) => (
+                    <tr key={i}>
+                      <td className="link" onClick={() => ui.goDisasm(m.rip)}>{labelAddr(m.rip, modules)}</td>
+                      <td className={m.access === "r" ? "dim" : "warn"}>{m.access}</td>
+                      <td className="link" onClick={() => ui.select(m.address)} title={`${m.size} bytes`}>{labelAddr(m.address, modules)}</td>
+                      <td title={m.after !== undefined ? `${m.before || "?"} → ${m.after || "?"}` : m.before}>{m.after !== undefined ? <>{m.before || "?"} → <span className="ok">{m.after || "?"}</span></> : m.before || "?"}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
               )}
               {res.trace.length > 0 && (
                 <table className="table mono">

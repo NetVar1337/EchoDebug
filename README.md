@@ -80,7 +80,7 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | Patches | Every write EchoDebug makes is journalled with the bytes that were there before, and can be reverted with one click |
 | Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
 | Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
-| Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
+| Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 37 tools plus 6 prompts and 4 resources; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |

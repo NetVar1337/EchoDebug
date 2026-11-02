@@ -79,6 +79,7 @@ const uint64 EMU_CODE_MAX = 0x100000;
 const int64 EMU_MAX_INSNS = 5000000;
 const int64 EMU_MAX_TIMEOUT_US = 5000000;
 const int64 EMU_MAX_TRACE = 100000;
+const int64 EMU_MAX_MEM_LOG = 20000;     // each entry carries before/after hex, so smaller than the trace cap
 const uint EMU_MAX_BLOBS = 64;           // injected / read-back memory blobs
 const uint64 EMU_MAX_BLOB_BYTES = 0x10000; // 64 KiB per blob
 
@@ -159,6 +160,12 @@ uint64 g_emu_count = 0;
 bool g_emu_trace_on = false;
 uint g_emu_trace_limit = 0;
 array<uint64> g_emu_trace;
+// memory log: explicit memory operands decoded with Zydis before each instruction runs
+bool g_emu_blank = false;
+bool g_emu_mem_on = false;
+uint g_emu_mem_limit = 0;
+array<MemAccess@> g_emu_mem;
+array<uint> g_emu_mem_pending;   // indexes of writes whose new value is read before the next instruction
 
 // g_pow2[e + 1074] == 2^e, used to decode IEEE-754 bits without a reinterpret cast.
 array<double> g_pow2;
@@ -185,6 +192,19 @@ class WatchEntry
     array<uint8> prev;    // last sampled bytes
     bool has_prev;
     WatchEntry() { address = 0; size = 4; has_prev = false; }
+}
+
+// One decoded memory operand of an emulated instruction.
+class MemAccess
+{
+    uint64 rip;
+    uint64 address;
+    uint size;
+    bool r;
+    bool w;
+    string before;   // hex at `address` before the instruction ran ("" if unreadable)
+    string after;    // writes only: hex after it ran
+    MemAccess() { rip = 0; address = 0; size = 0; r = false; w = false; }
 }
 
 // Everything a job thread needs, claimed atomically with the job slot (g_state_mx).
@@ -215,10 +235,13 @@ class EmuJob
     int64 timeout_us;
     bool trace;
     int64 trace_limit;
+    bool mem_log;
+    int64 mem_log_limit;
     EmuJob()
     {
         start = 0; stop = 0; max_insns = 100000; timeout_us = 1000000;
         trace = false; trace_limit = 2000;
+        mem_log = false; mem_log_limit = 2000;
     }
 }
 
@@ -2324,7 +2347,95 @@ bool emu_hook(uint64 h, uint64 address, uint32 size)
 {
     g_emu_count++;
     if (g_emu_trace_on && g_emu_trace.length() < g_emu_trace_limit) g_emu_trace.insertLast(address);
+    if (g_emu_mem_on) emu_log_mem(h, address, size);
     return true;   // the instruction limit is enforced by uc::start's count argument
+}
+
+// Bytes at `a` as the emulator sees them; pages it has not faulted in yet still hold the target's bytes.
+string emu_peek(uint64 h, uint64 a, uint n)
+{
+    array<uint8> b;
+    b.resize(n);
+    if (uc::mem_read(h, a, n, b)) return hex_of(b, 0, n);
+    if (g_emu_blank) return "";
+    array<uint8>@ p = process::read_bytes(a, n);
+    return (p is null || p.length() < n) ? "" : hex_of(p, 0, n);
+}
+
+void emu_flush_writes(uint64 h)
+{
+    for (uint i = 0; i < g_emu_mem_pending.length(); i++)
+    {
+        MemAccess@ m = g_emu_mem[g_emu_mem_pending[i]];
+        m.after = emu_peek(h, m.address, m.size);
+    }
+    g_emu_mem_pending.resize(0);
+}
+
+// Operand width from Zydis' Intel text ("dword ptr [...]"); the binding exposes no operand size.
+uint emu_ptr_size(const string &in t)
+{
+    if (t.findFirst("zmmword ptr") >= 0) return 64;
+    if (t.findFirst("ymmword ptr") >= 0) return 32;
+    if (t.findFirst("xmmword ptr") >= 0) return 16;
+    if (t.findFirst("tbyte ptr") >= 0) return 10;
+    if (t.findFirst("qword ptr") >= 0) return 8;
+    if (t.findFirst("dword ptr") >= 0) return 4;
+    if (t.findFirst("word ptr") >= 0) return 2;
+    if (t.findFirst("byte ptr") >= 0) return 1;
+    return 8;
+}
+
+// Value of a Zydis address register; only 64-bit GPRs and rip occur in x64 addressing in practice.
+bool emu_addr_reg(uint64 h, int zreg, uint64 next_rip, uint64 &out v)
+{
+    v = 0;
+    if (zreg == 0) return true;
+    string n = zydis::reg_name(zreg);
+    if (n == "rip") { v = next_rip; return true; }
+    x86_reg reg;
+    if (!emu_reg(n, reg)) return false;
+    return uc::reg_read64(h, reg, v);
+}
+
+void emu_log_mem(uint64 h, uint64 address, uint32 size)
+{
+    emu_flush_writes(h);   // the previous instruction has executed by now
+    if (g_emu_mem.length() >= g_emu_mem_limit) return;
+    array<uint8> code;
+    code.resize(size);
+    if (!uc::mem_read(h, address, size, code)) return;
+    array<disasm_insn@> insns;
+    if (!zydis::disasm(code, address, insns) || insns.length() == 0) return;
+    disasm_insn@ insn = insns[0];
+    if (insn.text.findFirst("lea ") == 0 || insn.text.findFirst("nop") == 0) return;   // address math, no access
+    for (uint8 i = 0; i < insn.operand_count_visible && g_emu_mem.length() < g_emu_mem_limit; i++)
+    {
+        disasm_operand op = insn.get_op(i);
+        if (op.type != op_type::mem) continue;
+        bool r = (op.action & (int(op_action::read) | int(op_action::condread))) != 0;
+        bool w = (op.action & (int(op_action::write) | int(op_action::condwrite))) != 0;
+        if (!r && !w) continue;
+        uint64 base = 0;
+        uint64 index = 0;
+        uint64 next_rip = address + size;
+        if (!emu_addr_reg(h, op.mem_base, next_rip, base) || !emu_addr_reg(h, op.mem_index, next_rip, index)) continue;
+        uint64 ea = base + index * op.mem_scale + uint64(op.mem_disp);
+        string seg = op.mem_segment == 0 ? "" : zydis::reg_name(op.mem_segment);
+        uint64 sb = 0;
+        if (seg == "gs") uc::reg_read64(h, x86_reg::gs_base, sb);
+        else if (seg == "fs") uc::reg_read64(h, x86_reg::fs_base, sb);
+        ea += sb;
+        MemAccess@ m = MemAccess();
+        m.rip = address;
+        m.address = ea;
+        m.size = emu_ptr_size(insn.text);
+        m.r = r;
+        m.w = w;
+        m.before = emu_peek(h, ea, m.size);
+        if (w) g_emu_mem_pending.insertLast(g_emu_mem.length());
+        g_emu_mem.insertLast(m);
+    }
 }
 
 // High, normally unused addresses; in process mode pick one the target has not mapped.
@@ -2358,15 +2469,16 @@ void h_emulate(json_obj@ r, int64 id)
     else if (!require_attached(id)) return;
 
     if (!opt_int(r, "max_insns", 100000, e.max_insns) || !opt_int(r, "timeout_us", 1000000, e.timeout_us) ||
-        !opt_int(r, "trace_limit", 2000, e.trace_limit) || !opt_bool(r, "trace", false, e.trace))
+        !opt_int(r, "trace_limit", 2000, e.trace_limit) || !opt_bool(r, "trace", false, e.trace) ||
+        !opt_int(r, "mem_log_limit", 2000, e.mem_log_limit) || !opt_bool(r, "mem_log", false, e.mem_log))
     {
-        bad_args(id, "max_insns/timeout_us/trace_limit must be numbers, trace a bool");
+        bad_args(id, "max_insns/timeout_us/trace_limit/mem_log_limit must be numbers, trace/mem_log bools");
         return;
     }
-    if (e.max_insns < 1 || e.timeout_us < 1 || e.trace_limit < 0) { bad_args(id, "max_insns and timeout_us must be >= 1"); return; }
-    if (e.max_insns > EMU_MAX_INSNS || e.timeout_us > EMU_MAX_TIMEOUT_US || e.trace_limit > EMU_MAX_TRACE)
+    if (e.max_insns < 1 || e.timeout_us < 1 || e.trace_limit < 0 || e.mem_log_limit < 0) { bad_args(id, "max_insns and timeout_us must be >= 1"); return; }
+    if (e.max_insns > EMU_MAX_INSNS || e.timeout_us > EMU_MAX_TIMEOUT_US || e.trace_limit > EMU_MAX_TRACE || e.mem_log_limit > EMU_MAX_MEM_LOG)
     {
-        send_error(id, E_LIMIT, "limit exceeded", "max_insns <= 5000000, timeout_us <= 5000000, trace_limit <= 100000");
+        send_error(id, E_LIMIT, "limit exceeded", "max_insns <= 5000000, timeout_us <= 5000000, trace_limit <= 100000, mem_log_limit <= 20000");
         return;
     }
 
@@ -2455,6 +2567,11 @@ void run_emulate(int64 id, EmuJob@ e)
     g_emu_trace.resize(0);
     g_emu_trace_on = e.trace;
     g_emu_trace_limit = uint(e.trace_limit);
+    g_emu_blank = blank;
+    g_emu_mem.resize(0);
+    g_emu_mem_pending.resize(0);
+    g_emu_mem_on = e.mem_log;
+    g_emu_mem_limit = uint(e.mem_log_limit);
     ok = ok && uc::hook_code(h, @emu_hook);
     // Inject the blobs before the run: map the page if the emulator has not faulted it in yet.
     for (uint i = 0; i < e.waddrs.length() && ok; i++)
@@ -2482,6 +2599,7 @@ void run_emulate(int64 id, EmuJob@ e)
     }
 
     int res = uc::start(h, e.start, e.stop, uint64(e.timeout_us), uint64(e.max_insns));
+    emu_flush_writes(h);   // the last instruction's writes
 
     array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
                             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
@@ -2523,6 +2641,24 @@ void run_emulate(int64 id, EmuJob@ e)
     o.set("fault_address", hex_addr(fault));
     o.set("regs", regs_out);
     o.set("trace", tr);
+    if (e.mem_log)
+    {
+        json_obj@ ml = json::array();
+        for (uint i = 0; i < g_emu_mem.length(); i++)
+        {
+            MemAccess@ m = g_emu_mem[i];
+            json_obj@ x = json_obj();
+            x.set("rip", hex_addr(m.rip));
+            x.set("address", hex_addr(m.address));
+            x.set("size", m.size);
+            x.set("access", m.r && m.w ? "rw" : (m.w ? "w" : "r"));
+            x.set("before", m.before);
+            if (m.w) x.set("after", m.after);
+            ml.push(x);
+        }
+        o.set("mem_log", ml);
+        o.set("mem_log_truncated", g_emu_mem.length() >= g_emu_mem_limit && g_emu_mem_limit > 0);
+    }
     o.set("instructions", g_emu_count);
     o.set("mem", mem_out);
     // Unicorn reports a timeout or instruction-limit stop as "ok"; this tells them apart.
