@@ -151,6 +151,46 @@ enable so clients can journal the pre-freeze bytes; frozen values are restored o
 The agent restores the pre-freeze bytes of every frozen address on `detach`, on target exit and in
 `on_unload`, and calls `process::detach()` in `on_unload` (Echo docs teardown rule).
 
+### Emulated debugger (`emu_*`)
+
+One persistent Unicorn x86-64 session (agent: `uc::create_process` / `uc::create`; Linux backend: the
+relay's own thread). The target process is never modified. Every reply carries the session state:
+`regs:{rax..r15,rip,eflags}`, `rip`, `instructions` (session total), `stop:{reason, ...}`,
+`next:[{address,bytes,text}]` (up to 6 instructions at rip), `stack:[{address,value}]` (8 slots at rsp),
+`breakpoints:[address]`, `dirty_pages:[address]`.
+
+| verb | request | notes |
+|---|---|---|
+| `emu_start` | `start`, `code?` (hex: blank emulator), `regs?`, `write?:[{address,data}]`, `breakpoints?:[address]` | replaces any session; a `ret` from the start function stops with `returned` |
+| `emu_step` | `count?` (default 1), `timeout_us?` | `stop.reason`: `step`, `count`, `breakpoint`, `returned`, `fault`, `timeout` |
+| `emu_run` | `until?`, `max_insns?` (default 1M), `timeout_us?` (≤ 5 s) | adds `until`; a resumed run never stops on the breakpoint it starts on |
+| `emu_break` | `address?`, `enabled?` (default true), `clear?` | |
+| `emu_set` | `regs?`, `write?:[{address,data}]` | emulator memory only; code writes flush the translation cache |
+| `emu_read` | `address`, `size?` (≤ 64 KiB) | untouched pages read through to the process |
+| `emu_state`, `emu_close` | — | `emu_close` → `closed: bool` |
+
+`fault` stops carry `error_name`, `fault_address`, `fault_rip` and leave rip on the faulting instruction.
+A detach closes process-backed sessions.
+
+### Batch verbs
+
+| verb | request | reply |
+|---|---|---|
+| `sig_scan_batch` | `patterns:[ida]` (≤ 512), `module?` (default main), `max_hits?` (≤ 64) | `results:[{pattern, count, results:[address]}]` (agent: `process::find_signatures`) |
+| `disasm_function` | `address`, `max_bytes?` (≤ 16 KiB) | `count`, `size`, `complete`, `results:[{address,length,bytes,text}]` (agent: `zydis::disasm_func`) |
+| `read_fields` | `address`, `fields:[{offset, type}]` (u8..u64, i8..i64, f32, f64, ptr; ≤ 1024 within 64 KiB) | `fields:[{offset,type,value}]` from one snapshot (agent: `process::read_buffer`) |
+
+### Relay monitors
+
+Built on `modules` / `read`, so they work with every backend:
+
+| verb | request | reply / events |
+|---|---|---|
+| `module_monitor` | `enabled?` (default true), `interval_ms?` (default 1000) | events `module_loaded` / `module_unloaded` (`name`, `base`, `size`, `ts`) |
+| `module_timeline` | — | `enabled`, `entries` (last 500 events) |
+| `page_monitor` | `address`, `size?`, `label?`, `interval_ms?`, `enabled?` | `page_changed` events (`address`, `size`, `label`, `count`, `pages`), FNV-1a per 4 KiB page; 64 MiB total |
+| `page_monitor_list` | — | `entries:[{address,size,label,interval_ms,changes,last_change}]` |
+
 ## Provider verbs (`ui_*`) and authentication
 
 Verbs that start with `ui_` are answered by the desktop app window, because the analyses behind them
@@ -174,9 +214,34 @@ differs from the app version and (re)installs the bundled agent into `%APPDATA%\
 ## MCP surface
 
 `POST /mcp` speaks JSON-RPC 2.0 (single messages and batches; notifications get `202 Accepted`).
-Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (with `subscribe`) and
-`logging` capabilities plus `instructions`), `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`,
-`resources/list`, `resources/read`, `resources/subscribe`/`unsubscribe`, `logging/setLevel`.
+Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (with `subscribe`),
+`completions` and `logging` capabilities plus `instructions`), `ping`, `tools/list`, `tools/call`,
+`prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`,
+`resources/subscribe`/`unsubscribe`, `completion/complete`, `logging/setLevel`.
+
+**Tools** carry `title`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+`openWorldHint`, derived from the verb) and an object `outputSchema`; results add `structuredContent`
+(the reply object) next to the text block.
+
+**Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],
+"deny":[tool], "audit":bool }` (omitted fields keep their value; the reply echoes the policy and
+`audit_path`). Deny and allow lists apply to every tool. `ask` and `readonly` gate the calls that change
+the target (`write`, `freeze`) and `dump`: `readonly` refuses them, `ask` sends the app window a
+`ui_approve` provider call (`tool`, `verb`, `arguments` → `approved: bool`) and refuses when no window
+answers. Refusals are tool errors with code `4003`; the call log records `outcome: ok | error | denied`.
+With `audit` on, every call is appended to `<config>/EchoDebug/mcp-audit.jsonl`; `mcp_audit_export` returns
+the in-memory log as JSONL plus the audit file.
+
+**Resource templates:** `echodebug://memory/{address}/{size}`, `echodebug://disasm/{address}`,
+`echodebug://module/{name}/pe|exports|strings`, `echodebug://names` (answered by the app window;
+`+` in a module-relative address may be sent as `%2B`).
+
+**Completion** (`completion/complete`): `module`/`name` arguments complete module names, address-like
+arguments complete named addresses (app window) and `module+0x`, `value_type` and `format` their enums.
+
+**stdio.** `echodebug-relay --stdio [port]` speaks newline-delimited JSON-RPC on stdin/stdout. If a relay
+already listens on the port it forwards to its `/mcp` with the token from the config directory; otherwise
+it becomes the relay on that port and also writes notifications to stdout.
 
 **Server-sent events.** `GET /mcp` with `Accept: text/event-stream` opens a notification stream:
 `notifications/resources/updated` for `echodebug://status` and `echodebug://target/modules` on every status
@@ -196,7 +261,8 @@ Prompts (`prompts/get` returns ready-to-use user messages with arguments substit
 `unpack_module` (module), `decrypt_strings` (address).
 
 Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
-`echodebug://target/modules` (fails when no memory server is connected).
+`echodebug://target/modules` (fails when no memory server is connected). Module monitor events also send
+`notifications/resources/updated` for `echodebug://target/modules`.
 
 The tool set covers the whole backend: process control (`status`, `list_processes`, `attach`,
 `detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,

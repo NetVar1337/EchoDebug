@@ -92,7 +92,12 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …), 11 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script. **Module projects** keep names, comments and bookmarks per module build (by RVA) and restore them on the next attach, wherever ASLR puts the module; panel sizes, the last place in each view and (optionally) the last target are restored on start; a target switcher in the Targets panel |
-| Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
+| MCP policy | Settings in the MCP panel: allow everything, **ask** (an Allow/Deny dialog in the window for writes, freezes and dumps) or read-only, plus allow/deny tool lists, an optional audit file (`mcp-audit.jsonl`) and JSONL export. Tools carry MCP annotations and structured output; resource templates (`echodebug://memory/{address}/{size}`, `module/{name}/exports`, …) and argument completion are supported |
+| Emulated debugger | **Emu Debugger** tab: a persistent Unicorn session over the target's memory — step, run to an address, breakpoints, edit registers and memory, watch the stack — without touching the process (`emu_*` verbs, also as MCP tools) |
+| Hook scanner | **Hooks** tab: executable code compared with the file on disk (rebased with its relocations), inline hooks at exports, IAT slots redirected to unbacked memory |
+| Monitors | **Monitors** tab: module load/unload timeline and page-change monitors (4 KiB page hashes), as events and MCP notifications, on every backend |
+| Engine dumpers | **Engines** tab: Unreal Engine 4.23+/5 (GNames/GObjects → object list and an `SDK.hpp`), Unity IL2CPP (global-metadata.dat v24–31 from disk or memory → `dump.cs` and an Il2CppDumper-style `script.json` with method RVAs) and Source engine netvars (`netvars.txt`) |
+| Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI; `echodebug-relay --stdio` serves MCP over stdin/stdout for clients that launch servers as subprocesses |
 | Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |
 
 **Not available on the Echo backend:** the native debugger (breakpoints, stepping, VEH), Frida,
@@ -113,8 +118,11 @@ only, requires the token on `/client` and `/mcp` (stored in `<config>/EchoDebug/
 `ECHODEBUG_TOKEN` overrides it, `ECHODEBUG_AUTH=0` turns the check off) and rejects browser origins
 other than the app's own, so other programs and web pages cannot reach your target's memory.
 
+For stdio clients: `claude mcp add echodebug -- echodebug-relay --stdio`.
+
 Any MCP client works: the relay speaks Streamable HTTP JSON-RPC 2.0 (`initialize`, `ping`,
-`tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read|subscribe`; batches supported,
+`tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read|subscribe|templates/list`,
+`completion/complete`; batches supported,
 notifications answered with `202`; `GET /mcp` with `Accept: text/event-stream` streams resource updates
 and agent events; a `tools/call` with a `progressToken` streams scan progress). Prompts:
 `explain_function`, `find_pattern`, `find_string`, `pointer_path`, `scan_value`, `triage_module`,
