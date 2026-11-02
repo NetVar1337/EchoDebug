@@ -44,9 +44,20 @@ export default function TargetsPanel() {
     >
       <div className="panel-section">
         <div className="row"><span className="dot" data-state={c.relay ? "ok" : "bad"} /> Relay {c.relay ? "running" : "offline"}{c.relayError && <span className="danger"> · {c.relayError}</span>}</div>
-        <div className="row"><span className="dot" data-state={c.ext ? "ok" : "bad"} /> Agent {c.ext ? `v${c.extVersion}` : "not loaded"}</div>
-        <div className="row"><span className="dot" data-state={c.agent ? "ok" : "bad"} /> Memory server {c.agent ? "connected" : "waiting for attach"}</div>
-        {!c.ext && <div className="faint" style={{ fontSize: 12 }}>Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>.</div>}
+        {c.os === "windows" ? (
+          <>
+            <div className="row"><span className="dot" data-state={c.ext ? "ok" : "bad"} /> Agent {c.ext ? `v${c.extVersion}` : "not loaded"}</div>
+            <div className="row"><span className="dot" data-state={c.agent ? "ok" : "bad"} /> Memory server {c.agent ? "connected" : "waiting for attach"}</div>
+            {!c.ext && <div className="faint" style={{ fontSize: 12 }}>Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>.</div>}
+          </>
+        ) : (
+          <>
+            <div className="row"><span className="dot" data-state={c.backend === "local" ? "ok" : "warn"} /> Backend {c.backend === "local" ? "local /proc (Linux)" : "none — attach below"}</div>
+            <div className="faint" style={{ fontSize: 12 }}>
+              The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze / emulate / pointer-scan need the Windows agent.
+            </div>
+          </>
+        )}
         <label className="search"><Search size={13} /><input placeholder="Filter processes…" value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
       </div>
       <div className="panel-body">

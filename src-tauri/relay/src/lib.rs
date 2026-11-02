@@ -18,6 +18,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+pub mod local;
+
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -72,7 +74,7 @@ static RESOURCES: LazyLock<Vec<Value>> = LazyLock::new(|| {
 const MCP_LOG_CAP: usize = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Agent,
     Ext,
 }
@@ -146,6 +148,13 @@ impl Relay {
 
     fn status(&self, ty: &str) -> Map<String, Value> {
         let s = self.lock();
+        let backend = if s.agent.is_some() {
+            "echo"
+        } else if local::attached_pid().is_some() {
+            "local"
+        } else {
+            "none"
+        };
         let v = json!({
             "type": ty,
             "agent": s.agent.is_some(),
@@ -153,12 +162,14 @@ impl Relay {
             "ext_version": s.ext_version,
             "app_version": self.0.app_version,
             "target": s.target,
+            "backend": backend,
+            "local": backend == "local",
         });
         let Value::Object(m) = v else { unreachable!() };
         m
     }
 
-    fn broadcast_status(&self) {
+    pub(crate) fn broadcast_status(&self) {
         let _ = self
             .0
             .events
@@ -214,28 +225,40 @@ impl Relay {
         let id = self.next_id();
         req.insert("id".into(), id.into());
         let (tx, mut rx) = oneshot::channel();
-        {
+        // Grab the upstream sender in a short lock scope so no guard is held across an await.
+        let upstream = {
             let mut s = self.lock();
-            let Some(up) = s.slot(kind) else {
+            s.slot(kind).as_ref().map(|up| (up.conn, up.tx.clone()))
+        };
+        let Some((conn, up_tx)) = upstream else {
+            // No Echo upstream: on Linux the relay serves the verbs itself from /proc.
+            if local::available() {
                 return match kind {
-                    Kind::Agent => error(orig, 2001, "echo memory server not connected"),
-                    Kind::Ext => error(orig, 2002, "EchoDebug agent not connected"),
+                    Kind::Agent => local::handle_native(self, req, &orig).await
+                        .unwrap_or_else(|| error(orig.clone(), 2001, "echo memory server not connected")),
+                    Kind::Ext => local::handle_ext(self, req, &orig).await
+                        .unwrap_or_else(|| error(orig.clone(), 2002, "EchoDebug agent not connected")),
                 };
-            };
-            let conn = up.conn;
-            if up.tx.send(Value::Object(req).to_string()).is_err() {
-                return error(orig, 2004, "upstream disconnected");
             }
-            s.pending.insert(
-                id,
-                Pending {
-                    kind,
-                    conn,
-                    orig: orig.clone(),
-                    reply: tx,
-                },
-            );
+            return match kind {
+                Kind::Agent => error(orig, 2001, "echo memory server not connected"),
+                Kind::Ext => error(orig, 2002, "EchoDebug agent not connected"),
+            };
+        };
+        let sent = up_tx.send(Value::Object(req).to_string());
+        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
+        if sent.is_err() {
+            return error(orig, 2004, "upstream disconnected");
         }
+        self.lock().pending.insert(
+            id,
+            Pending {
+                kind,
+                conn,
+                orig: orig.clone(),
+                reply: tx,
+            },
+        );
 
         match tokio::time::timeout(self.0.timeout, &mut rx).await {
             Ok(Ok(reply)) => reply,

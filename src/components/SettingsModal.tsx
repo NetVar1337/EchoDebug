@@ -5,6 +5,7 @@ import { attempt, log } from "@/store/output";
 import { useUi, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
+import { isWindowsOs } from "@/lib/tauri";
 import { IconButton } from "./ui";
 
 const kAccents = ["", "#2eb8a6", "#88c0d0", "#f26b38", "#a78bfa", "#f472b6", "#facc15"];
@@ -21,6 +22,7 @@ export default function SettingsModal() {
     if (r) log("info", "agent", `installed ${r.path}${r.changed ? " (updated)" : " (unchanged)"}`);
     else if (!isTauri()) log("warn", "agent", "agent install is only available in the desktop app");
   };
+  const windowsOnly = isWindowsOs(conn.os);
   return (
     <div className="modal-scrim" onMouseDown={(e) => e.target === e.currentTarget && close()}>
       <div className="modal" role="dialog" aria-label="Settings">
@@ -64,12 +66,14 @@ export default function SettingsModal() {
             <div className="settings-row">
               <span>Agent script</span>
               <div className="row">
-                <button className="btn" onClick={() => void reinstall()}>Reinstall agent</button>
-                <button className="btn" onClick={() => void attempt("agent", openScriptsFolder())} disabled={!isTauri()}>Open scripts folder</button>
+                <button className="btn" onClick={() => void reinstall()} disabled={!windowsOnly} title={windowsOnly ? undefined : "The Echo agent only runs inside Echo on Windows"}>Reinstall agent</button>
+                <button className="btn" onClick={() => void attempt("agent", openScriptsFolder())} disabled={!isTauri() || !windowsOnly}>Open scripts folder</button>
               </div>
             </div>
             <div className="faint" style={{ fontSize: 12 }}>
-              Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>. Reopen the Echo menu to refresh the script list.
+              {windowsOnly
+                ? <>Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>. Reopen the Echo menu to refresh the script list.</>
+                : <>Host <span className="mono">{conn.os}</span>: the Echo agent is Windows-only. On Linux the relay serves a local <span className="mono">/proc</span> memory backend — attach from the Targets panel.</>}
             </div>
           </div>
 

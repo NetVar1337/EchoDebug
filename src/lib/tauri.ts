@@ -11,6 +11,16 @@ export async function relayInfo(): Promise<RelayInfo> {
   return invoke<RelayInfo>("relay_info");
 }
 
+/** Host OS of the desktop app ("windows" | "linux" | "macos" | …); "browser" outside Tauri. */
+export async function hostOs(): Promise<string> {
+  if (!isTauri()) return "browser";
+  return invoke<string>("host_os");
+}
+
+export function isWindowsOs(os: string): boolean {
+  return os === "windows";
+}
+
 export async function installAgent(): Promise<InstallResult | null> {
   if (!isTauri()) return null;
   return invoke<InstallResult>("install_agent");

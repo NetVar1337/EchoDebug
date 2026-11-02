@@ -17,7 +17,7 @@ import ModulesPanel from "@/components/panels/ModulesPanel";
 import NamesPanel from "@/components/panels/NamesPanel";
 import TargetsPanel from "@/components/panels/TargetsPanel";
 import WatchPanel from "@/components/panels/WatchPanel";
-import { installAgent, isTauri } from "@/lib/tauri";
+import { hostOs, installAgent, isTauri } from "@/lib/tauri";
 import { exportSession, importSession } from "@/lib/session";
 import { useConn } from "@/store/conn";
 import { applyMotion, useMotion } from "@/store/motion";
@@ -36,9 +36,15 @@ export default function App() {
     log("info", "app", `EchoDebug v${useConn.getState().appVersion}${isTauri() ? "" : " (browser mode)"}`);
     void useConn.getState().init();
     if (isTauri()) {
-      void installAgent()
-        .then((r) => r && log("info", "agent", `echo_debug.as ${r.changed ? "installed/updated" : "up to date"} at ${r.path}`))
-        .catch((e) => log("error", "agent", `install failed: ${e}`));
+      void hostOs().then((os) => {
+        if (os !== "windows") {
+          log("info", "agent", `host ${os}: the Echo agent is Windows-only; the relay serves a local /proc backend on Linux`);
+          return;
+        }
+        return installAgent()
+          .then((r) => r && log("info", "agent", `echo_debug.as ${r.changed ? "installed/updated" : "up to date"} at ${r.path}`))
+          .catch((e) => log("error", "agent", `install failed: ${e}`));
+      });
     }
     return startUpdateLoop(() => useUi.getState().autoUpdate);
   }, []);

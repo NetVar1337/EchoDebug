@@ -98,8 +98,8 @@ export default function McpPanel() {
     >
       <div className="panel-section">
         <div className="row"><span className="dot" data-state={c.relay ? "ok" : "bad"} /> Relay {c.relay ? "running" : "offline"}</div>
-        <div className="row"><span className="dot" data-state={c.ext ? "ok" : "bad"} /> Agent (ext verbs) {c.ext ? `v${c.extVersion}` : "not loaded"}</div>
-        <div className="row"><span className="dot" data-state={c.agent ? "ok" : "bad"} /> Memory server {c.agent ? "connected" : "waiting for attach"}</div>
+        <div className="row"><span className="dot" data-state={c.ext ? "ok" : "bad"} /> Agent (ext verbs) {c.ext ? `v${c.extVersion}` : c.os === "linux" ? "not available (Windows-only); local backend serves core verbs" : "not loaded"}</div>
+        <div className="row"><span className="dot" data-state={c.agent || c.backend === "local" ? "ok" : "bad"} /> Memory backend {c.agent ? "Echo server" : c.backend === "local" ? "local /proc (Linux)" : "waiting for attach"}</div>
         <div className="row"><span className="dot" data-state={c.target ? "ok" : "warn"} /> Target {c.target ? `${c.target.name ?? "?"} (pid ${c.target.pid})` : "none — attach from Targets"}</div>
         <div className="label" style={{ marginTop: 6 }}>Endpoint</div>
         <CopyChip text={endpoint} copied={copied} onCopy={copy} />

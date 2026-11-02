@@ -55,8 +55,17 @@ fn relay_info(state: tauri::State<'_, RelayState>) -> RelayInfo {
     }
 }
 
+/// Host OS ("windows", "linux", "macos", …) so the UI can gate Windows-only Echo features.
+#[tauri::command]
+fn host_os() -> String {
+    std::env::consts::OS.to_string()
+}
+
 #[tauri::command]
 fn install_agent(state: tauri::State<'_, RelayState>) -> Result<InstallResult, String> {
+    if std::env::consts::OS != "windows" {
+        return Err("the Echo agent (AngelScript) only runs inside Echo on Windows; on Linux the relay serves a local /proc backend".to_owned());
+    }
     install(state.port)
 }
 
@@ -121,16 +130,22 @@ pub fn run() {
             if let Some(e) = &error {
                 eprintln!("{e}");
             }
-            // The agent ships inside the app, so app updates also update the agent.
-            match install(port) {
-                Ok(r) => eprintln!("agent at {} (updated: {})", r.path, r.changed),
-                Err(e) => eprintln!("agent install failed: {e}"),
+            // The agent ships inside the app, so app updates also update the agent. Windows only:
+            // on Linux the relay serves the local /proc backend instead.
+            if std::env::consts::OS == "windows" {
+                match install(port) {
+                    Ok(r) => eprintln!("agent at {} (updated: {})", r.path, r.changed),
+                    Err(e) => eprintln!("agent install failed: {e}"),
+                }
+            } else {
+                eprintln!("host os '{}': skipping Echo agent install (Windows-only); local /proc backend active", std::env::consts::OS);
             }
             app.manage(RelayState { port, error });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             relay_info,
+            host_os,
             install_agent,
             scripts_dir,
             write_text_file,

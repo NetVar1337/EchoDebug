@@ -38,6 +38,21 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 4. In **Targets**, pick a process and click **Attach**. The status bar should show
    `Memory server` and `Agent` as green.
 
+## Linux / Ubuntu (preview build)
+
+Releases also ship `EchoDebug_x.y.z_amd64.deb` (install with `sudo dpkg -i …` or the Software app)
+and `EchoDebug.AppImage`. **Auto-update works on the AppImage** (the Tauri updater updates AppImages,
+not .deb installs) — use the AppImage if you want the in-app "Restart to update" flow; `latest.json`
+on each release carries the signed `linux-x86_64` updater artifact.
+
+On Linux the Echo agent is unavailable (it runs inside Echo's Discord overlay on Windows), so the
+relay serves a **local `/proc` backend** itself: attach by pid/name from Targets, then read/write
+memory, modules, region map, AoB/string scans, disassembly (iced-x86), ELF function enumeration,
+the value scanner, pointer chains, typed reads, region stats and module dumps all work against the
+local process (`/proc/<pid>/mem` — same user, or set `kernel.yama.ptrace_scope=0`). RTTI, freeze,
+watch-stream, Unicorn emulation and pointer scans are Windows-agent-only and answer with a clear
+error; the MCP server, all views and the UI/UX are fully available for preview.
+
 ## Features
 
 | Area | What you get |
@@ -75,6 +90,8 @@ Echo (Discord overlay host)                      EchoDebug.exe (Tauri)
 **Not available on the Echo backend:** the native debugger (breakpoints, stepping, VEH), Frida,
 kernel inspection, network capture/proxy, and Reverse-Slap/AiDA's decompilers and .NET decompiler.
 Echo exposes no API for these, and EchoDebug deliberately ships no driver to replace them.
+**On the Linux local backend**, RTTI/freeze/watch/emulate/pointer-scan are likewise unavailable
+(Windows-agent or MSVC concepts); everything else listed above works via `/proc` + ELF symbols.
 
 ### MCP
 

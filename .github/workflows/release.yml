@@ -94,8 +94,9 @@ jobs:
           {
             echo "body<<__NOTES__"
             cat notes/notes.md
-            printf '\n\n**Install:** run `EchoDebug_%s_x64-setup.exe` (per-user, no admin) or `EchoDebug_%s_x64_en-US.msi` (per-machine). Both update themselves.' "$VERSION" "$VERSION"
-            printf '\n\n**Echo agent:** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
+            printf '\n\n**Install (Windows):** run `EchoDebug_%s_x64-setup.exe` (per-user, no admin) or `EchoDebug_%s_x64_en-US.msi` (per-machine). Both update themselves.' "$VERSION" "$VERSION"
+            printf '\n\n**Install (Ubuntu/Linux):** `EchoDebug_%s_amd64.deb` installs with `sudo dpkg -i` / the Software app. For **auto-updates** use the AppImage (`EchoDebug.AppImage`) instead — the Tauri updater updates AppImages, not .deb installs. On Linux the app previews the full UI and talks MCP; process memory comes from a local `/proc` backend (the Echo agent is Windows-only).\n' "$VERSION"
+            printf '\n\n**Echo agent (Windows):** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
             echo "__NOTES__"
           } >> "$GITHUB_OUTPUT"
       - uses: tauri-apps/tauri-action@v0
@@ -117,3 +118,53 @@ jobs:
         run: gh release upload "v$VERSION" agent/echo_debug.as --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Ubuntu/.deb + AppImage. The AppImage carries the signed updater artifact (.tar.gz + .sig)
+  # that the in-app updater downloads; latest.json gets a linux-x86_64 platform entry.
+  build-linux:
+    needs: [version, build]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - run: npm ci
+      - run: npm run build
+      - name: Build .deb and AppImage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles appimage,deb
+        working-directory: src-tauri
+      - name: Upload Linux artifacts and extend latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd src-tauri/target/release/bundle
+          ls appimage deb
+          APPIMAGE=$(ls appimage/*.AppImage | head -1)
+          TARBALL=$(ls appimage/*.AppImage.tar.gz | head -1)
+          SIG="$TARBALL.sig"
+          DEB=$(ls deb/*.deb | head -1)
+          gh release upload "v$VERSION" "$APPIMAGE" "$TARBALL" "$SIG" "$DEB" --clobber
+          cd "$GITHUB_WORKSPACE"
+          gh release download "v$VERSION" --pattern latest.json --dir .
+          node scripts/merge-latest-json.mjs latest.json "src-tauri/target/release/bundle/$SIG" "$VERSION" "$(basename "$TARBALL")"
+          gh release upload "v$VERSION" latest.json --clobber

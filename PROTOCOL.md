@@ -53,6 +53,15 @@ replies immediately with:
 { "type":"error", "id":<orig>, "code":2002, "message":"EchoDebug agent not connected" }      // /ext missing
 ```
 
+**Local backend (Linux):** on non-Windows hosts, when no `/agent` or `/ext` upstream is connected, the
+relay serves the verbs itself from `/proc/<pid>` (`mem`/`maps`, ELF symbols via `object`, iced-x86 for
+disassembly): native verbs `ping`, `read`, `read_batch`, `modules`, `sig_scan`, `sig_scan_ida`,
+`string_scan`, `disassemble`, `enumerate_functions`, `resolve_relative`; ext verbs `attach`, `detach`,
+`alive`, `write`, `query`, `regions`, `chain`, `scan_new`/`scan_next`/`scan_results`/`scan_clear`,
+`read_typed`, `region_stats`, `dump`. Agent-only verbs (freeze, watch, emulate, pointer_scan,
+peb_walk, resolve_export, reopen_socket) and RTTI answer with a clear "requires the Echo agent"
+error. Status frames carry `"backend": "echo" | "local" | "none"` and `"local": bool`.
+
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
 

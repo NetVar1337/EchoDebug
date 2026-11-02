@@ -40,6 +40,11 @@
       "wix": {
         "language": "en-US"
       }
+    },
+    "linux": {
+      "deb": {
+        "section": "utils"
+      }
     }
   },
   "plugins": {
