@@ -26,6 +26,13 @@ import { buildNeedle, formatAs, inspect, type CopyFormat, type NeedleMode } from
 import { floatScanFields, groupMatches, groupSpan, parseGroup } from "./analysis/scancmp";
 import { searchMemory } from "./memsearch";
 import { readManyChunked } from "./batch";
+import { parseYara, scanYara } from "./analysis/yara";
+import { toPatEntry, toPatFile } from "./analysis/flirtgen";
+import { health } from "./analysis/sigrepair";
+import { genInput, moduleFunctions } from "./flirtlive";
+import { readRange } from "./memory";
+import { useSigs } from "@/store/sigs";
+import { useNames } from "@/store/names";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 
@@ -297,6 +304,49 @@ provide("ui_inspect", async (args) => {
   if (!b) throw new Error("not readable");
   const fmt = (typeof args.format === "string" ? args.format : "spaced") as CopyFormat;
   return { address: labelAddr(a, modules()), little_endian: inspect(b, true), big_endian: inspect(b, false), bytes: formatAs(b, fmt) };
+});
+
+provide("ui_yara_scan", async (args) => {
+  if (typeof args.rules !== "string") throw new Error("missing 'rules' (YARA source)");
+  const rules = parseYara(args.rules);
+  const out: unknown[] = [];
+  if (typeof args.address === "string") {
+    const a = addrArg(args);
+    const size = num(args, "size", 0x10000, 256 * 1024 * 1024);
+    for (const h of scanYara(rules, await readRange(a, size))) out.push({ ...h, strings: h.strings.slice(0, 50).map((s) => ({ ...s, address: labelAddr(a + BigInt(s.offset), modules()) })) });
+  } else {
+    const list = args.module === "*" ? modules() : [pickModule(args)];
+    for (const m of list) {
+      const img = await loadImage(m);
+      let entrypoint: number | undefined;
+      try { entrypoint = parsePe(img).entryRva; } catch { /* not PE */ }
+      for (const h of scanYara(rules, img, { entrypoint })) out.push({ ...h, module: m.name, strings: h.strings.slice(0, 50).map((s) => ({ ...s, address: labelAddr(toBig(m.base) + BigInt(s.offset), modules()) })) });
+    }
+  }
+  return { rules: rules.length, count: out.length, matches: out };
+});
+
+provide("ui_sig_health", async () => {
+  const mods = modules();
+  const main = pickModule({}).name;
+  const out = [];
+  for (const s of useSigs.getState().sigs) {
+    const hits = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern: s.ida, module: s.module || main, find_all: true }, true).catch(() => null);
+    const n = hits?.success ? hits.results.length : 0;
+    out.push({ name: s.name, module: s.module || main, ida: s.ida, hits: n, health: health(n), first: hits?.results?.[0] ? labelAddr(hits.results[0], mods) : null });
+  }
+  return { count: out.length, broken: out.filter((x) => x.health !== "ok").length, results: out };
+});
+
+provide("ui_flirt_pat", async (args) => {
+  const m = pickModule(args);
+  const names = useNames.getState();
+  const fns = (await moduleFunctions(m)).map((f) => ({ ...f, name: names.nameOf(f.address) }))
+    .filter((f) => !args.named_only || f.name)
+    .slice(0, num(args, "limit", 2000, 20000))
+    .map((f) => ({ ...f, name: f.name || `sub_${(toBig(f.address) - toBig(m.base)).toString(16)}` }));
+  const entries = (await genInput(fns)).map(toPatEntry).filter((e) => e !== null);
+  return { module: m.name, count: entries.length, pat: toPatFile(entries) };
 });
 
 // ------------------------------------------------------------------------------------------------

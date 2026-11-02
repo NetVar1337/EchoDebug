@@ -33,3 +33,18 @@ describe("ELF parser", () => {
     expect(relocTypeName(183, 1025)).toBe("1025");
   });
 });
+
+describe("ELF executable ranges in a mapped image", () => {
+  it.skipIf(!kSample)("finds the R-X PT_LOAD segment", async () => {
+    const { elfExecutableRanges } = await import("./xrefindex");
+    const file = new Uint8Array(readFileSync(kSample!));
+    // the headers sit at the start of both the file and the mapped image
+    const r = elfExecutableRanges(file);
+    expect(r.length).toBeGreaterThanOrEqual(1);
+    const info = parseElf(file);
+    const text = info.sections.find((s) => s.name === ".text")!;
+    const lowest = info.segments.filter((s) => s.typeName === "LOAD").reduce((m, s) => (s.vaddr < m ? s.vaddr : m), 1n << 62n) & ~0xfffn;
+    const rva = Number(text.addr - lowest);
+    expect(r.some((x) => rva >= x.rva && rva < x.rva + x.size)).toBe(true);
+  });
+});

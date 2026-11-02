@@ -21,6 +21,8 @@ import XrefView from "./views/XrefView";
 import AntiDebugView from "./views/AntiDebugView";
 import DebuggerView from "./views/DebuggerView";
 import CfgView from "./views/CfgView";
+import SigToolsView from "./views/SigToolsView";
+import YaraView from "./views/YaraView";
 
 const kViews: Record<TabId, () => JSX.Element> = {
   disassembly: DisassemblyView,
@@ -44,6 +46,8 @@ const kViews: Record<TabId, () => JSX.Element> = {
   antidebug: AntiDebugView,
   debugger: DebuggerView,
   cfg: CfgView,
+  sigtools: SigToolsView,
+  yara: YaraView,
 };
 
 export default function WorkspacePanel() {

@@ -6,7 +6,7 @@ export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger" | "cfg";
+  | "debugger" | "cfg" | "sigtools" | "yara";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -17,6 +17,8 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "strings", label: "Strings" },
   { id: "pe", label: "PE Browser" },
   { id: "signatures", label: "Signatures" },
+  { id: "sigtools", label: "Sig Tools" },
+  { id: "yara", label: "YARA" },
   { id: "pointers", label: "Pointers" },
   { id: "emulator", label: "Emulator" },
   { id: "graph", label: "Graph" },
