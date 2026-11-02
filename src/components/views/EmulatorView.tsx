@@ -19,9 +19,25 @@ type EmuResult = {
   mem?: MemBlob[];
   mem_log?: MemAccess[];
   mem_log_truncated?: boolean;
+  /** GPRs before each instruction (step_regs) */
+  steps?: Record<string, string>[];
+  steps_truncated?: boolean;
+  xmm?: Record<string, string>;
+  ymm?: Record<string, string>;
+  regions?: { address: string; end: string; perms: string }[];
+  regions_truncated?: boolean;
 };
 
 const kRegs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"];
+const kVec = Array.from({ length: 16 }, (_, i) => i);
+
+/** Little-endian 16-byte hex as four f32 lanes, low lane first. */
+function f32Lanes(hex: string): string {
+  if (hex.length < 32) return "";
+  const b = hexToBytes(hex.slice(0, 32));
+  const dv = new DataView(b.buffer);
+  return [0, 4, 8, 12].map((o) => Number(dv.getFloat32(o, true).toPrecision(6))).join(", ");
+}
 
 /** A scratch buffer the emulator writes into, so a routine can be fed input. */
 type Blob = { address: string; size: number; input: string; output: string };
@@ -36,6 +52,8 @@ export default function EmulatorView() {
   const [maxInsns, setMaxInsns] = useState(100000);
   const [trace, setTrace] = useState(true);
   const [memLog, setMemLog] = useState(true);
+  const [stepRegs, setStepRegs] = useState(false);
+  const [step, setStep] = useState(0);
   const [res, setRes] = useState<EmuResult | null>(null);
   const [busy, setBusy] = useState(false);
   // Oracle mode: a buffer that is written before the run and read back after it.
@@ -74,6 +92,7 @@ export default function EmulatorView() {
       max_insns: maxInsns,
       trace,
       mem_log: memLog,
+      ...(stepRegs ? { step_regs: true, step_regs_limit: 1000 } : {}),
       ...(cleanCode ? { code: cleanCode.toLowerCase() } : {}),
       ...(write.length ? { write } : {}),
       ...(read.length ? { read } : {}),
@@ -81,6 +100,7 @@ export default function EmulatorView() {
     setBusy(false);
     if (out) {
       setRes(out);
+      setStep(0);
       if (out.mem?.length) {
         setBlobs(out.mem.map((m) => ({ address: m.address, size: m.size, input: bufInput.replace(/[^0-9a-f]/gi, ""), output: m.data })));
       }
@@ -115,6 +135,7 @@ export default function EmulatorView() {
               <span>max insns</span><input className="input mono" style={{ width: 100 }} type="number" value={maxInsns} onChange={(e) => setMaxInsns(Number(e.target.value))} />
               <label className="row"><input type="checkbox" checked={trace} onChange={(e) => setTrace(e.target.checked)} />trace</label>
               <label className="row" title="Log every explicit memory read/write with its value"><input type="checkbox" checked={memLog} onChange={(e) => setMemLog(e.target.checked)} />memory</label>
+              <label className="row" title="Record all registers before each instruction (first 1000 steps)"><input type="checkbox" checked={stepRegs} onChange={(e) => setStepRegs(e.target.checked)} />steps</label>
               <span className="grow" />
               <button className="btn primary" disabled={busy} onClick={() => void run()}>{busy ? "Running…" : "Emulate"}</button>
             </div>
@@ -155,6 +176,57 @@ export default function EmulatorView() {
                 <div className={res.error === 0 ? "ok" : "warn"}>{res.error_name} · {res.instructions} instructions{res.error ? ` · fault ${res.fault_address}` : ""}</div>
               </div>
               <div className="kv">{kRegs.filter((r) => res.regs[r]).flatMap((r) => [<span key={r + "k"}>{r}</span>, <span key={r} className="link" onClick={() => ui.select(res.regs[r])}>{res.regs[r]}</span>])}</div>
+              {res.steps && res.steps.length > 0 && (() => {
+                const n = res.steps.length;
+                const i = Math.min(step, n - 1);
+                const cur = res.steps[i];
+                const prev = i > 0 ? res.steps[i - 1] : undefined;
+                return (
+                  <div className="panel-section">
+                    <div className="label">Steps ({n}{res.steps_truncated ? ", limit hit" : ""}) · registers before the instruction runs, changed ones highlighted</div>
+                    <div className="row">
+                      <button className="btn" disabled={i === 0} onClick={() => setStep(i - 1)}>‹</button>
+                      <input type="range" className="grow" min={0} max={n - 1} value={i} onChange={(e) => setStep(Number(e.target.value))} />
+                      <button className="btn" disabled={i === n - 1} onClick={() => setStep(i + 1)}>›</button>
+                      <span className="mono" style={{ minWidth: 70, textAlign: "right" }}>{i + 1}/{n}</span>
+                    </div>
+                    <div className="row mono">rip <span className="link" onClick={() => ui.goDisasm(cur.rip)}>{labelAddr(cur.rip, modules)}</span></div>
+                    <div className="kv">{kRegs.filter((r) => cur[r] && r !== "rip").flatMap((r) => [
+                      <span key={r + "k"}>{r}</span>,
+                      <span key={r} className={prev && prev[r] !== cur[r] ? "warn" : undefined} title={prev && prev[r] !== cur[r] ? `was ${prev[r]}` : undefined}>{cur[r]}</span>,
+                    ])}</div>
+                  </div>
+                );
+              })()}
+              {res.xmm && Object.keys(res.xmm).length > 0 && (
+                <table className="table mono">
+                  <colgroup><col style={{ width: 56 }} /><col /><col style={{ width: "38%" }} /></colgroup>
+                  <thead><tr><th>Vector</th><th>Hex (little-endian)</th><th>f32 lanes</th></tr></thead>
+                  <tbody>{kVec.filter((k) => res.xmm![`xmm${k}`]).map((k) => {
+                    const y = res.ymm?.[`ymm${k}`];
+                    return (
+                      <tr key={k}>
+                        <td>{y ? `ymm${k}` : `xmm${k}`}</td>
+                        <td title={y ?? res.xmm![`xmm${k}`]}>{y ?? res.xmm![`xmm${k}`]}</td>
+                        <td className="dim">{f32Lanes(res.xmm![`xmm${k}`])}</td>
+                      </tr>
+                    );
+                  })}</tbody>
+                </table>
+              )}
+              {res.regions && res.regions.length > 0 && (
+                <table className="table mono">
+                  <colgroup><col /><col /><col style={{ width: 48 }} /></colgroup>
+                  <thead><tr><th>Mapped regions ({res.regions.length}{res.regions_truncated ? ", truncated" : ""})</th><th>End</th><th /></tr></thead>
+                  <tbody>{res.regions.map((m) => (
+                    <tr key={m.address}>
+                      <td className="link" onClick={() => ui.select(m.address)}>{labelAddr(m.address, modules)}</td>
+                      <td>{m.end}</td>
+                      <td className={m.perms.includes("x") ? "warn" : "dim"}>{m.perms}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              )}
               {blobs.length > 0 && (
                 <div className="panel-section">
                   <div className="label">Oracle buffer</div>
