@@ -125,13 +125,19 @@ npm run dev                  # UI only in a browser (needs a relay: cargo run -p
 npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, sessions)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
+# agent tests: compiles echo_debug.as with the real AngelScript engine against mocks of Echo's API
+cmake -S tests/agent -B build/agent-tests && cmake --build build/agent-tests -j && ctest --test-dir build/agent-tests --output-on-failure
 ```
+
+The agent tests (`tests/agent/`) need CMake and a C++17 compiler; CMake fetches the pinned AngelScript SDK.
+`echo_mock.as` stands in for Echo's API (one fake target, scriptable Unicorn/Zydis, captured `ws::send`),
+and every function in `namespace tests` of `agent_tests.as` is a test.
 
 ### Releases are automatic
 
 Use [Conventional Commits](https://www.conventionalcommits.org/). Every push to `main`:
 
-1. runs CI (frontend, relay, AngelScript lint, Windows `cargo check`);
+1. runs CI (frontend, relay, AngelScript lint and tests, Windows `cargo check`);
 2. computes the next version from commits since the last tag (`feat` → minor, `fix`/`perf`/`refactor`/`revert` → patch,
    `!`/`BREAKING CHANGE` → major; minor while < 1.0). `docs`/`chore`/`ci`/`test` alone don't release;
 3. writes the version into `package.json`, `Cargo.toml`, `Cargo.lock` and the agent, then commits `chore(release): vX.Y.Z`
@@ -152,5 +158,6 @@ can no longer verify updates. Dependabot keeps npm, cargo and Actions dependenci
   [echo-angelscript-lsp](https://github.com/speedsunderscore/echo-angelscript-lsp) (used for the agent lint),
   [as_bundler](https://github.com/sinistercodes/as_bundler), [Signature-Doctor](https://github.com/b4rzY/Signature-Doctor),
   [Dumper-7](https://github.com/Encryqed/Dumper-7) and [echo-esp-preview](https://github.com/speedsunderscore/echo-esp-preview).
+- [AngelScript](https://www.angelcode.com/angelscript/) SDK (zlib license), built by the agent test host.
 
 Licensed under GPL-3.0.

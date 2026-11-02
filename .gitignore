@@ -7,3 +7,4 @@ src-tauri/gen/
 .vscode/*
 !.vscode/extensions.json
 tsconfig.tsbuildinfo
+build/
