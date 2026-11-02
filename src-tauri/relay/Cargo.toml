@@ -13,6 +13,8 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 iced-x86 = "1"
 object = { version = "0.36", features = ["read", "elf", "std"] }
 getrandom = "0.3"
+pdb = "0.8"
+ureq = "3"
 
 [dev-dependencies]
 tokio-tungstenite = "0.28"

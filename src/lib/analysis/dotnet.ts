@@ -543,7 +543,9 @@ export function parseDotnet(img: Uint8Array): DotnetInfo | null {
   }
 }
 
-function parseDotnetSafe(img: Uint8Array): DotnetInfo | null {
+type Opened = { meta: Meta; cli: CliHeader; root: MetaRoot; us: Uint8Array };
+
+function openMeta(img: Uint8Array): Opened | null {
   const pe = parsePe(img); // throws for non PE images
   const clr = pe.dirs.find((d) => d.name === "CLR");
   if (!clr || !clr.rva || !clr.size) return null;
@@ -563,6 +565,7 @@ function parseDotnetSafe(img: Uint8Array): DotnetInfo | null {
   if (!stringsStream) return null;
   const blobStream = root.streams["#Blob"];
   const guidStream = root.streams["#GUID"];
+  const usStream = root.streams["#US"];
 
   const tblBuf = sliceAt(dv, cli.metaRva + tblStream.off, tblStream.size);
   if (!tblBuf) return null;
@@ -576,5 +579,137 @@ function parseDotnetSafe(img: Uint8Array): DotnetInfo | null {
     guid: (guidStream && sliceAt(dv, cli.metaRva + guidStream.off, guidStream.size)) || empty,
     rows: decodedRows,
   };
-  return buildInfo(meta, cli, root);
+  const us = (usStream && sliceAt(dv, cli.metaRva + usStream.off, usStream.size)) || empty;
+  return { meta, cli, root, us };
+}
+
+function parseDotnetSafe(img: Uint8Array): DotnetInfo | null {
+  const o = openMeta(img);
+  return o ? buildInfo(o.meta, o.cli, o.root) : null;
+}
+
+/* ------------------------------------------------------------------ */
+/* token-level access (IL disassembler, user strings)                  */
+/* ------------------------------------------------------------------ */
+
+export type DotnetMethodRef = { token: number; rva: number; name: string; type: string };
+export type UserString = { index: number; token: number; text: string };
+
+export type DotnetMetadata = {
+  /** "Namespace.Type::Member", "string \"…\"" and so on for any metadata token */
+  tokenName(token: number): string;
+  /** the #US entry a 0x70xxxxxx token points at */
+  userString(token: number): string | null;
+  userStrings: UserString[];
+  methods: DotnetMethodRef[];
+  entryPointToken: number;
+};
+
+/** ECMA-335 II.23.2 compressed unsigned integer: [value, bytes used]. */
+export function compressedUInt(b: Uint8Array, at: number): [number, number] {
+  const x = b[at];
+  if (x === undefined) return [0, 1];
+  if ((x & 0x80) === 0) return [x, 1];
+  if ((x & 0xc0) === 0x80) return [((x & 0x3f) << 8) | (b[at + 1] ?? 0), 2];
+  return [(((x & 0x1f) << 24) | ((b[at + 1] ?? 0) << 16) | ((b[at + 2] ?? 0) << 8) | (b[at + 3] ?? 0)) >>> 0, 4];
+}
+
+function readUs(us: Uint8Array, idx: number): string | null {
+  if (idx <= 0 || idx >= us.length) return null;
+  const [len, n] = compressedUInt(us, idx);
+  const start = idx + n;
+  const chars = Math.floor(Math.max(0, len - 1) / 2); // trailing flag byte
+  if (start + chars * 2 > us.length) return null;
+  let s = "";
+  for (let i = 0; i < chars; i++) s += String.fromCharCode(us[start + i * 2] | (us[start + i * 2 + 1] << 8));
+  return s;
+}
+
+export function openMetadata(img: Uint8Array): DotnetMetadata | null {
+  let o: Opened | null;
+  try { o = openMeta(img); } catch { return null; }
+  if (!o) return null;
+  const { meta, us } = o;
+  const rows = meta.rows;
+  const str = (i: number) => readHeapString(meta.strings, i);
+  const typeDefs = rows.get(T.TypeDef) ?? [];
+  const typeRefs = rows.get(T.TypeRef) ?? [];
+  const methodRows = rows.get(T.MethodDef) ?? [];
+  const fieldRows = rows.get(T.Field) ?? [];
+  const memberRefs = rows.get(T.MemberRef) ?? [];
+  const nested = new Map<number, number>();
+  for (const r of rows.get(T.NestedClass) ?? []) if (r.NestedClass && r.EnclosingClass) nested.set(r.NestedClass, r.EnclosingClass);
+
+  const typeDefName = (row: number, depth = 0): string => {
+    const td = typeDefs[row - 1];
+    if (!td || depth > 16) return "?";
+    const enc = nested.get(row);
+    if (enc) return `${typeDefName(enc, depth + 1)}/${str(td.TypeName)}`;
+    const ns = str(td.TypeNamespace);
+    return ns ? `${ns}.${str(td.TypeName)}` : str(td.TypeName);
+  };
+  const typeRefName = (row: number): string => {
+    const tr = typeRefs[row - 1];
+    if (!tr) return "?";
+    const ns = str(tr.TypeNamespace);
+    return ns ? `${ns}.${str(tr.TypeName)}` : str(tr.TypeName);
+  };
+  // owner TypeDef of a method / field row: the last TypeDef whose list starts at or before it
+  const owner = (row: number, col: "MethodList" | "FieldList"): number => {
+    let best = 0;
+    for (let i = 0; i < typeDefs.length; i++) if (typeDefs[i][col] && typeDefs[i][col] <= row) best = i + 1;
+    return best;
+  };
+  const methodOwner = methodRows.map((_, i) => owner(i + 1, "MethodList"));
+  const fieldOwner = fieldRows.map((_, i) => owner(i + 1, "FieldList"));
+
+  const coded = (kind: string, v: number) => splitCoded(kind, v);
+  const typeName = (table: number, row: number): string =>
+    table === T.TypeDef ? typeDefName(row) : table === T.TypeRef ? typeRefName(row) : table === T.TypeSpec ? `typespec#${row}` : `table${table}#${row}`;
+
+  const userString = (token: number): string | null => ((token >>> 24) === 0x70 ? readUs(us, token & 0xffffff) : null);
+  const tokenName = (token: number): string => {
+    const table = token >>> 24;
+    const row = token & 0xffffff;
+    switch (table) {
+      case 0x70: {
+        const s = userString(token);
+        return s === null ? `string#${row.toString(16)}` : JSON.stringify(s);
+      }
+      case T.TypeDef: case T.TypeRef: case T.TypeSpec: return typeName(table, row);
+      case T.MethodDef: {
+        const m = methodRows[row - 1];
+        return m ? `${typeDefName(methodOwner[row - 1])}::${str(m.Name)}` : `method#${row}`;
+      }
+      case T.Field: {
+        const f = fieldRows[row - 1];
+        return f ? `${typeDefName(fieldOwner[row - 1])}::${str(f.Name)}` : `field#${row}`;
+      }
+      case T.MemberRef: {
+        const m = memberRefs[row - 1];
+        if (!m) return `memberref#${row}`;
+        const parent = coded("MemberRefParent", m.Class);
+        const p = parent ? (parent.table === T.MethodDef ? tokenName((T.MethodDef << 24) | parent.row) : typeName(parent.table, parent.row)) : "?";
+        return `${p}::${str(m.Name)}`;
+      }
+      case T.MethodSpec: {
+        const ms = (rows.get(T.MethodSpec) ?? [])[row - 1];
+        const target = ms ? coded("MethodDefOrRef", ms.Method) : null;
+        return target ? `${tokenName((target.table << 24) | target.row)}<…>` : `methodspec#${row}`;
+      }
+      case T.StandAloneSig: return `sig#${row}`;
+      case T.ModuleRef: return `moduleref#${row}`;
+      default: return `token 0x${token.toString(16).padStart(8, "0")}`;
+    }
+  };
+  const methods: DotnetMethodRef[] = methodRows.map((m, i) => ({ token: (T.MethodDef << 24) | (i + 1), rva: m.RVA, name: str(m.Name), type: typeDefName(methodOwner[i]) }));
+  const userStrings: UserString[] = [];
+  for (let i = 1; i < us.length;) {
+    const [len, n] = compressedUInt(us, i);
+    if (len === 0) { i += n; continue; }
+    const text = readUs(us, i);
+    if (text !== null) userStrings.push({ index: i, token: (0x70 << 24) | i, text });
+    i += n + len;
+  }
+  return { tokenName, userString, userStrings, methods, entryPointToken: o.cli.entryPointToken };
 }

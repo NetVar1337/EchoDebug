@@ -24,6 +24,7 @@ pub mod local;
 pub mod local_dbg;
 pub mod local_emu;
 pub mod local_ext;
+pub mod symbols;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -258,6 +259,19 @@ impl Relay {
                     .await
                     .unwrap_or_default();
                 return json!({ "type": "processes_result", "id": orig, "success": true, "processes": processes });
+            }
+            // PDB symbols from a symbol server (or a local file), any backend.
+            "pdb_symbols" => {
+                let r = tokio::task::spawn_blocking(move || symbols::handle(&req)).await;
+                let mut v = r.unwrap_or_else(|e| error(Value::Null, 3003, &e.to_string()));
+                v["id"] = orig;
+                return v;
+            }
+            // Disassemble caller-supplied bytes (module files on disk, old builds), any backend.
+            "disasm_bytes" => {
+                let mut v = disasm_bytes(&req);
+                v["id"] = orig;
+                return v;
             }
             // Local introspection verbs for the app's MCP panel.
             "mcp_log" => {
@@ -689,6 +703,27 @@ impl Relay {
         };
         Ok(json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }] }))
     }
+}
+
+fn disasm_bytes(req: &Map<String, Value>) -> Value {
+    let hex = req.get("data").and_then(Value::as_str).unwrap_or("");
+    let addr = req.get("address").and_then(Value::as_str).and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+    let bytes: Option<Vec<u8>> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
+    let Some(bytes) = bytes.filter(|b| !b.is_empty() && b.len() <= 1 << 20 && hex.len().is_multiple_of(2)) else {
+        return json!({ "type": "error", "code": 2000, "message": "disasm_bytes needs hex 'data' (up to 1 MiB)" });
+    };
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        match local::disasm_one(&bytes[off..], addr + off as u64) {
+            Some((len, text)) => {
+                out.push(json!({ "address": format!("0x{:x}", addr + off as u64), "length": len, "bytes": bytes[off..off + len].iter().map(|b| format!("{b:02x}")).collect::<String>(), "text": text }));
+                off += len;
+            }
+            None => break,
+        }
+    }
+    json!({ "type": "disasm_bytes_result", "success": true, "count": out.len(), "complete": off >= bytes.len(), "results": out })
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

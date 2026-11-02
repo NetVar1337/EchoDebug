@@ -152,3 +152,32 @@ export function parseRuntimeFunctions(img: Uint8Array, pe?: PeInfo): RuntimeFunc
   }
   return out.sort((a, b) => a.begin - b.begin);
 }
+
+/** Lays a PE *file* out like the loader does (headers + each section at its RVA), unrelocated. */
+export function mapPeFile(file: Uint8Array): Uint8Array {
+  const dv = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  if (file.length < 0x40 || dv.getUint16(0, true) !== 0x5a4d) throw new Error("no MZ header");
+  const nt = dv.getUint32(0x3c, true);
+  if (dv.getUint32(nt, true) !== 0x4550) throw new Error("no PE signature");
+  const fh = nt + 4;
+  const nsec = dv.getUint16(fh + 2, true);
+  const optSize = dv.getUint16(fh + 16, true);
+  const oh = fh + 20;
+  const sizeOfImage = dv.getUint32(oh + 56, true);
+  const sizeOfHeaders = dv.getUint32(oh + 60, true);
+  if (sizeOfImage > 1 << 30) throw new Error("SizeOfImage is implausibly large");
+  const img = new Uint8Array(sizeOfImage);
+  img.set(file.subarray(0, Math.min(sizeOfHeaders, file.length, sizeOfImage)));
+  const st = oh + optSize;
+  for (let i = 0; i < nsec; i++) {
+    const o = st + i * 40;
+    if (o + 40 > file.length) break;
+    const vsize = dv.getUint32(o + 8, true);
+    const rva = dv.getUint32(o + 12, true);
+    const rawSize = dv.getUint32(o + 16, true);
+    const rawPtr = dv.getUint32(o + 20, true);
+    const n = Math.min(rawSize, vsize || rawSize, file.length - rawPtr, sizeOfImage - rva);
+    if (n > 0 && rawPtr < file.length && rva < sizeOfImage) img.set(file.subarray(rawPtr, rawPtr + n), rva);
+  }
+  return img;
+}
