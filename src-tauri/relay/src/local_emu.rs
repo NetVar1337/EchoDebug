@@ -50,6 +50,7 @@ mod imp {
         insns: u64,
         stack: (u64, u64),
         rip: u64,
+        x: crate::emux::Extras,
     }
 
     fn error_name(e: uc_error) -> &'static str {
@@ -141,7 +142,16 @@ mod imp {
             insns: 0,
             stack: (stack_base, STACK_SIZE),
             rip: start,
+            x: crate::emux::Extras::default(),
         };
+        let mut data = data;
+        if let Err(e) = crate::emux::parse(req, &mut data.x) {
+            return json!({ "type": "error", "code": 3002, "message": "bad arguments", "detail": e });
+        }
+        if code.is_none() && req.get("stubs").and_then(Value::as_bool).unwrap_or(false) {
+            data.x.stubs = crate::emux::resolve_stubs(mem);
+        }
+        crate::local_more::CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut uc = match Unicorn::new_with_data(Arch::X86, Mode::MODE_64, data) {
             Ok(u) => u,
             Err(e) => return json!({ "type": "error", "code": 3003, "message": "emulation failed", "detail": e.to_string() }),
@@ -185,15 +195,46 @@ mod imp {
             }
         }
 
-        let _ = uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _size, _v| fault_in(uc, addr, false));
-        let _ = uc.add_code_hook(1, 0, |uc, addr, _size| {
-            let d = uc.get_data_mut();
-            d.insns += 1;
-            d.rip = addr;
-            if want_trace && d.trace.len() < d.trace_limit {
-                d.trace.push(addr);
+        if let Err(e) = crate::emux::set_xmm(&mut uc, req) {
+            return json!({ "type": "error", "code": 3002, "message": "bad arguments", "detail": e });
+        }
+        {
+            let mut x = std::mem::take(&mut uc.get_data_mut().x);
+            crate::emux::baseline(&uc, &mut x);
+            uc.get_data_mut().x = x;
+        }
+        let _ = uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _size, _v| {
+            if fault_in(uc, addr, false) {
+                return true;
             }
+            let rip = uc.get_data().rip;
+            let d = uc.get_data_mut();
+            crate::emux::on_fault(&mut d.x, addr, rip);
+            d.x.zero_unmapped && fault_in(uc, addr, true)
         });
+        let _ = uc.add_code_hook(1, 0, |uc, addr, _size| {
+            if crate::local_more::CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = uc.emu_stop();
+                return;
+            }
+            {
+                let d = uc.get_data_mut();
+                d.insns += 1;
+                d.rip = addr;
+                if want_trace && d.trace.len() < d.trace_limit {
+                    d.trace.push(addr);
+                }
+            }
+            let mut x = std::mem::take(&mut uc.get_data_mut().x);
+            crate::emux::code(uc, &mut x, addr);
+            uc.get_data_mut().x = x;
+        });
+        if uc.get_data().x.layers {
+            let _ = uc.add_mem_hook(HookType::MEM_WRITE, 1, 0, |uc, _ty, addr, size, _v| {
+                crate::emux::on_write(&mut uc.get_data_mut().x, addr, size);
+                true
+            });
+        }
         if want_log {
             let _ = uc.add_mem_hook(HookType::MEM_READ | HookType::MEM_WRITE, 1, 0, |uc, ty, addr, size, value| {
                 let (sb, ss) = uc.get_data().stack;
@@ -242,6 +283,7 @@ mod imp {
                 reads.push(json!({ "address": hex_addr(a), "size": n, "ok": ok, "data": if ok { hex_bytes(&b) } else { String::new() } }));
             }
         }
+        let xmm = crate::emux::xmm_json(&uc);
         let d = uc.get_data();
         let mut out = json!({
             "type": "emulate_result", "success": true,
@@ -253,6 +295,7 @@ mod imp {
             out["mem_log"] = json!(d.log);
             out["mem_log_truncated"] = json!(d.log_truncated);
         }
+        crate::emux::report(&mut out, &d.x, xmm);
         out
     }
 

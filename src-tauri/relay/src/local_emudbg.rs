@@ -55,6 +55,53 @@ mod imp {
         /// pages written by the session (shown as "dirty" so the UI can diff against the process)
         dirty: BTreeSet<u64>,
         trace: Vec<u64>,
+        x: crate::emux::Extras,
+        /// breakpoint address -> condition ("rax==0x10")
+        conds: std::collections::HashMap<u64, String>,
+        /// memory watchpoints: (address, size, 1 read | 2 write)
+        wps: Vec<(u64, u64, u8)>,
+        wp_hit: Option<Value>,
+    }
+
+    struct Snap {
+        regs: Vec<u64>,
+        xmm: Vec<Box<[u8]>>,
+        mem: Vec<(u64, Vec<u8>)>,
+        insns: u64,
+    }
+
+    /// "rax==0x10", "rcx!=0", "rdx<0x100", "r8&1"
+    fn cond_true(uc: &Unicorn<'_, Sess>, c: &str) -> bool {
+        for op in ["==", "!=", "<=", ">=", "<", ">", "&"] {
+            if let Some((l, r)) = c.split_once(op) {
+                let Some((_, reg)) = REGS.iter().find(|(n, _)| n.eq_ignore_ascii_case(l.trim())) else { return true };
+                let Some(v) = parse_u64(&json!(r.trim())) else { return true };
+                let cur = uc.reg_read(*reg).unwrap_or(0);
+                return match op {
+                    "==" => cur == v,
+                    "!=" => cur != v,
+                    "<=" => cur <= v,
+                    ">=" => cur >= v,
+                    "<" => cur < v,
+                    ">" => cur > v,
+                    _ => cur & v != 0,
+                };
+            }
+        }
+        true
+    }
+
+    fn watch_check(uc: &mut Unicorn<'_, Sess>, addr: u64, size: usize, write: bool) {
+        let rip = uc.get_data().last_rip;
+        let d = uc.get_data_mut();
+        if d.wps.is_empty() || d.wp_hit.is_some() {
+            return;
+        }
+        let want = if write { 2 } else { 1 };
+        if let Some((a, _, _)) = d.wps.iter().find(|(a, n, m)| m & want != 0 && addr < a + n && addr + size as u64 > *a) {
+            d.wp_hit = Some(json!({ "rip": hex_addr(rip), "address": hex_addr(addr), "size": size, "access": if write { "write" } else { "read" }, "watch": hex_addr(*a) }));
+            let _ = uc.emu_stop();
+        }
     }
 
     type Uc = Unicorn<'static, Sess>;
@@ -215,8 +262,16 @@ mod imp {
             let d = uc.get_data_mut();
             d.skip = Some(rip);
             d.hit = None;
+            d.wp_hit = None;
             d.trace.clear();
+            crate::emux::reset_run(&mut d.x);
         }
+        {
+            let mut x = std::mem::take(&mut uc.get_data_mut().x);
+            crate::emux::baseline(uc, &mut x);
+            uc.get_data_mut().x = x;
+        }
+        crate::local_more::CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
         let before = uc.get_data().insns;
         let res = uc.emu_start(rip, until, timeout_us, count);
         let now = uc.reg_read(RegisterX86::RIP).unwrap_or(0);
@@ -226,6 +281,9 @@ mod imp {
             Err(e) if now == RET_SENTINEL || (e == uc_error::FETCH_UNMAPPED && d.last_rip == RET_SENTINEL) => json!({ "reason": "returned" }),
             Err(e) => json!({ "reason": "fault", "error_name": error_name(e).to_lowercase(), "fault_rip": hex_addr(d.last_rip) }),
             Ok(()) if d.hit.is_some() => json!({ "reason": "breakpoint", "address": hex_addr(d.hit.unwrap_or(0)) }),
+            // the access has happened: rip is after the instruction that touched the range
+            Ok(()) if d.wp_hit.is_some() => json!({ "reason": "watchpoint", "hit": d.wp_hit }),
+            Ok(()) if crate::local_more::CANCEL.load(std::sync::atomic::Ordering::SeqCst) => json!({ "reason": "cancelled" }),
             Ok(()) if now == RET_SENTINEL => json!({ "reason": "returned" }),
             Ok(()) if until != 0 && now == until => json!({ "reason": "until", "address": hex_addr(until) }),
             Ok(()) if count != 0 && ran as usize >= count => json!({ "reason": if count == 1 { "step" } else { "count" } }),
@@ -260,7 +318,14 @@ mod imp {
         while maps.iter().any(|m| m.end > stack_base && m.start < stack_base + STACK_SIZE + TLS_SIZE) {
             stack_base -= 0x10_0000_0000;
         }
-        let sess = Sess { mem, bps: BTreeSet::new(), skip: None, hit: None, insns: 0, last_rip: start, stack: (stack_base, STACK_SIZE), dirty: BTreeSet::new(), trace: Vec::new() };
+        let mut x = crate::emux::Extras::default();
+        crate::emux::parse(req, &mut x)?;
+        if req.get("stubs").and_then(Value::as_bool).unwrap_or(false) {
+            if let Some(m) = &mem {
+                x.stubs = crate::emux::resolve_stubs(m);
+            }
+        }
+        let sess = Sess { mem, bps: BTreeSet::new(), skip: None, hit: None, insns: 0, last_rip: start, stack: (stack_base, STACK_SIZE), dirty: BTreeSet::new(), trace: Vec::new(), x, conds: Default::default(), wps: Vec::new(), wp_hit: None };
         let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, sess).map_err(|e| format!("{e:?}"))?;
         uc.mem_map(stack_base, STACK_SIZE, Prot::READ | Prot::WRITE).map_err(|e| format!("{e:?}"))?;
         // a zeroed TLS block for fs:/gs: (stack canaries, errno)
@@ -287,8 +352,25 @@ mod imp {
             let set: BTreeSet<u64> = b.iter().filter_map(parse_u64).collect();
             uc.get_data_mut().bps = set;
         }
-        uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _size, _v| fault_in(uc, addr, false)).map_err(|e| format!("{e:?}"))?;
+        crate::emux::set_xmm(&mut uc, req)?;
+        uc.add_mem_hook(HookType::MEM_UNMAPPED, 1, 0, |uc, _ty, addr, _size, _v| {
+            if fault_in(uc, addr, false) {
+                return true;
+            }
+            let rip = uc.get_data().last_rip;
+            let d = uc.get_data_mut();
+            crate::emux::on_fault(&mut d.x, addr, rip);
+            d.x.zero_unmapped && fault_in(uc, addr, true)
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        uc.add_mem_hook(HookType::MEM_READ, 1, 0, |uc, _ty, addr, size, _v| {
+            watch_check(uc, addr, size, false);
+            true
+        })
+        .map_err(|e| format!("{e:?}"))?;
         uc.add_mem_hook(HookType::MEM_WRITE, 1, 0, |uc, _ty, addr, size, _v| {
+            watch_check(uc, addr, size, true);
+            crate::emux::on_write(&mut uc.get_data_mut().x, addr, size);
             let (sb, ss) = uc.get_data().stack;
             if !(sb..sb + ss).contains(&addr) {
                 let d = uc.get_data_mut();
@@ -299,24 +381,47 @@ mod imp {
         })
         .map_err(|e| format!("{e:?}"))?;
         uc.add_code_hook(1, 0, |uc, addr, _size| {
-            let d = uc.get_data_mut();
-            if d.skip.take() != Some(addr) && d.bps.contains(&addr) {
-                d.hit = Some(addr);
-                d.last_rip = addr;
+            if crate::local_more::CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = uc.emu_stop();
                 return;
             }
-            d.insns += 1;
-            d.last_rip = addr;
-            if d.trace.len() < 10_000 {
-                d.trace.push(addr);
+            let skipped = uc.get_data_mut().skip.take() == Some(addr);
+            let at_bp = !skipped && uc.get_data().bps.contains(&addr);
+            if at_bp {
+                let cond = uc.get_data().conds.get(&addr).cloned().unwrap_or_default();
+                if cond.is_empty() || cond_true(uc, &cond) {
+                    let d = uc.get_data_mut();
+                    d.hit = Some(addr);
+                    d.last_rip = addr;
+                    let _ = uc.emu_stop();
+                    return;
+                }
             }
+            {
+                let d = uc.get_data_mut();
+                d.insns += 1;
+                d.last_rip = addr;
+                if d.trace.len() < 10_000 {
+                    d.trace.push(addr);
+                }
+            }
+            let mut x = std::mem::take(&mut uc.get_data_mut().x);
+            crate::emux::code(uc, &mut x, addr);
+            uc.get_data_mut().x = x;
         })
         .map_err(|e| format!("{e:?}"))?;
         Ok(uc)
     }
 
+    /// Adds the extras (register trace, API calls, layers, faults, xmm) to a step/run reply.
+    fn with_extras(uc: &mut Unicorn<'_, Sess>, mut v: Value) -> Value {
+        let xmm = crate::emux::xmm_json(uc);
+        crate::emux::report(&mut v, &uc.get_data().x, xmm);
+        v
+    }
+
     fn serve(mut uc: Uc, rx: mpsc::Receiver<Job>) {
+        let mut snaps: Vec<(String, Snap)> = Vec::new();
         while let Ok((req, reply)) = rx.recv() {
             let verb = req.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
             let timeout = req.get("timeout_us").and_then(Value::as_u64).unwrap_or(2_000_000).clamp(1000, 10_000_000);
@@ -325,13 +430,76 @@ mod imp {
                 "emu_step" => {
                     let n = req.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1_000_000) as usize;
                     let stop = run(&mut uc, n, 0, timeout, trace);
-                    state(&mut uc, stop)
+                    { let st = state(&mut uc, stop); with_extras(&mut uc, st) }
                 }
                 "emu_run" => {
                     let until = arg_addr(&req, "until").unwrap_or(0);
                     let max = req.get("max_insns").and_then(Value::as_u64).unwrap_or(1_000_000).clamp(1, 50_000_000) as usize;
                     let stop = run(&mut uc, max, until, timeout, trace);
-                    state(&mut uc, stop)
+                    { let st = state(&mut uc, stop); with_extras(&mut uc, st) }
+                }
+                "emu_watch" => {
+                    if req.get("clear").and_then(Value::as_bool) == Some(true) {
+                        uc.get_data_mut().wps.clear();
+                    }
+                    if let Some(a) = arg_addr(&req, "address") {
+                        let n = req.get("size").and_then(Value::as_u64).unwrap_or(8).max(1);
+                        let m = match req.get("access").and_then(Value::as_str).unwrap_or("rw") { "r" => 1, "w" => 2, _ => 3 };
+                        let on = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                        let wps = &mut uc.get_data_mut().wps;
+                        wps.retain(|w| w.0 != a);
+                        if on {
+                            wps.push((a, n, m));
+                        }
+                    }
+                    let list: Vec<Value> = uc.get_data().wps.iter().map(|(a, n, m)| json!({ "address": hex_addr(*a), "size": n, "access": match m { 1 => "r", 2 => "w", _ => "rw" } })).collect();
+                    json!({ "success": true, "watchpoints": list })
+                }
+                "emu_snapshot" => {
+                    let name = req.get("name").and_then(Value::as_str).unwrap_or("default").to_owned();
+                    let regs: Vec<u64> = REGS.iter().map(|(_, r)| uc.reg_read(*r).unwrap_or(0)).collect();
+                    let xmm: Vec<Box<[u8]>> = crate::emux::XMM.iter().map(|r| uc.reg_read_long(*r).unwrap_or_default()).collect();
+                    let mut mem = Vec::new();
+                    let mut bytes = 0u64;
+                    for r in uc.mem_regions().unwrap_or_default() {
+                        let n = r.end - r.begin + 1;
+                        bytes += n;
+                        if bytes > 128 << 20 {
+                            break;
+                        }
+                        if let Ok(b) = uc.mem_read_as_vec(r.begin, n as usize) {
+                            mem.push((r.begin, b));
+                        }
+                    }
+                    let insns = uc.get_data().insns;
+                    snaps.retain(|(n, _)| *n != name);
+                    if snaps.len() >= 8 {
+                        snaps.remove(0);
+                    }
+                    let regions = mem.len();
+                    snaps.push((name.clone(), Snap { regs, xmm, mem, insns }));
+                    json!({ "success": true, "name": name, "regions": regions, "bytes": bytes.min(128 << 20), "instructions": insns, "snapshots": snaps.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>() })
+                }
+                "emu_restore" => {
+                    let name = req.get("name").and_then(Value::as_str).unwrap_or("default");
+                    match snaps.iter().find(|(n, _)| n == name) {
+                        Some((_, sn)) => {
+                            for (a, b) in &sn.mem {
+                                let _ = uc.mem_write(*a, b);
+                            }
+                            for ((_, r), v) in REGS.iter().zip(&sn.regs) {
+                                let _ = uc.reg_write(*r, *v);
+                            }
+                            for (r, v) in crate::emux::XMM.iter().zip(&sn.xmm) {
+                                if v.len() >= 16 {
+                                    let _ = uc.reg_write_long(*r, v);
+                                }
+                            }
+                            uc.get_data_mut().insns = sn.insns;
+                            state(&mut uc, json!({ "reason": "restored" }))
+                        }
+                        None => failed(&format!("no snapshot named {name}")),
+                    }
                 }
                 "emu_break" => {
                     let mut err = None;
@@ -342,17 +510,24 @@ mod imp {
                         match parse_u64(a) {
                             Some(a) => {
                                 let on = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-                                let bps = &mut uc.get_data_mut().bps;
+                                let cond = req.get("condition").and_then(Value::as_str).unwrap_or("").to_owned();
+                                let d = uc.get_data_mut();
                                 if on {
-                                    bps.insert(a);
+                                    d.bps.insert(a);
+                                    if cond.is_empty() { d.conds.remove(&a); } else { d.conds.insert(a, cond); }
                                 } else {
-                                    bps.remove(&a);
+                                    d.bps.remove(&a);
+                                    d.conds.remove(&a);
                                 }
                             }
                             None => err = Some(bad("'address' must be a 0x address")),
                         }
                     }
-                    err.unwrap_or_else(|| state(&mut uc, json!({ "reason": "edit" })))
+                    err.unwrap_or_else(|| {
+                        let mut v = state(&mut uc, json!({ "reason": "edit" }));
+                        v["conditions"] = json!(uc.get_data().conds.iter().map(|(a, c)| (hex_addr(*a), json!(c))).collect::<Map<String, Value>>());
+                        v
+                    })
                 }
                 "emu_set" => {
                     let mut r = Ok(0);
@@ -438,8 +613,41 @@ mod imp {
             handle(&m)
         }
 
+        /// the session is process-global: tests take turns
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        #[test]
+        fn watchpoints_conditions_layers_snapshots() {
+            let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+            // mov rax,1 ; mov [0x500000],rax ; inc rax ; mov rcx,0x600000 ; mov byte [rcx],0xc3 ; call rcx ; ret
+            let code = "48c7c001000000 48890425000050 00 48ffc0 48c7c100006000 c601c3 ffd1 c3".replace(' ', "");
+            let r = call(json!({ "type": "emu_start", "start": "0x400000", "code": code, "trace_regs": true, "layers": true }));
+            assert_eq!(r["success"], true, "{r}");
+            let w = call(json!({ "type": "emu_watch", "address": "0x500000", "size": 8, "access": "w" }));
+            assert_eq!(w["watchpoints"][0]["access"], "w", "{w}");
+            let r = call(json!({ "type": "emu_run" }));
+            assert_eq!(r["stop"]["reason"], "watchpoint", "{r}");
+            assert_eq!(r["stop"]["hit"]["access"], "write");
+            assert!(r["reg_trace"].as_array().unwrap().iter().any(|e| e["changes"]["rax"] == "0x1"), "{r}");
+            let snap = call(json!({ "type": "emu_snapshot", "name": "s1" }));
+            assert_eq!(snap["name"], "s1", "{snap}");
+            // a conditional breakpoint that never holds, then one that does
+            call(json!({ "type": "emu_watch", "clear": true }));
+            call(json!({ "type": "emu_break", "address": "0x40000f", "condition": "rax==0x5" }));
+            let r = call(json!({ "type": "emu_run" }));
+            assert_eq!(r["stop"]["reason"], "returned", "the false condition does not stop: {r}");
+            assert_eq!(r["layers"][0]["entry"], "0x600000", "written then executed: {r}");
+            let back = call(json!({ "type": "emu_restore", "name": "s1" }));
+            assert_eq!(back["regs"]["rax"], "0x1", "{back}");
+            call(json!({ "type": "emu_break", "address": "0x40000f", "condition": "rax==0x1" }));
+            let r = call(json!({ "type": "emu_run" }));
+            assert_eq!((r["stop"]["reason"].as_str(), r["rip"].as_str()), (Some("breakpoint"), Some("0x40000f")), "{r}");
+            assert_eq!(call(json!({ "type": "emu_close" }))["closed"], true);
+        }
+
         #[test]
         fn step_break_edit_run() {
+            let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
             // 0x400000: mov eax, 1 ; add eax, ecx ; mov [0x500000], eax ; inc eax ; ret
             let code = "b80100000001c8890425000050".to_owned() + "00ffc0c3";
             let r = call(json!({ "type": "emu_start", "start": "0x400000", "code": code, "regs": { "rcx": "0x10" } }));

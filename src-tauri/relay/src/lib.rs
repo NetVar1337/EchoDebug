@@ -25,6 +25,8 @@ pub mod local_dbg;
 pub mod local_emu;
 pub mod local_emudbg;
 pub mod local_ext;
+pub mod local_more;
+pub mod emux;
 pub mod lift;
 pub mod mcp;
 pub mod monitor;

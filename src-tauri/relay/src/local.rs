@@ -262,6 +262,14 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
         return None;
     }
     let verb = req.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
+    let t0 = std::time::Instant::now();
+    let r = handle_ext_inner(relay, req, orig, &verb).await;
+    crate::local_more::stat(&verb, t0);
+    r
+}
+
+async fn handle_ext_inner(relay: &Relay, req: Map<String, Value>, orig: &Value, verb: &str) -> Option<Value> {
+    let verb = verb.to_owned();
     let reply = match verb.as_str() {
         "attach" => return Some(local_attach(relay, &req, orig)),
         "detach" => return Some(local_detach(relay, orig)),
@@ -272,6 +280,20 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
         }
         "reopen_socket" => {
             return Some(err(orig, 3003, "operation failed", "no Echo memory socket on the local Linux backend"));
+        }
+        "stats" | "cancel" | "journal" | "agent_config" | "ptr_compare" | "mem_snapshot_list" => {
+            let mut v = match verb.as_str() {
+                "stats" => crate::local_more::stats(),
+                "cancel" => crate::local_more::cancel(),
+                "journal" => crate::local_more::journal_verb(&req),
+                "ptr_compare" => crate::local_more::ptr_compare(&req),
+                "mem_snapshot_list" => crate::local_more::mem_snapshot_list(),
+                _ => err(orig, 3003, "operation failed", "agent_config configures the Windows Echo agent; the local backend has no agent"),
+            };
+            if let Value::Object(m) = &mut v {
+                m.insert("id".into(), orig.clone());
+            }
+            return Some(v);
         }
         // the emulated debugger: emu_start without 'code' needs an attached process (checked inside)
         v if v.starts_with("emu_") => {
@@ -328,15 +350,28 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
                 "dump" => ext_dump(&mem, &req),
                 "freeze" => crate::local_ext::freeze(relay, &mem, &req),
                 "freeze_list" => crate::local_ext::freeze_list(),
+                "freeze_group" => crate::local_ext::freeze_group(&req),
+                "hash_pages" => crate::local_more::hash_pages(&mem, &req),
+                "mem_snapshot" => crate::local_more::mem_snapshot(&mem, &req),
+                "mem_diff" => crate::local_more::mem_diff(&mem, &req),
+                "mem_snapshot_list" => crate::local_more::mem_snapshot_list(),
+                "ptr_save" => crate::local_more::ptr_save(&req),
+                "ptr_compare" => crate::local_more::ptr_compare(&req),
+                "find_instances" => crate::local_more::find_instances(&mem, &req),
+                "rtti_name" => crate::local_more::rtti_name(&mem, &req),
+                "xref_scan" => crate::local_more::xref_scan(&mem, &req),
                 "watch" => crate::local_ext::watch(relay, &mem, &req),
                 "unwatch" => crate::local_ext::unwatch(&req),
                 "watch_list" => crate::local_ext::watch_list(),
                 "pointer_scan" => {
                     let req2 = req.clone();
                     let relay2 = relay.clone();
-                    tokio::task::spawn_blocking(move || crate::local_ext::pointer_scan(&relay2, &mem, &req2))
+                    crate::local_more::CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let v = tokio::task::spawn_blocking(move || crate::local_ext::pointer_scan(&relay2, &mem, &req2))
                         .await
-                        .unwrap_or_else(|e| json!({ "type": "error", "code": 3003, "message": "pointer scan failed", "detail": e.to_string() }))
+                        .unwrap_or_else(|e| json!({ "type": "error", "code": 3003, "message": "pointer scan failed", "detail": e.to_string() }));
+                    crate::local_more::remember_pointer_scan(&v);
+                    v
                 }
                 "resolve_export" => crate::local_ext::resolve_export(&mem, &req),
                 // Linux stand-in for the PEB walk: the dynamic loader's r_debug/link_map chain.
@@ -855,8 +890,11 @@ fn ext_write(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let Some(bytes) = bytes.filter(|b| !b.is_empty() && b.len() <= 0x100000) else {
         return json!({ "type": "error", "code": 3002, "message": "bad arguments", "detail": "data must be non-empty hex, max 1 MiB" });
     };
+    let mut before = vec![0u8; bytes.len()];
+    let had = mem.read_at(addr, &mut before).map(|n| n == bytes.len()).unwrap_or(false);
     match mem.write_at(addr, &bytes) {
         Ok(()) => {
+            crate::local_more::journal("write", addr, if had { &before } else { &[] }, &bytes);
             let m = region_of(mem, addr);
             json!({ "type": "write_result", "success": true, "written": bytes.len(), "region": m })
         }
@@ -1175,6 +1213,9 @@ fn scan_range(mem: &impl MemIo, lo: u64, hi: u64, writable_only: bool) -> Vec<Ma
         .collect()
 }
 
+/// One worker's first-scan hits: addresses, numeric values, pattern bytes, hit the cap.
+type ShardHits = (Vec<u64>, Vec<u64>, Vec<u8>, bool);
+
 fn ext_scan_new(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let vt = req.get("value_type").and_then(Value::as_str).unwrap_or("");
     let op = req.get("compare").and_then(Value::as_str).unwrap_or("exact");
@@ -1212,56 +1253,72 @@ fn ext_scan_new(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
         truncated: false,
     };
     let is_pattern = !st.pattern.is_empty();
-    for m in scan_range(mem, lo, hi, writable_only) {
-        let mut pos = m.start;
-        while pos + width as u64 <= m.end {
-            let core = (m.end - pos).min(SCAN_CHUNK) as usize;
-            let want = (core + width - 1).min((m.end - pos) as usize);
-            let mut buf = vec![0u8; want];
-            if !mem.read_at(pos, &mut buf).map(|n| n == want).unwrap_or(false) {
-                pos += SCAN_CHUNK;
-                continue;
-            }
-            let limit = want - width + 1;
-            let first = (align - pos % align) % align;
-            let mut o = first as usize;
-            while o < limit {
-                let a = pos + o as u64;
-                let hit = if is_pattern {
-                    buf[o..o + width] == st.pattern[..]
-                } else {
-                    let mut bits = 0u64;
-                    for k in 0..width {
-                        bits |= (buf[o + k] as u64) << (8 * k);
-                    }
-                    test_num(&st.op, &st.vtype, width, bits, 0, st.t1, st.t2, st.f1, st.f2, eps)
-                        || st.op == "unknown"
-                };
-                if hit {
-                    st.addrs.push(a);
-                    if is_pattern {
-                        st.prev_raw.extend_from_slice(&buf[o..o + width]);
+    // regions split into contiguous shards scanned on worker threads, merged in address order
+    let regions = scan_range(mem, lo, hi, writable_only);
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let per = regions.len().div_ceil(workers).max(1);
+    let shard = |part: &[MapLine]| -> ShardHits {
+        let (mut addrs, mut bits_out, mut raw) = (Vec::new(), Vec::new(), Vec::new());
+        for m in part {
+            let mut pos = m.start;
+            while pos + width as u64 <= m.end {
+                let core = (m.end - pos).min(SCAN_CHUNK) as usize;
+                let want = (core + width - 1).min((m.end - pos) as usize);
+                let mut buf = vec![0u8; want];
+                if !mem.read_at(pos, &mut buf).map(|n| n == want).unwrap_or(false) {
+                    pos += SCAN_CHUNK;
+                    continue;
+                }
+                let limit = want - width + 1;
+                let first = (align - pos % align) % align;
+                let mut o = first as usize;
+                while o < limit {
+                    let hit = if is_pattern {
+                        buf[o..o + width] == st.pattern[..]
                     } else {
                         let mut bits = 0u64;
                         for k in 0..width {
                             bits |= (buf[o + k] as u64) << (8 * k);
                         }
-                        st.prev_bits.push(bits);
+                        test_num(&st.op, &st.vtype, width, bits, 0, st.t1, st.t2, st.f1, st.f2, eps) || st.op == "unknown"
+                    };
+                    if hit {
+                        addrs.push(pos + o as u64);
+                        if is_pattern {
+                            raw.extend_from_slice(&buf[o..o + width]);
+                        } else {
+                            let mut bits = 0u64;
+                            for k in 0..width {
+                                bits |= (buf[o + k] as u64) << (8 * k);
+                            }
+                            bits_out.push(bits);
+                        }
+                        if addrs.len() >= SCAN_CAP {
+                            return (addrs, bits_out, raw, true);
+                        }
                     }
-                    if st.addrs.len() >= SCAN_CAP {
-                        st.truncated = true;
-                        break;
-                    }
+                    o += align as usize;
                 }
-                o += align as usize;
+                pos += SCAN_CHUNK;
             }
-            if st.truncated {
-                break;
-            }
-            pos += SCAN_CHUNK;
         }
-        if st.truncated {
-            break;
+        (addrs, bits_out, raw, false)
+    };
+    let parts: Vec<ShardHits> = std::thread::scope(|sc| {
+        let handles: Vec<_> = regions.chunks(per).map(|part| sc.spawn(move || shard(part))).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
+    for (addrs, bits, raw, trunc) in parts {
+        let room = SCAN_CAP.saturating_sub(st.addrs.len());
+        if addrs.len() > room || trunc {
+            st.truncated = true;
+        }
+        let take = addrs.len().min(room);
+        st.addrs.extend_from_slice(&addrs[..take]);
+        if is_pattern {
+            st.prev_raw.extend_from_slice(&raw[..take * width]);
+        } else {
+            st.prev_bits.extend_from_slice(&bits[..take]);
         }
     }
     let count = st.addrs.len();

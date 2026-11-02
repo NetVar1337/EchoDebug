@@ -20,6 +20,9 @@ impl Drop for Child {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_backend_against_a_live_process() {
+    // journal and pointer maps go to a scratch config dir, not the user's
+    let cfg = std::env::temp_dir().join(format!("echodebug-test-{}", std::process::id()));
+    std::env::set_var("XDG_CONFIG_HOME", &cfg);
     let child = Child(std::process::Command::new("sh").args(["-c", "while :; do :; done"]).spawn().unwrap());
     let pid = child.0.id();
     let relay = Relay::new("1.2.3", Duration::from_secs(30)).with_local_backend(true);
@@ -87,6 +90,48 @@ async fn local_backend_against_a_live_process() {
     assert_eq!(tl["enabled"], true);
     call(json!({ "type": "module_monitor", "enabled": false })).await;
 
+    // hashing, snapshots and diffs in the backend
+    let hp = call(json!({ "type": "hash_pages", "ranges": [{ "address": a, "size": 0x2000 }] })).await;
+    assert_eq!(hp["ranges"][0]["hashes"].as_str().unwrap().len(), 32, "{hp}");
+    let ms = call(json!({ "type": "mem_snapshot", "name": "t", "address": a, "size": 0x1000 })).await;
+    assert_eq!(ms["success"], true, "{ms}");
+    call(json!({ "type": "write", "address": a, "data": "a1b2c3d4" })).await;
+    let md = call(json!({ "type": "mem_diff", "name": "t" })).await;
+    assert_eq!(md["ranges"][0]["address"], a, "{md}");
+    assert_eq!(md["ranges"][0]["new"], "a1b2c3d4");
+    call(json!({ "type": "write", "address": a, "data": orig4 })).await;
+    // a pointer we plant is found as an "instance" and as an absolute-pointer xref
+    let a8 = format!("0x{:x}", u64::from_str_radix(a.trim_start_matches("0x"), 16).unwrap() + 0x100);
+    let planted = list.iter().find(|m| m["name"].as_str().unwrap().starts_with("libc")).unwrap()["base"].as_str().unwrap().to_owned();
+    let le: String = u64::from_str_radix(planted.trim_start_matches("0x"), 16).unwrap().to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    call(json!({ "type": "write", "address": a8, "data": le })).await;
+    let fi = call(json!({ "type": "find_instances", "vtable": planted, "max": 50 })).await;
+    assert!(fi["instances"].as_array().unwrap().iter().any(|x| *x == json!(a8)), "{fi}");
+    let xr = call(json!({ "type": "xref_scan", "target": planted, "max": 200 })).await;
+    assert!(xr["results"].as_array().unwrap().iter().any(|x| x["address"] == json!(a8) && x["kind"] == "pointer"), "{xr}");
+    // typed watch with a condition, clamp freeze in a group
+    let wc = call(json!({ "type": "watch", "address": a, "value_type": "u32", "condition": "gt", "value": 5 })).await;
+    assert_eq!(wc["success"], true, "{wc}");
+    let fz = call(json!({ "type": "freeze", "address": a8, "mode": "clamp", "value_type": "u32", "min": 0, "max": 7, "group": "g" })).await;
+    assert_eq!(fz["success"], true, "{fz}");
+    let mut clamped = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        clamped = call(json!({ "type": "read", "address": a8, "size": 4 })).await["data"].as_str().unwrap().to_owned();
+        if clamped == "07000000" {
+            break;
+        }
+    }
+    assert_eq!(clamped, "07000000", "clamp freeze holds the value at max");
+    let fg = call(json!({ "type": "freeze_group", "group": "g", "enabled": false })).await;
+    assert_eq!(fg["entries"], 1, "{fg}");
+    call(json!({ "type": "freeze", "address": a8, "enabled": false })).await;
+    call(json!({ "type": "unwatch", "address": a })).await;
+    let st = call(json!({ "type": "stats" })).await;
+    assert!(st["verbs"].as_array().unwrap().iter().any(|v| v["verb"] == "mem_diff"), "{st}");
+    let jr = call(json!({ "type": "journal", "limit": 10 })).await;
+    assert!(jr["entries"].as_array().unwrap().iter().any(|e| e["kind"] == "write"), "{jr}");
+
     let w = call(json!({ "type": "watch", "address": a, "size": 4, "label": "t" })).await;
     assert_eq!(w["watched"], 1, "{w}");
     let f = call(json!({ "type": "freeze", "address": a, "data": "deadbeef", "enabled": true })).await;
@@ -138,6 +183,20 @@ async fn local_backend_against_a_live_process() {
     let dv = call(json!({ "type": "devirt", "start": ex["address"], "max_insns": 200 })).await;
     assert_eq!(dv["success"], true, "{dv}");
 
+    // libc stand-ins: injected code calls memcpy through its export (an IFUNC resolver in glibc)
+    let mc = call(json!({ "type": "resolve_export", "module": libc, "name": "memcpy" })).await;
+    let mc = u64::from_str_radix(mc["address"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    let scratch = 0x7fe0_0000_0000u64;
+    let imm = |v: u64| v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let code = format!("48bf{}48be{}48c7c20400000048b8{}ffd0c3", imm(scratch + 0x100), imm(scratch + 0x200), imm(mc));
+    let em = call(json!({ "type": "emulate", "start": format!("0x{scratch:x}"), "end": "0x1", "stubs": true, "trace_regs": true,
+        "write": [{ "address": format!("0x{scratch:x}"), "data": code }, { "address": format!("0x{:x}", scratch + 0x200), "data": "deadbeef" }],
+        "read": [{ "address": format!("0x{:x}", scratch + 0x100), "size": 4 }] })).await;
+    assert_eq!(em["api_calls"][0]["api"], "memcpy", "{em}");
+    assert_eq!(em["mem"][0]["data"], "deadbeef", "the stand-in copied: {em}");
+    assert!(em["reg_trace"].as_array().unwrap().len() >= 4, "{em}");
+    assert!(em["xmm"]["xmm0"].is_string());
+
     // emulated debugger over the same code: step twice, edit a register, break, close
     let es = call(json!({ "type": "emu_start", "start": ex["address"] })).await;
     assert_eq!(es["success"], true, "{es}");
@@ -156,6 +215,10 @@ async fn local_backend_against_a_live_process() {
     // pointer scan runs (results depend on the process)
     let ps = call(json!({ "type": "pointer_scan", "target": a, "max_depth": 1, "max_results": 10 })).await;
     assert_eq!(ps["type"], "pointer_scan_result", "{ps}");
+    let sv = call(json!({ "type": "ptr_save", "name": "run1" })).await;
+    assert_eq!(sv["success"], true, "{sv}");
+    let pc = call(json!({ "type": "ptr_compare", "names": ["run1", "@last"] })).await;
+    assert_eq!(pc["count"], ps["results"].as_array().unwrap().len(), "{pc}");
 
     // debugger round trip
     let d = call(json!({ "type": "dbg_attach" })).await;
