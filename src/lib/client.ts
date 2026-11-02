@@ -31,9 +31,21 @@ class Client {
   private timer: ReturnType<typeof setTimeout> | null = null;
   connected = false;
 
-  connect(port: number): void {
+  /** `token` is the relay's bearer token; browsers can't set WebSocket headers, so it goes in the query. */
+  connect(port: number, token = ""): void {
     this.url = `ws://127.0.0.1:${port}/client`;
+    this.setToken(token);
     this.open();
+  }
+
+  /** Used for the next (re)connect; the open socket stays authorized. */
+  setToken(token: string): void {
+    this.url = this.url.split("?")[0] + (token ? `?token=${encodeURIComponent(token)}` : "");
+  }
+
+  /** Fire-and-forget frame (replies to relay-initiated `ui_call`s). */
+  send(frame: Record<string, unknown>): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(frame));
   }
 
   private open(): void {

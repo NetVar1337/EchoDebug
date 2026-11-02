@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -38,6 +38,18 @@ const NATIVE_VERBS: &[&str] = &[
     "disassemble",
 ];
 
+/// Verbs served by the connected desktop UI (its name/comment/patch stores), not by Echo.
+const UI_VERBS: &[&str] = &[
+    "list_names",
+    "set_name",
+    "list_comments",
+    "set_comment",
+    "list_patches",
+    "revert_patch",
+    "list_signatures",
+];
+const UI_TIMEOUT: Duration = Duration::from_secs(10);
+
 static TOOLS: LazyLock<Vec<Value>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../../../src/lib/tools.json"))
         .expect("src/lib/tools.json is a JSON array")
@@ -56,8 +68,14 @@ static PROMPTS: LazyLock<Vec<Value>> = LazyLock::new(|| {
         "arguments": [{ "name": "target", "description": "0x-prefixed hex address to reach", "required": true }, { "name": "max_depth", "description": "Pointer depth 1-5, default 3" }] },
       { "name": "scan_value", "description": "Walk a Cheat-Engine-style value scan: first scan, then narrow with changed/increased/decreased until few candidates remain.",
         "arguments": [{ "name": "value_type", "description": "u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bytes string wstring", "required": true }, { "name": "value", "description": "Value to search for on the first scan", "required": true }] },
-      { "name": "triage_module", "description": "Read a module's PE headers, imports and sections from live memory and flag what deserves a second look.",
-        "arguments": [{ "name": "module", "description": "Module name", "required": true }] }
+      { "name": "triage_module", "description": "Read a module's PE headers, sections (with entropy) and imports from live memory, run anti-debug and crypto-constant scans, and flag what deserves a second look.",
+        "arguments": [{ "name": "module", "description": "Module name", "required": true }] },
+      { "name": "find_value_references", "description": "Locate a value in memory with the value scanner, then find what points at it: static pointer paths, absolute pointers and the code around them.",
+        "arguments": [{ "name": "value_type", "description": "u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bytes string wstring", "required": true }, { "name": "value", "description": "Current value to search for", "required": true }] },
+      { "name": "rebuild_class", "description": "Rebuild a C++ class sketch from a live object: RTTI name and bases, vtable slots, field offsets used by the virtual functions and typed reads of the object.",
+        "arguments": [{ "name": "address", "description": "0x-prefixed address of a live object (its first qword is the vtable)", "required": true }, { "name": "size", "description": "Bytes of the object to inspect, default 0x200" }] },
+      { "name": "update_signatures_after_patch", "description": "Re-scan the user's saved signatures after a game update, report which still match, moved or broke, and propose replacements for the broken ones.",
+        "arguments": [{ "name": "module", "description": "Module to scan; default each signature's own module" }] }
     ]"#).expect("prompts")
 });
 
@@ -96,6 +114,10 @@ struct Shared {
     agent: Option<Upstream>,
     ext: Option<Upstream>,
     pending: HashMap<u64, Pending>,
+    /// the `/client` socket that registered as the desktop UI (`ui_register`); last one wins
+    ui: Option<Upstream>,
+    /// relay -> UI calls awaiting a `ui_reply`, keyed by `call_id`, with the UI conn they went to
+    ui_pending: HashMap<u64, (u64, oneshot::Sender<Value>)>,
     ext_version: String,
     target: Value,
 }
@@ -118,6 +140,8 @@ struct Inner {
     mcp_log: Mutex<VecDeque<Value>>,
     /// serve verbs from /proc when no Echo upstream is connected (Linux default; tests turn it off)
     local_backend: AtomicBool,
+    /// bearer token required on `/mcp` and `/client`; `None` disables the check
+    token: Mutex<Option<String>>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -138,7 +162,35 @@ impl Relay {
             events: broadcast::channel(1024).0,
             mcp_log: Mutex::new(VecDeque::new()),
             local_backend: AtomicBool::new(local::available()),
+            token: Mutex::new(None),
         }))
+    }
+
+    /// Builder: require `token` on `/mcp` (`Authorization: Bearer`) and `/client` (header or `?token=`).
+    pub fn with_token(self, token: Option<String>) -> Self {
+        self.set_token(token);
+        self
+    }
+
+    /// Replaces the token at runtime (token regeneration). Open sockets stay connected.
+    pub fn set_token(&self, token: Option<String>) {
+        *self.0.token.lock().unwrap_or_else(|e| e.into_inner()) = token;
+    }
+
+    fn token_ok(&self, headers: &HeaderMap, query: Option<&str>) -> bool {
+        let guard = self.0.token.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(want) = guard.as_deref() else {
+            return true;
+        };
+        let bearer = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        [bearer, query].into_iter().flatten().any(|got| {
+            // constant-time compare: no early exit on the first differing byte
+            got.len() == want.len()
+                && got.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        })
     }
 
     /// Builder: enable/disable the local /proc backend (default: on for Linux, off elsewhere).
@@ -227,6 +279,7 @@ impl Relay {
                     "tools": TOOLS.len(),
                 });
             }
+            v if UI_VERBS.contains(&v) => return self.ui_call(&verb, req, orig).await,
             v if NATIVE_VERBS.contains(&v) => Kind::Agent,
             _ => Kind::Ext,
         };
@@ -279,6 +332,46 @@ impl Relay {
                     .unwrap_or_else(|_| error(orig, 2003, "timed out"))
             }
         }
+    }
+
+    /// Forwards a UI verb to the registered desktop UI as
+    /// `{ "type":"ui_call", "call_id", "verb", "args" }` and waits for its `ui_reply`.
+    async fn ui_call(&self, verb: &str, mut args: Map<String, Value>, orig: Value) -> Value {
+        args.remove("type");
+        args.remove("id");
+        let call_id = self.next_id();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut s = self.lock();
+            let Some(ui) = s.ui.as_ref() else {
+                return error(orig, 2005, "EchoDebug UI not connected: open the desktop app (or the browser dev UI) and retry");
+            };
+            let frame = json!({ "type": "ui_call", "call_id": call_id, "verb": verb, "args": args });
+            if ui.tx.send(frame.to_string()).is_err() {
+                return error(orig, 2005, "EchoDebug UI not connected");
+            }
+            let conn = ui.conn;
+            s.ui_pending.insert(call_id, (conn, tx));
+        }
+        let reply = match tokio::time::timeout(self.0.timeout.min(UI_TIMEOUT), rx).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => return error(orig, 2004, "UI disconnected"),
+            Err(_) => {
+                self.lock().ui_pending.remove(&call_id);
+                return error(orig, 2003, "timed out waiting for the UI");
+            }
+        };
+        if let Some(msg) = reply.get("error").and_then(Value::as_str) {
+            return error(orig, 2006, msg);
+        }
+        let mut out = match reply.get("result") {
+            Some(Value::Object(m)) => m.clone(),
+            _ => Map::new(),
+        };
+        out.insert("type".into(), format!("{verb}_result").into());
+        out.insert("id".into(), orig);
+        out.insert("success".into(), true.into());
+        Value::Object(out)
     }
 
     /// Sends a one-shot request to the ext agent; the reply (if any) is dropped. Used for
@@ -421,6 +514,7 @@ impl Relay {
     }
 
     async fn client(self, socket: WebSocket) {
+        let conn = self.next_id();
         let (mut sink, mut stream) = socket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let mut events = self.0.events.subscribe();
@@ -448,13 +542,34 @@ impl Relay {
                 Message::Close(_) => break,
                 _ => continue,
             };
-            let (relay, tx) = (self.clone(), tx.clone());
-            tokio::spawn(async move {
-                let req = serde_json::from_str(&text).unwrap_or(Value::Null);
-                let _ = tx.send(relay.request(req).await.to_string());
-            });
+            let req = serde_json::from_str(&text).unwrap_or(Value::Null);
+            match req["type"].as_str() {
+                // This socket is the desktop UI: route UI verbs (names, comments, patches) to it.
+                Some("ui_register") => {
+                    self.lock().ui = Some(Upstream { conn, tx: tx.clone() });
+                    let _ = tx.send(json!({ "type": "ui_register_result", "id": req["id"], "success": true }).to_string());
+                }
+                Some("ui_reply") => {
+                    let waiter = req["call_id"].as_u64().and_then(|id| self.lock().ui_pending.remove(&id));
+                    if let Some((_, reply)) = waiter {
+                        let _ = reply.send(req);
+                    }
+                }
+                _ => {
+                    let (relay, tx) = (self.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let _ = tx.send(relay.request(req).await.to_string());
+                    });
+                }
+            }
         }
         writer.abort();
+        let mut s = self.lock();
+        if s.ui.as_ref().is_some_and(|u| u.conn == conn) {
+            s.ui = None;
+        }
+        // dropping the senders fails this UI's in-flight calls with "UI disconnected"
+        s.ui_pending.retain(|_, (c, _)| *c != conn);
     }
 
     /// Handles one JSON-RPC message; `None` for notifications and client responses.
@@ -590,10 +705,13 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 /// Renders a prompt's `messages` with the caller's arguments substituted.
 fn prompt_messages(prompt: &Value, args: &Value) -> Value {
-    let text = |name: &str, tmpl: &str| -> Value {
+    // Substitutes every declared argument; ones the caller left out read "(not given)".
+    let text = |_: &str, tmpl: &str| -> Value {
         let mut t = tmpl.to_owned();
-        if let Some(a) = args.get(name).and_then(|v| v.as_str()) {
-            t = t.replace(&format!("{{{{{name}}}}}"), a);
+        for a in prompt["arguments"].as_array().into_iter().flatten() {
+            let name = a["name"].as_str().unwrap_or_default();
+            let value = args.get(name).and_then(Value::as_str).unwrap_or("(not given)");
+            t = t.replace(&format!("{{{{{name}}}}}"), value);
         }
         json!({ "role": "user", "content": { "type": "text", "text": t } })
     };
@@ -609,8 +727,15 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
             "Find static pointer chains that reach {{target}}: run a pointer scan with max_depth {{max_depth}} (default 3), take the first module-rooted result, verify it with the chain resolver, and report module+offset and the offsets array.")],
         "scan_value" => vec![text("value",
             "Run a value scan of type {{value_type}} for {{value}}: first scan with compare 'exact' (or 'unknown' if the value is not known yet), then narrow with changed/increased/decreased/unchanged scans until under 50 candidates remain. Report the surviving addresses and their current values.")],
+        // Tool names are in backticks; a unit test checks each one exists in tools.json.
         "triage_module" => vec![text("module",
-            "Triage the module {{module}}: read its PE headers (sections, imports with IAT addresses, exports), compute per-section entropy from live memory, list suspicious imports (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread,NtProtectVirtualMemory, IsDebuggerPresent, …) with their call sites, and check for INT 2D / VMCALL / PEB-read anti-debug patterns. Summarize the findings.")],
+            "Triage the module {{module}}. 1) `list_modules` for its base and size. 2) `read_memory` 0x1000 bytes at the base and parse the DOS/NT headers, section table and data directories; follow the import and export directories with more `read_memory` calls. 3) For each section, `read_memory` its bytes (in chunks up to 1 MiB) and compute Shannon entropy; flag sections above 7.2 (packed/encrypted) and writable+executable sections (`query_region` on each). 4) Suspicious imports (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread, NtProtectVirtualMemory, IsDebuggerPresent, CheckRemoteDebuggerPresent, NtQueryInformationProcess): find their IAT slots, then call sites with `signature_scan` for 'FF 15 ?? ?? ?? ??' and `resolve_relative` (offset 2, inst_size 6) to see which hits target those slots. 5) Anti-debug: `signature_scan` with find_all for 'CD 2D' (INT 2D), '0F 01 C1' (VMCALL), '65 48 8B 04 25 60 00 00 00' (PEB via gs:[60]), '0F 31' (RDTSC); `string_scan` for debugger names (x64dbg, ollydbg, ida, cheat engine). 6) Crypto: `signature_scan` for '63 7C 77 7B F2 6B 6F C5' (AES S-box), '98 2F 8A 42 91 44 37 71' (SHA-256 K), '67 E6 09 6A 85 AE 67 BB' (SHA-256 H), '78 A4 6A D7 56 B7 C7 E8' (MD5 T), '96 30 07 77 2C 61 0E EE' (CRC-32 table), and `string_scan` for 'expand 32-byte k' (ChaCha/Salsa). `disassemble` around interesting hits. Summarize per category with module+0xRVA addresses and label the key sites with `set_name`.")],
+        "find_value_references" => vec![text("value",
+            "Find what references the {{value_type}} value {{value}}. 1) `value_scan_first` with compare 'exact'; while more than ~20 candidates remain, ask the user to change the value in the target and narrow with `value_scan_next` (exact/changed/increased/decreased), reading the survivors with `value_scan_results`. 2) For each surviving address: `query_region` to see where it lives, then `pointer_scan` with it as target and verify the best module-rooted results with `pointer_chain`. 3) Find absolute pointers to it: `signature_scan` with find_all for its 8 little-endian address bytes, and for each hit `disassemble` 64 bytes before it if it lies in code. 4) Report the stable pointer paths as module+offset plus offsets, the code sites that touch the value, and name the confirmed address with `set_name` (check `list_names` first so existing user names are reused). Call `value_scan_clear` when done.")],
+        "rebuild_class" => vec![text("address",
+            "Rebuild the C++ class of the object at {{address}} (inspect {{size}} bytes; default 0x200). 1) `rtti_resolve` on {{address}} for the class name, base classes and vtable; if it fails, `read_memory` 8 bytes for the vtable pointer. 2) `read_memory` the vtable (8 bytes per slot) until a slot leaves the module's executable range (`query_region`); `list_names` to reuse names the user gave those functions. 3) `disassemble` 0x100 bytes of each virtual function and collect the [rcx+offset] accesses with their operand sizes and the call targets (`enumerate_functions` for function bounds). 4) `read_memory` the object and decode candidate fields with `read_typed` (pointers, floats, ints, strings); `rtti_resolve_batch` the qwords that look like pointers to identify member objects. 5) Output a C++ class sketch: inheritance from RTTI, a commented vtable listing slot index, address and inferred purpose, and fields with offset comments, type and a guessed name. Offer to store the names with `set_name` and notes with `set_comment`.")],
+        "update_signatures_after_patch" => vec![text("module",
+            "Update the user's saved signatures after a patch (module override: {{module}}). 1) `list_signatures` for the catalog (name, module, IDA pattern, original address, previous hit count). 2) `list_modules` to get each module's new base. 3) For each signature, `signature_scan` its IDA pattern with find_all in its module. Classify: OK (exactly one hit, same RVA), MOVED (one hit at a new RVA; give old and new RVA), AMBIGUOUS (several hits), BROKEN (no hit). 4) For each BROKEN or AMBIGUOUS one: `disassemble` around its old address and around candidates found by scanning a shorter prefix of the pattern, decide where the function went, then build a new signature like the sigmaker does: take the instruction bytes from `read_memory`, wildcard rel32/disp32 operands and immediates that look like addresses, and grow it one instruction at a time until `signature_scan` reports exactly one hit. 5) Report a table: name, status, old RVA, new RVA, old pattern, proposed pattern. Do not modify the catalog yourself; the user re-saves the proposals from the Signatures view.")],
         _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],
     };
     json!({ "description": prompt["description"], "messages": msgs })
@@ -679,16 +804,23 @@ async fn health(State(relay): State<Relay>) -> Json<Value> {
 async fn client_ws(
     State(relay): State<Relay>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !origin_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // Browsers cannot set headers on a WebSocket, so the UI passes the token as `?token=`.
+    if !relay.token_ok(&headers, query.get("token").map(String::as_str)) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     ws.on_upgrade(move |s| relay.client(s))
 }
 
 fn upstream_ws(relay: Relay, kind: Kind, headers: &HeaderMap, ws: WebSocketUpgrade) -> Response {
-    // Echo connects without an Origin; anything with one is a browser page.
+    // Echo connects without an Origin; anything with one is a browser page. No token here: Echo's
+    // `process::open_socket(url)` and the agent's `ws::connect` dial a fixed URL baked into the agent
+    // script, and upstreams only answer requests the relay sends them (they cannot drive tools).
     if headers.contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -710,6 +842,9 @@ async fn ext_ws(State(relay): State<Relay>, headers: HeaderMap, ws: WebSocketUpg
 async fn mcp(State(relay): State<Relay>, headers: HeaderMap, body: Bytes) -> Response {
     if !origin_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !relay.token_ok(&headers, None) {
+        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")]).into_response();
     }
     let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
         return Json(rpc_error(Value::Null, -32700, "parse error".into())).into_response();
@@ -758,13 +893,41 @@ pub async fn run(listener: TcpListener, relay: Relay) -> std::io::Result<()> {
     axum::serve(tokio::net::TcpListener::from_std(listener)?, router(relay)).await
 }
 
-pub async fn serve(port: u16, app_version: String) -> std::io::Result<()> {
-    run(bind(port)?, Relay::new(app_version, DEFAULT_TIMEOUT)).await
+pub async fn serve(port: u16, app_version: String, token: Option<String>) -> std::io::Result<()> {
+    run(bind(port)?, Relay::new(app_version, DEFAULT_TIMEOUT).with_token(token)).await
+}
+
+/// A fresh random bearer token: 32 bytes from the OS RNG as 64 lowercase hex chars.
+pub fn generate_token() -> String {
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).expect("OS random number generator");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompts_reference_only_known_tools() {
+        for p in PROMPTS.iter() {
+            let msgs = prompt_messages(p, &json!({}));
+            let text = msgs["messages"][0]["content"]["text"].as_str().unwrap();
+            assert!(!text.contains("{{"), "{text}");
+            // backticked words are tool names: odd-indexed pieces of a split on '`'
+            for name in text.split('`').skip(1).step_by(2) {
+                assert!(TOOLS.iter().any(|t| t["name"] == name), "prompt {} names unknown tool `{name}`", p["name"]);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_tokens_are_random_hex() {
+        let (a, b) = (generate_token(), generate_token());
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn origins() {

@@ -4,7 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, Play, RefreshCw } from "lucide-react";
 import tools from "@/lib/tools.json";
 import { request } from "@/lib/client";
-import { useConn } from "@/store/conn";
+import { isTauri } from "@/lib/tauri";
+import { mcpAddCommand, useConn } from "@/store/conn";
 import { attempt } from "@/store/output";
 import { CopyChip, IconButton, Panel, useCopy } from "../ui";
 
@@ -28,7 +29,7 @@ export default function McpPanel() {
   const [running, setRunning] = useState(false);
 
   const endpoint = `http://127.0.0.1:${c.port}/mcp`;
-  const addCmd = `claude mcp add --transport http echodebug ${endpoint}`;
+  const addCmd = mcpAddCommand(c.port, c.token);
 
   const loadMeta = async () => {
     const m = await attempt("mcp_meta", request<Meta>("mcp_meta"));
@@ -87,6 +88,12 @@ export default function McpPanel() {
         <CopyChip text={endpoint} copied={copied} onCopy={copy} />
         <div className="label" style={{ marginTop: 6 }}>Connect a client (Claude Code)</div>
         <CopyChip text={addCmd} copied={copied} onCopy={copy} />
+        <div className="row" style={{ marginTop: 4 }}>
+          <span className="faint grow" style={{ fontSize: 12 }}>
+            {c.token ? "Requests without this bearer token get 401." : "No token: start the browser UI with ?token= from the relay's output."}
+          </span>
+          {isTauri() && <button className="btn" onClick={() => void attempt("token", c.regenerateToken())}>Regenerate token</button>}
+        </div>
         <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
           Any MCP client works — the relay speaks Streamable HTTP JSON-RPC 2.0 on <span className="mono">POST /mcp</span> (batch supported).
           Capabilities: tools ({meta?.tools ?? kTools.length}), prompts, resources.

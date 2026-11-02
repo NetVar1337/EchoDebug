@@ -14,16 +14,21 @@ use tower::ServiceExt;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+const TOKEN: &str = "test-token";
+
 async fn start() -> (SocketAddr, Relay) {
-    let relay = Relay::new("1.2.3", Duration::from_secs(5)).with_local_backend(false);
+    let relay = Relay::new("1.2.3", Duration::from_secs(5))
+        .with_local_backend(false)
+        .with_token(Some(TOKEN.into()));
     let listener = bind(0).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(run(listener, relay.clone()));
     (addr, relay)
 }
 
+/// `/client` needs the token (as `?token=`, like the browser UI); upstream routes ignore it.
 async fn connect(addr: SocketAddr, path: &str) -> Ws {
-    connect_async(format!("ws://{addr}{path}")).await.unwrap().0
+    connect_async(format!("ws://{addr}{path}?token={TOKEN}")).await.unwrap().0
 }
 
 async fn send(ws: &mut Ws, v: Value) {
@@ -203,7 +208,7 @@ async fn ext_events_broadcast_and_status_tracks_hello_and_attach() {
 async fn origin_checks() {
     let (addr, _) = start().await;
     let reject = |path: &str, origin: &str| {
-        let mut req = format!("ws://{addr}{path}").into_client_request().unwrap();
+        let mut req = format!("ws://{addr}{path}?token={TOKEN}").into_client_request().unwrap();
         req.headers_mut().insert("origin", origin.parse().unwrap());
         async move {
             match connect_async(req).await {
@@ -232,7 +237,14 @@ async fn origin_checks() {
 }
 
 async fn mcp(relay: &Relay, body: Value, origin: Option<&str>) -> (StatusCode, Value) {
+    mcp_auth(relay, body, origin, Some(&format!("Bearer {TOKEN}"))).await
+}
+
+async fn mcp_auth(relay: &Relay, body: Value, origin: Option<&str>, auth: Option<&str>) -> (StatusCode, Value) {
     let mut req = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
+    if let Some(a) = auth {
+        req = req.header(header::AUTHORIZATION, a);
+    }
     if let Some(o) = origin {
         req = req.header(header::ORIGIN, o);
     }
@@ -530,4 +542,131 @@ async fn local_backend_serves_verbs_without_upstream() {
     let r = recv_until(&mut client, |v| v["type"] == "status_result").await;
     assert_eq!(r["backend"], "local");
     assert_eq!(r["local"], true);
+}
+
+#[tokio::test]
+async fn token_required_on_mcp_and_client() {
+    let (addr, relay) = start().await;
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+
+    let (s, _) = mcp_auth(&relay, ping.clone(), None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "no token");
+    let (s, _) = mcp_auth(&relay, ping.clone(), None, Some("Bearer wrong-token")).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong token");
+    let (s, _) = mcp_auth(&relay, ping.clone(), None, Some(TOKEN)).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "missing Bearer scheme");
+    let (s, r) = mcp_auth(&relay, ping.clone(), None, Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!((s, &r["result"]), (StatusCode::OK, &json!({})), "right token");
+    // Origin check still applies with a valid token.
+    let (s, _) = mcp(&relay, ping.clone(), Some("https://evil.example")).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    let status = |url: String, auth: Option<&'static str>| async move {
+        let mut req = url.into_client_request().unwrap();
+        if let Some(a) = auth {
+            req.headers_mut().insert("authorization", a.parse().unwrap());
+        }
+        match connect_async(req).await {
+            Err(WsError::Http(resp)) => resp.status(),
+            Ok(_) => StatusCode::SWITCHING_PROTOCOLS,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(status(format!("ws://{addr}/client"), None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status(format!("ws://{addr}/client?token=nope"), None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status(format!("ws://{addr}/client?token={TOKEN}"), None).await, StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(status(format!("ws://{addr}/client"), Some("Bearer test-token")).await, StatusCode::SWITCHING_PROTOCOLS);
+    // Echo's upstream routes stay token-free (the agent script dials a fixed URL).
+    assert_eq!(status(format!("ws://{addr}/agent"), None).await, StatusCode::SWITCHING_PROTOCOLS);
+
+    // Regeneration takes effect immediately.
+    relay.set_token(Some("rotated".into()));
+    let (s, _) = mcp(&relay, ping.clone(), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "old token rejected after rotation");
+    let (s, _) = mcp_auth(&relay, ping, None, Some("Bearer rotated")).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+fn tool_call(id: u64, name: &str, args: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } })
+}
+
+fn tool_text(r: &Value) -> String {
+    r["result"]["content"][0]["text"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn ui_tools_forward_to_registered_ui() {
+    let (addr, relay) = start().await;
+
+    // No UI registered: clear error, not a hang.
+    let (_, r) = mcp(&relay, tool_call(1, "list_names", json!({})), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(tool_text(&r).contains("2005") && tool_text(&r).contains("UI not connected"), "{r}");
+
+    // A plain /client (script) does not receive UI calls; the registered one does.
+    let mut ui = connect(addr, "/client").await;
+    send(&mut ui, json!({ "type": "ui_register", "id": 1 })).await;
+    let reg = recv_until(&mut ui, |v| v["type"] == "ui_register_result").await;
+    assert_eq!((reg["id"].as_u64(), reg["success"].as_bool()), (Some(1), Some(true)));
+
+    let fake_ui = tokio::spawn(async move {
+        let call = recv_until(&mut ui, |v| v["type"] == "ui_call").await;
+        assert_eq!(call["verb"], "set_name");
+        assert_eq!(call["args"], json!({ "address": "0x140001000", "name": "main" }));
+        assert!(call["call_id"].is_u64());
+        send(&mut ui, json!({ "type": "ui_reply", "call_id": call["call_id"], "result": { "address": "0x140001000", "name": "main" } })).await;
+
+        let call = recv_until(&mut ui, |v| v["type"] == "ui_call").await;
+        assert_eq!(call["verb"], "revert_patch");
+        send(&mut ui, json!({ "type": "ui_reply", "call_id": call["call_id"], "error": "no patch with id zz" })).await;
+        ui
+    });
+    let (_, r) = mcp(&relay, tool_call(2, "set_name", json!({ "address": "0x140001000", "name": "main" })), None).await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let body: Value = serde_json::from_str(&tool_text(&r)).unwrap();
+    assert_eq!(body, json!({ "success": true, "address": "0x140001000", "name": "main" }));
+
+    let (_, r) = mcp(&relay, tool_call(3, "revert_patch", json!({ "patch_id": "zz" })), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(tool_text(&r).contains("no patch with id zz"), "{r}");
+
+    // The UI goes away: calls fail fast again.
+    let ui = fake_ui.await.unwrap();
+    drop(ui);
+    let mut gone = false;
+    for _ in 0..50 {
+        let (_, r) = mcp(&relay, tool_call(4, "list_patches", json!({})), None).await;
+        if tool_text(&r).contains("2005") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "UI unregistered on disconnect");
+}
+
+#[tokio::test]
+async fn ui_call_times_out_and_fails_on_disconnect() {
+    let relay = Relay::new("1.2.3", Duration::from_millis(300)).with_local_backend(false);
+    let listener = bind(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(listener, relay.clone()));
+    let mut ui = connect(addr, "/client").await;
+    send(&mut ui, json!({ "type": "ui_register", "id": 1 })).await;
+    recv_until(&mut ui, |v| v["type"] == "ui_register_result").await;
+
+    // UI never answers → 2003.
+    let (_, r) = mcp(&relay, tool_call(1, "list_comments", json!({})), None).await;
+    assert!(tool_text(&r).contains("2003"), "{r}");
+
+    // UI drops while a call is in flight → 2004.
+    let call = tokio::spawn({
+        let relay = relay.clone();
+        async move { mcp(&relay, tool_call(2, "list_names", json!({})), None).await }
+    });
+    recv_until(&mut ui, |v| v["type"] == "ui_call" && v["verb"] == "list_names").await;
+    drop(ui);
+    let (_, r) = call.await.unwrap();
+    assert!(tool_text(&r).contains("2004"), "{r}");
 }

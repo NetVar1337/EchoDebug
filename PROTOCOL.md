@@ -21,9 +21,24 @@ are lowercase hex strings without a prefix (`"4883ec28"`). Sizes and counts are 
 |---|---|---|
 | `/agent` | Echo's native memory server (`process::open_socket(url)`) | Relay is the *requester*: it sends Echo native requests and receives `*_result` / `error` frames. One connection at a time; a new one replaces the old. |
 | `/ext` | `echo_debug.as` via `ws::connect` | Relay sends ext requests and receives replies + id-less events. One at a time; a new one replaces the old. |
-| `/client` | UI, scripts, anything | Sends requests `{ "type", "id", ... }`, receives replies with the same `id`, plus broadcast events. Many clients. |
-| `POST /mcp` | MCP clients | Streamable HTTP, JSON responses only (no SSE). Tools are defined in `src/lib/tools.json`. |
+| `/client` | UI, scripts, anything | Sends requests `{ "type", "id", ... }`, receives replies with the same `id`, plus broadcast events. Many clients. Needs the token (see below) as `?token=<token>` or `Authorization: Bearer <token>`. |
+| `POST /mcp` | MCP clients | Streamable HTTP, JSON responses only (no SSE). Tools are defined in `src/lib/tools.json`. Needs `Authorization: Bearer <token>`. |
 | `GET /health` | anyone | `200 {"ok":true,"version":"x.y.z"}` |
+
+## Authentication
+
+The relay requires a per-install bearer token on `/mcp` and `/client`; requests without it (or with
+a wrong one) get `401`. The desktop app generates 32 random bytes (64 hex chars) on first start, stores
+them in `<app config dir>/mcp_token` (mode 0600 on Unix), passes the token to the relay and hands it to
+its own UI via the `relay_info` command, so the UI needs no user action. Settings and the MCP panel
+show the `claude mcp add ... --header "Authorization: Bearer <token>"` command and can regenerate the
+token (takes effect immediately for new requests; already-open sockets stay connected). The headless
+`echodebug-relay` takes `ECHODEBUG_TOKEN` or generates a token and prints it with the connect command;
+the browser dev UI reads it from `?token=` (next to `?port=`). The Origin checks still apply on top.
+
+`/agent` and `/ext` take no token: Echo's `process::open_socket(url)` and the agent's `ws::connect`
+dial a URL baked into `agent/echo_debug.as`, and upstreams only answer requests the relay sends them;
+they cannot call tools. They reject any request carrying an `Origin`, so browser pages cannot reach them.
 
 ## Routing
 
@@ -38,7 +53,9 @@ A `/client` request is routed by its `type`:
    - `processes` → `{ "type":"processes_result", "id", "success":true,
      "processes":[{ "pid":1234, "name":"game.exe", "path":"C:\\...\\game.exe", "memory":123456 }] }`
      (local process list of the machine running the app, sorted by name)
-3. **Everything else** → `/ext`.
+3. **UI verbs** → the desktop UI (see "UI round trip"): `list_names`, `set_name`, `list_comments`,
+   `set_comment`, `list_patches`, `revert_patch`, `list_signatures`.
+4. **Everything else** → `/ext`.
 
 Two more local verbs feed the app's MCP panel: `mcp_log` → `{ "type":"mcp_log_result", ..., "entries":[...] }`
 (ring buffer of the last 200 `tools/call` requests the relay saw) and `mcp_meta` → serverInfo,
@@ -64,6 +81,32 @@ error. Status frames carry `"backend": "echo" | "local" | "none"` and `"local": 
 
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
+
+### UI round trip (relay → desktop UI)
+
+User names, comments, the patch journal and saved signatures live in the UI's stores. The UI marks
+its `/client` socket with `{ "type":"ui_register", "id" }` (reply `ui_register_result`); the most
+recent registration wins and is dropped when that socket closes. A UI verb from MCP or any `/client`
+is forwarded only to that socket as
+
+```json
+{ "type":"ui_call", "call_id":17, "verb":"set_name", "args":{ "address":"0x140001000", "name":"main" } }
+```
+
+and the UI answers on the same socket with `{ "type":"ui_reply", "call_id":17, "result":{...} }` or
+`{ "type":"ui_reply", "call_id":17, "error":"message" }`. The caller receives
+`{ "type":"<verb>_result", "id", "success":true, ...result }` or an error frame: `2005` no UI
+registered, `2006` the UI reported an error, `2003` no reply within 10 s, `2004` the UI disconnected.
+
+| verb | request fields | result fields |
+|---|---|---|
+| `list_names` | – | `names:[{address,name}]` |
+| `set_name` | `address`, `name` (empty removes) | `address`, `name` |
+| `list_comments` | – | `comments:[{address,comment}]` |
+| `set_comment` | `address`, `comment` (empty removes) | `address`, `comment` |
+| `list_patches` | – | `patches:[{id,address,written,before,note,created,reverted}]` |
+| `revert_patch` | `patch_id` | `patch_id`, `address`, `restored` (the UI writes `before` back via `write`, then marks the patch reverted) |
+| `list_signatures` | – | `signatures:[{id,name,module,ida,address,hits,note}]` |
 
 ### Broadcasts (relay → every `/client`)
 
@@ -147,7 +190,10 @@ the request body, and the reply is returned as pretty-printed JSON in a single t
 
 Prompts (`prompts/get` returns ready-to-use user messages with arguments substituted):
 `explain_function` (address), `find_pattern` (pattern, module?), `find_string` (text, module?),
-`pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module).
+`pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module),
+`find_value_references` (value_type, value), `rebuild_class` (address, size?),
+`update_signatures_after_patch` (module?). Prompt texts name tools in backticks; a relay unit test
+checks that every one of them exists in `src/lib/tools.json`.
 
 Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
 `echodebug://target/modules` (fails when no memory server is connected).
@@ -158,6 +204,8 @@ The tool set covers the whole backend: process control (`status`, `list_processe
 `signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
 `resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
 `value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
-dumping (`dump_module`) and socket housekeeping (`reopen_native_socket`).
+dumping (`dump_module`), socket housekeeping (`reopen_native_socket`) and the user's annotations in
+the UI (`list_names`, `set_name`, `list_comments`, `set_comment`, `list_patches`, `revert_patch`,
+`list_signatures`; these need the desktop app open).
 
 Because the relay routes by verb, an MCP client gets exactly the same behaviour as the desktop UI.

@@ -3,12 +3,21 @@ import { invoke, isTauri as coreIsTauri } from "@tauri-apps/api/core";
 
 export const isTauri = (): boolean => typeof window !== "undefined" && coreIsTauri();
 
-export type RelayInfo = { port: number; error?: string | null };
+export type RelayInfo = { port: number; error?: string | null; token?: string };
 export type InstallResult = { path: string; changed: boolean };
 
 export async function relayInfo(): Promise<RelayInfo> {
-  if (!isTauri()) return { port: Number(new URLSearchParams(location.search).get("port")) || 47110 }; // ?port= for browser dev
+  if (!isTauri()) {
+    // browser dev: ?port=&token= (the headless relay prints both at startup)
+    const q = new URLSearchParams(location.search);
+    return { port: Number(q.get("port")) || 47110, token: q.get("token") ?? "" };
+  }
   return invoke<RelayInfo>("relay_info");
+}
+
+/** New per-install MCP/relay token (desktop app only). */
+export async function regenerateToken(): Promise<string> {
+  return invoke<string>("regenerate_token");
 }
 
 /** Host OS of the desktop app ("windows" | "linux" | "macos" | …); "browser" outside Tauri. */

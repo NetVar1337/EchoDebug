@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use echo_debug_relay::{Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
 use serde::Serialize;
@@ -11,12 +12,17 @@ const AGENT_PORT_LINE: &str = "const int RELAY_PORT = 47110;";
 struct RelayState {
     port: u16,
     error: Option<String>,
+    relay: Relay,
+    token: Mutex<String>,
+    token_path: PathBuf,
 }
 
 #[derive(Serialize)]
 struct RelayInfo {
     port: u16,
     error: Option<String>,
+    /// bearer token for /mcp and /client
+    token: String,
 }
 
 #[derive(Serialize)]
@@ -30,6 +36,35 @@ fn scripts_path() -> Result<PathBuf, String> {
     dirs::config_dir()
         .map(|d| d.join("scripts"))
         .ok_or_else(|| "cannot locate the user config directory".to_owned())
+}
+
+/// Writes the MCP/relay token readable by the current user only.
+fn write_token(path: &Path, token: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    fs::write(path, token).map_err(|e| format!("write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// The per-install token, generated on first start and kept in the app config dir.
+fn load_or_create_token(path: &Path) -> String {
+    if let Ok(t) = fs::read_to_string(path) {
+        let t = t.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    let token = echo_debug_relay::generate_token();
+    if let Err(e) = write_token(path, &token) {
+        eprintln!("token not persisted, it changes on next start: {e}");
+    }
+    token
 }
 
 fn install(port: u16) -> Result<InstallResult, String> {
@@ -52,7 +87,18 @@ fn relay_info(state: tauri::State<'_, RelayState>) -> RelayInfo {
     RelayInfo {
         port: state.port,
         error: state.error.clone(),
+        token: state.token.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     }
+}
+
+/// Replaces the token; MCP clients must be re-added with the new header. Open sockets stay up.
+#[tauri::command]
+fn regenerate_token(state: tauri::State<'_, RelayState>) -> Result<String, String> {
+    let token = echo_debug_relay::generate_token();
+    write_token(&state.token_path, &token)?;
+    state.relay.set_token(Some(token.clone()));
+    *state.token.lock().unwrap_or_else(|e| e.into_inner()) = token.clone();
+    Ok(token)
 }
 
 /// Host OS ("windows", "linux", "macos", …) so the UI can gate Windows-only Echo features.
@@ -111,15 +157,16 @@ pub fn run() {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(DEFAULT_PORT);
             let version = app.package_info().version.to_string();
+            let token_path = app.path().app_config_dir()?.join("mcp_token");
+            let token = load_or_create_token(&token_path);
+            let relay = Relay::new(version, DEFAULT_TIMEOUT).with_token(Some(token.clone()));
             // A busy port must not kill the app: the UI shows the error from relay_info.
             let error = match echo_debug_relay::bind(port) {
                 Ok(listener) => {
                     port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                    let relay = relay.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) =
-                            echo_debug_relay::run(listener, Relay::new(version, DEFAULT_TIMEOUT))
-                                .await
-                        {
+                        if let Err(e) = echo_debug_relay::run(listener, relay).await {
                             eprintln!("relay stopped: {e}");
                         }
                     });
@@ -140,11 +187,18 @@ pub fn run() {
             } else {
                 eprintln!("host os '{}': skipping Echo agent install (Windows-only); local /proc backend active", std::env::consts::OS);
             }
-            app.manage(RelayState { port, error });
+            app.manage(RelayState {
+                port,
+                error,
+                relay,
+                token: Mutex::new(token),
+                token_path,
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             relay_info,
+            regenerate_token,
             host_os,
             install_agent,
             scripts_dir,

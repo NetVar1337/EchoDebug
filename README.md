@@ -81,7 +81,7 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | Triage | The imports of a module that deserve a second look (memory tampering, injection, anti-analysis), each with the callsites that use it |
 | Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 37 tools plus 6 prompts and 4 resources; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 44 tools plus 9 prompts and 4 resources, bearer-token protected; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
@@ -95,23 +95,30 @@ Echo exposes no API for these, and EchoDebug deliberately ships no driver to rep
 
 ### MCP
 
+Copy the command from **Settings** or the **MCP Server** panel; it carries this install's token:
+
 ```bash
-claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp
+claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp --header "Authorization: Bearer <token>"
 ```
 
-The relay listens on `127.0.0.1` only. It rejects browser origins other than the app's own and
-localhost dev servers, so web pages can't reach your target's memory.
+The relay listens on `127.0.0.1` only. `/mcp` and `/client` require the per-install bearer token
+(generated on first start, stored in the app config dir as `mcp_token`, regenerable from Settings),
+and browser origins other than the app's own and localhost dev servers are rejected, so neither web
+pages nor other local pages can reach your target's memory. Clients added before the token existed
+must be removed and re-added with the header.
 
 ### Connecting an MCP client
 
 ```bash
-claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp
+claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp --header "Authorization: Bearer <token>"
 ```
 
 Any MCP client works — the relay speaks Streamable HTTP JSON-RPC 2.0 (`initialize`, `ping`,
 `tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read`; batches supported,
 notifications answered with `202`). Prompts: `explain_function`, `find_pattern`, `find_string`,
-`pointer_path`, `scan_value`, `triage_module`. Resources: `echodebug://status`, `echodebug://tools`,
+`pointer_path`, `scan_value`, `triage_module`, `find_value_references`, `rebuild_class`,
+`update_signatures_after_patch`. With the desktop app open, MCP clients can also read and set your
+names and comments, list and revert journalled patches and list saved signatures. Resources: `echodebug://status`, `echodebug://tools`,
 `echodebug://mcp/log`, `echodebug://target/modules`.
 
 ## Development
@@ -121,7 +128,7 @@ Requirements: Node 22+, Rust (stable, 1.90+), and on Windows the WebView2 runtim
 ```bash
 npm ci
 npm run tauri dev            # desktop app with hot reload
-npm run dev                  # UI only in a browser (needs a relay: cargo run -p echo-debug-relay --manifest-path src-tauri/Cargo.toml)
+npm run dev                  # UI only in a browser (needs a relay: cargo run -p echo-debug-relay --manifest-path src-tauri/Cargo.toml; open the URL it prints with ?port=&token=)
 npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, sessions)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as

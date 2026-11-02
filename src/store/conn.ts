@@ -2,7 +2,8 @@
 import { create } from "zustand";
 import { client, request, type Frame } from "@/lib/client";
 import { type Module } from "@/lib/hex";
-import { hostOs, relayInfo } from "@/lib/tauri";
+import { hostOs, regenerateToken, relayInfo, type RelayInfo } from "@/lib/tauri";
+import { handleUiCall } from "@/lib/uiBridge";
 import { clearImages } from "@/lib/memory";
 import { log } from "./output";
 import pkg from "../../package.json";
@@ -12,6 +13,8 @@ export type Progress = { job: string; done: number; total: number } | null;
 
 type ConnStore = {
   port: number;
+  /** bearer token for /mcp and /client (shown in the MCP connect command) */
+  token: string;
   relay: boolean;
   relayError: string;
   agent: boolean;
@@ -33,6 +36,8 @@ type ConnStore = {
   refreshModules: () => Promise<void>;
   attach: (by: { name?: string; pid?: number }) => Promise<void>;
   detach: () => Promise<void>;
+  /** desktop app: new token; MCP clients must be re-added with it */
+  regenerateToken: () => Promise<void>;
 };
 
 let started = false;
@@ -43,6 +48,12 @@ export function onAgentEvent(l: (f: Frame) => void): () => void {
   return () => eventListeners.delete(l);
 }
 
+/** `claude mcp add` command for this relay, with the bearer token header. */
+export function mcpAddCommand(port: number, token: string): string {
+  const header = token ? ` --header "Authorization: Bearer ${token}"` : "";
+  return `claude mcp add --transport http echodebug http://127.0.0.1:${port}/mcp${header}`;
+}
+
 function targetFrom(f: Frame): Target | null {
   const t = f.target as Target | null | undefined;
   return t && typeof t === "object" && t.pid ? t : null;
@@ -50,6 +61,7 @@ function targetFrom(f: Frame): Target | null {
 
 export const useConn = create<ConnStore>((set, get) => ({
   port: 47110,
+  token: "",
   relay: false,
   relayError: "",
   agent: false,
@@ -67,18 +79,22 @@ export const useConn = create<ConnStore>((set, get) => ({
   init: async () => {
     if (started) return; // StrictMode mounts effects twice in dev
     started = true;
-    const info = await relayInfo().catch((e) => ({ port: 47110, error: String(e) }));
+    const info: RelayInfo = await relayInfo().catch((e) => ({ port: 47110, error: String(e) }));
     const os = await hostOs().catch(() => "browser");
-    set({ port: info.port, relayError: info.error ?? "", os });
+    set({ port: info.port, token: info.token ?? "", relayError: info.error ?? "", os });
     if (info.error) log("error", "relay", info.error);
     client.onState((up) => {
       set({ relay: up });
       log(up ? "info" : "warn", "relay", up ? `connected to 127.0.0.1:${info.port}` : "relay disconnected, retrying");
-      if (up) void get().refreshStatus();
-      else set({ agent: false, ext: false });
+      if (up) {
+        void get().refreshStatus();
+        // this socket serves the MCP annotation tools (names, comments, patches) from our stores
+        void request("ui_register").catch((e) => log("warn", "mcp", `ui_register: ${String(e)}`));
+      } else set({ agent: false, ext: false });
     });
     client.on((f) => {
       if (f.type === "status") applyStatus(f);
+      else if (f.type === "ui_call") void handleUiCall(f);
       else if (f.type === "event") {
         const ev = String(f.event ?? "");
         if (ev === "progress") set({ progress: { job: String(f.job), done: Number(f.done), total: Number(f.total) } });
@@ -91,7 +107,7 @@ export const useConn = create<ConnStore>((set, get) => ({
         for (const l of eventListeners) l(f);
       }
     });
-    client.connect(info.port);
+    client.connect(info.port, info.token ?? "");
   },
 
   refreshStatus: async () => {
@@ -123,6 +139,13 @@ export const useConn = create<ConnStore>((set, get) => ({
   detach: async () => {
     await request("detach");
     set({ target: null, modules: [] });
+  },
+
+  regenerateToken: async () => {
+    const token = await regenerateToken();
+    client.setToken(token);
+    set({ token });
+    log("info", "mcp", "token regenerated; re-add MCP clients with the new header");
   },
 }));
 
