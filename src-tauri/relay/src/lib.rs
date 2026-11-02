@@ -177,6 +177,11 @@ impl Relay {
         self.0.token.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The local backend's attach/detach: other clients learn the target from status frames.
+    pub(crate) fn set_target(&self, target: Value) {
+        self.lock().target = target;
+    }
+
     pub(crate) fn emit(&self, frame: Value) {
         let _ = self.0.events.send(frame.to_string());
     }
@@ -214,6 +219,8 @@ impl Relay {
             "target": s.target,
             "backend": backend,
             "local": backend == "local",
+            // the relay can attach by itself (Linux /proc backend) when no Echo agent is loaded
+            "local_available": s.ext.is_none() && self.0.local_backend.load(Ordering::Relaxed) && local::available(),
         });
         let Value::Object(m) = v else { unreachable!() };
         m

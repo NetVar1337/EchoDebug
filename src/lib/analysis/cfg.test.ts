@@ -94,6 +94,28 @@ describe("jump tables", () => {
     expect(t.targets).toEqual([base + 0x2810n, base + 0x27e0n]);
   });
 
+  it("recovers the table from real GCC/iced AT&T output (notrack, resolved lea, movslq)", () => {
+    // gcc -O1 switch as printed by the local backend (iced-x86 GAS formatter)
+    const t0 = 0x2004;
+    [0x10, 0x20, 0x30].forEach((v, i) => dv.setInt32(t0 + i * 4, v - t0, true)); // entries relative to the table
+    const lines = [
+      L(0x14000116f, 3, "and $7,%eax"),
+      L(0x140001172, 3, "cmp $2,%eax"),
+      L(0x140001175, 2, "ja 0x00000001400011AF"),
+      L(0x140001177, 2, "mov %eax,%eax"),
+      L(0x140001179, 7, "lea 0x140002004,%rdx ; 0x140002004"),
+      L(0x140001180, 4, "movslq (%rdx,%rax,4),%rax"),
+      L(0x140001184, 3, "add %rdx,%rax"),
+      L(0x140001187, 3, "notrack jmp *%rax"),
+    ];
+    expect(flowOf("notrack jmp *%rax").kind).toBe("indirect-jmp");
+    const t = resolveSwitch(lines, 7, img, base)!;
+    expect(t).not.toBeNull();
+    expect(t.kind).toBe("relative");
+    expect(t.count).toBe(3);
+    expect(t.targets).toEqual([base + 0x10n, base + 0x20n, base + 0x30n]);
+  });
+
   it("returns null for a plain indirect jump", () => {
     expect(resolveSwitch([L(0x1000, 2, "jmp rax")], 0, img, base)).toBeNull();
   });

@@ -671,7 +671,7 @@ pub fn itanium_classes(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     use object::{Object, ObjectSymbol};
     let module = req.get("module").and_then(Value::as_str).unwrap_or("");
     let Some((path, base, size)) = (if module.is_empty() {
-        mem.modules().ok().and_then(|m| m.into_iter().max_by_key(|x| x.2)).and_then(|(n, _, _)| module_path(mem, &n))
+        crate::local::main_module(mem).and_then(|(n, _, _)| module_path(mem, &n))
     } else {
         module_path(mem, module)
     }) else {

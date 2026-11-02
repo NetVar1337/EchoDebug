@@ -13,7 +13,7 @@ const kMaxCases = 1024;
 
 /** AT&T → Intel for the operand forms the switch shapes use. Intel text passes through. */
 export function toIntel(text: string): string {
-  const t = text.trim();
+  const t = text.trim().replace(/^(?:(?:notrack|bnd) )+/i, "");
   if (!t.includes("%")) return t;
   const sp = t.indexOf(" ");
   if (sp < 0) return t.replace(/%/g, "");
@@ -34,7 +34,7 @@ export function toIntel(text: string): string {
       if (disp) s += disp.startsWith("-") ? disp : (s ? "+" : "") + disp;
       return `${indirect ? "qword ptr " : ""}[${s}]`;
     }
-    return op.replace(/^\$/, "").replace(/^%/, "");
+    return op.replace(/^\$/, "").replace(/^%/, "").replace(/ ;.*$/, "");
   };
   const ops: string[] = [];
   let depth = 0;
@@ -73,7 +73,7 @@ function leaTarget(l: SwitchLine, mem: string): bigint | null {
     const d = num(m[2]);
     return BigInt(l.address) + BigInt(l.length) + (m[1] === "-" ? -d : d);
   }
-  const abs = /^\s*(0x[0-9a-f]+)\s*$/i.exec(mem);
+  const abs = /^\s*\[?\s*(0x[0-9a-f]+)\s*\]?\s*$/i.exec(mem);
   return abs ? BigInt(abs[1]) : null;
 }
 
@@ -130,7 +130,7 @@ export function resolveSwitch(lines: readonly SwitchLine[], at: number, img: Uin
   }
 
   // jmp REG ; preceded by add REG, B ; load REG, dword ptr [B+IDX*4(+DISP)]
-  m = /^jmp\s+(\w+)$/.exec(jt);
+  m = /^jmp\s+(?:qword ptr )?(\w+)$/.exec(jt);
   if (!m) return null;
   const jr = reg64(m[1]);
   let addB: string | null = null;
@@ -144,7 +144,7 @@ export function resolveSwitch(lines: readonly SwitchLine[], at: number, img: Uin
       addB = reg64(a[2]);
       continue;
     }
-    const ld = /^(?:mov|movsxd|movsx)\s+(\w+),\s*dword ptr \[(\w+)\+(\w+)\*4(?:\+(0x[0-9a-f]+))?\]$/.exec(t);
+    const ld = /^(?:mov|movsxd|movsx)\s+(\w+),\s*(?:dword ptr )?\[(\w+)\+(\w+)\*4(?:\+(0x[0-9a-f]+))?\]$/.exec(t);
     if (ld && addB && reg64(ld[1]) === jr && reg64(ld[2]) === addB) {
       idx = reg64(ld[3]);
       disp = ld[4] ? BigInt(ld[4]) : null;
@@ -156,9 +156,10 @@ export function resolveSwitch(lines: readonly SwitchLine[], at: number, img: Uin
   let bVal: bigint | null = null;
   for (let i = loadAt - 1; i >= Math.max(0, loadAt - 12); i--) {
     const t = toIntel(lines[i].text).toLowerCase();
-    const lea = /^lea\s+(\w+),\s*\[([^\]]+)\]/.exec(t);
+    // `lea rdx, [rip+X]`, `lea rdx, [0x...]`, or GAS's resolved `lea rdx, 0x...`
+    const lea = /^lea\s+(\w+),\s*(\[[^\]]+\]|0x[0-9a-f]+)/.exec(t);
     if (lea && reg64(lea[1]) === addB) {
-      bVal = leaTarget(lines[i], lea[2]);
+      bVal = leaTarget(lines[i], lea[2].replace(/^\[|\]$/g, ""));
       break;
     }
   }

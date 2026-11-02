@@ -69,7 +69,7 @@ export default function TargetsPanel() {
               <tr key={p.pid} data-selected={c.target?.pid === p.pid} onDoubleClick={() => void attach(p)} title={p.path}>
                 <td className="mono dim">{p.pid}</td>
                 <td>{p.name}</td>
-                <td><button className="row-action" disabled={!c.ext || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
+                <td><button className="row-action" disabled={(!c.ext && !c.localAvailable) || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
               </tr>
             ))}
           </tbody>

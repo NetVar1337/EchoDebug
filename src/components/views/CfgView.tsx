@@ -1,7 +1,7 @@
 // Control-flow graph of the function at the disassembly cursor: basic blocks laid out in layers,
 // taken (green), fall-through (red) and unconditional/switch (accent) edges.
-import { useEffect, useMemo, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Maximize2, RefreshCw, ZoomIn, ZoomOut } from "lucide-react";
 import { request } from "@/lib/client";
 import { labelAddr, moduleOf, showAddr, toBig } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
@@ -28,6 +28,8 @@ export default function CfgView() {
   const [busy, setBusy] = useState(false);
   const [sel, setSel] = useState<bigint | null>(null);
   const [tick, setTick] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const wrap = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!root) return;
@@ -67,6 +69,18 @@ export default function CfgView() {
   const pos = useMemo(() => (cfg ? layoutCfg(cfg, blockH, kWidth) : new Map()), [cfg]);
   const width = Math.max(400, ...[...pos.values()].map((p) => p.x + p.w + 20));
   const height = Math.max(200, ...[...pos.values()].map((p) => p.y + p.h + 20));
+  const fit = () => {
+    const el = wrap.current;
+    if (el) setZoom(Math.max(0.35, Math.min(1, (el.clientWidth - 30) / (width + 20), (el.clientHeight - 30) / height)));
+  };
+  // open on the entry block, not on the middle of a wide switch fan-out
+  useLayoutEffect(() => {
+    const el = wrap.current;
+    const p = cfg ? pos.get(cfg.entry) : undefined;
+    if (!el || !p) return;
+    el.scrollLeft = Math.max(0, (p.x + p.w / 2) * zoom + 10 - el.clientWidth / 2);
+    el.scrollTop = 0;
+  }, [cfg, pos]);
 
   return (
     <NeedsAgent>
@@ -75,12 +89,15 @@ export default function CfgView() {
           <span className="panel-title">CFG</span>
           <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || labelAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges` : ""}</span>
           <span className="faint" style={{ fontSize: 12 }}><span style={{ color: "var(--success)" }}>taken</span> · <span style={{ color: "var(--danger)" }}>fall-through</span> · <span style={{ color: "var(--accent)" }}>jump / case</span></span>
+          <IconButton tip="Zoom out" onClick={() => setZoom((z) => Math.max(0.15, z / 1.25))}><ZoomOut size={14} /></IconButton>
+          <IconButton tip="Zoom in" onClick={() => setZoom((z) => Math.min(2, z * 1.25))}><ZoomIn size={14} /></IconButton>
+          <IconButton tip="Fit" onClick={fit} disabled={!cfg}><Maximize2 size={14} /></IconButton>
           <IconButton tip="Rebuild" onClick={() => setTick((t) => t + 1)} disabled={!root}><RefreshCw size={14} /></IconButton>
         </div>
         {busy && <Progress value={0.5} />}
-        <div className="cfg-wrap">
+        <div className="cfg-wrap" ref={wrap}>
           {cfg && (
-            <svg width={width + 20} height={height} style={{ display: "block", margin: 10 }}>
+            <svg width={(width + 20) * zoom} height={height * zoom} viewBox={`0 0 ${width + 20} ${height}`} style={{ display: "block", margin: 10 }}>
               <defs>
                 {["taken", "fallthrough", "jump"].map((k) => (
                   <marker key={k} id={`cfg-arrow-${k}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">

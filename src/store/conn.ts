@@ -20,6 +20,8 @@ type ConnStore = {
   ext: boolean;
   /** this or another app window serves the ui_* MCP verbs */
   provider: boolean;
+  /** the relay can attach on its own (Linux local backend) */
+  localAvailable: boolean;
   extVersion: string;
   appVersion: string;
   /** "echo" (Windows memory server), "local" (Linux /proc backend) or "none" */
@@ -60,6 +62,7 @@ export const useConn = create<ConnStore>((set, get) => ({
   agent: false,
   ext: false,
   provider: false,
+  localAvailable: false,
   extVersion: "",
   appVersion: pkg.version,
   backend: "none",
@@ -109,7 +112,7 @@ export const useConn = create<ConnStore>((set, get) => ({
   },
 
   refreshModules: async () => {
-    if (!get().agent) return set({ modules: [] });
+    if (!get().agent && get().backend !== "local") return set({ modules: [] });
     try {
       const r = await request<{ modules: Module[] }>("modules");
       set({ modules: [...r.modules].sort((a, b) => a.name.localeCompare(b.name)) });
@@ -138,7 +141,7 @@ function applyStatus(f: Frame): void {
   const backend = String(f.backend ?? (agent ? "echo" : "none"));
   const target = targetFrom(f) ?? (agent || backend === "local" ? s.target : null);
   const changed = agent !== s.agent || target?.pid !== s.target?.pid;
-  useConn.setState({ agent, provider: Boolean(f.provider), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
+  useConn.setState({ agent, provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
   if (changed) {
     clearImages();
     void s.refreshModules();

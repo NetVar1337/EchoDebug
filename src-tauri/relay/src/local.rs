@@ -51,6 +51,10 @@ pub trait MemIo: Send + Sync {
         Ok(out)
     }
     fn alive(&self) -> bool;
+    /// Path of the main executable, when known (`/proc/<pid>/exe`).
+    fn exe(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -96,6 +100,9 @@ impl MemIo for ProcIo {
     }
     fn alive(&self) -> bool {
         std::path::Path::new(&format!("/proc/{}", self.pid)).exists()
+    }
+    fn exe(&self) -> Option<String> {
+        std::fs::read_link(format!("/proc/{}/exe", self.pid)).ok().map(|p| p.display().to_string())
     }
 }
 
@@ -330,12 +337,20 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
     Some(Value::Object(r))
 }
 
+/// The main program: the module backed by `/proc/<pid>/exe`, else the largest module.
+pub(crate) fn main_module(mem: &impl MemIo) -> Option<(String, u64, u64)> {
+    let mods = mem.modules().ok()?;
+    if let Some(exe) = mem.exe() {
+        let name = exe.rsplit('/').next().unwrap_or(&exe).trim_end_matches(" (deleted)").to_owned();
+        if let Some(m) = mods.iter().find(|(n, _, _)| *n == name) {
+            return Some(m.clone());
+        }
+    }
+    mods.into_iter().max_by_key(|(_, _, sz)| *sz)
+}
+
 fn modules_base(mem: &impl MemIo) -> Value {
-    mem.modules()
-        .ok()
-        .and_then(|m| m.iter().max_by_key(|(_, _, sz)| *sz).map(|(_, b, _)| hex_addr(*b)))
-        .map(Value::String)
-        .unwrap_or(Value::String("0x0".into()))
+    Value::String(main_module(mem).map(|(_, b, _)| hex_addr(b)).unwrap_or_else(|| "0x0".into()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -359,7 +374,10 @@ fn native_read(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     }
     let mut buf = vec![0u8; size as usize];
     match mem.read_at(addr, &mut buf) {
-        Ok(n) if n == size as usize => json!({ "type": "read_result", "success": true, "address": hex_addr(addr), "size": size, "data": hex_bytes(&buf) }),
+        Ok(n) if n == size as usize => {
+            crate::local_dbg::unshadow(addr, &mut buf);
+            json!({ "type": "read_result", "success": true, "address": hex_addr(addr), "size": size, "data": hex_bytes(&buf) })
+        }
         _ => json!({ "type": "read_result", "success": false, "address": hex_addr(addr), "size": 0, "data": "" }),
     }
 }
@@ -379,7 +397,10 @@ fn native_read_batch(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
             }
             let mut buf = vec![0u8; size as usize];
             match mem.read_at(addr.unwrap(), &mut buf) {
-                Ok(n) if n == size as usize => json!({ "success": true, "address": hex_addr(addr.unwrap()), "data": hex_bytes(&buf) }),
+                Ok(n) if n == size as usize => {
+                    crate::local_dbg::unshadow(addr.unwrap(), &mut buf);
+                    json!({ "success": true, "address": hex_addr(addr.unwrap()), "data": hex_bytes(&buf) })
+                }
                 _ => json!({ "success": false, "address": hex_addr(addr.unwrap()), "data": "" }),
             }
         })
@@ -524,6 +545,7 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     if n == 0 || (!function_mode && n != size) {
         return json!({ "type": "error", "code": 1005, "message": "memory read failed" });
     }
+    crate::local_dbg::unshadow(addr, &mut buf);
     if function_mode {
         // keep what was readable: a function near the end of a mapping is shorter than 64 KiB
         size = n;
@@ -614,7 +636,7 @@ pub fn resolve_rip_relative(code: &[u8], ip: u64, off: usize, inst_size: usize) 
 fn native_functions(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let module = req.get("module").and_then(Value::as_str).unwrap_or("");
     let mods = mem.modules().unwrap_or_default();
-    let picked = if module.is_empty() { mods.iter().max_by_key(|(_, _, s)| *s).cloned() } else { mods.iter().find(|(n, _, _)| *n == module || n.ends_with(module) || n.rsplit('/').next() == Some(module)).cloned() };
+    let picked = if module.is_empty() { main_module(mem) } else { mods.iter().find(|(n, _, _)| *n == module || n.ends_with(module) || n.rsplit('/').next() == Some(module)).cloned() };
     let Some((name, base, size)) = picked else {
         return json!({ "type": "error", "code": 1003, "message": "module not found", "detail": module });
     };
@@ -680,12 +702,11 @@ fn local_attach(relay: &Relay, req: &Map<String, Value>, orig: &Value) -> Value 
         *g = Some(LocalState { pid, scan: None });
     }
     crate::local_ext::start_ticker(relay, pid);
-    relay.broadcast_status();
     let mem = io(pid).unwrap();
     let base = modules_base(&mem);
-    let name = req.get("name").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| {
-        mem.modules().ok().and_then(|m| m.iter().max_by_key(|(_, _, s)| *s).map(|(n, _, _)| n.clone())).unwrap_or_default()
-    });
+    let name = req.get("name").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| main_module(&mem).map(|(n, _, _)| n).unwrap_or_default());
+    relay.set_target(json!({ "pid": pid, "base": base, "name": name }));
+    relay.broadcast_status();
     json!({ "type": "attach_result", "id": orig, "success": true, "pid": pid, "base": base, "name": name, "native_socket": false })
 }
 
@@ -701,6 +722,7 @@ fn local_detach(relay: &Relay, orig: &Value) -> Value {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = None;
     }
+    relay.set_target(Value::Null);
     relay.broadcast_status();
     json!({ "type": "detach_result", "id": orig, "success": true })
 }
@@ -894,7 +916,7 @@ fn ext_dump(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
             Some((_, b, s)) => (b, s),
             None => return json!({ "type": "error", "code": 3003, "message": "dump failed", "detail": format!("module not found: {m}") }),
         },
-        _ => match mem.modules().ok().and_then(|v| v.into_iter().max_by_key(|(_, _, s)| *s)) {
+        _ => match main_module(mem) {
             Some((_, b, s)) => (b, s),
             None => return json!({ "type": "error", "code": 3003, "message": "dump failed", "detail": "no modules" }),
         },

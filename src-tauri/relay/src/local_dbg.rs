@@ -12,9 +12,35 @@
 //! {tid?, regs}. Stops broadcast `{type:"event", event:"dbg_stop", reason, tid, address, regs}`;
 //! process exit broadcasts `dbg_exit`.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use serde_json::{json, Map, Value};
 
 use crate::Relay;
+
+/// Original bytes under the debugger's int3s: reads and disassembly show these instead of 0xCC.
+static SHADOW: Mutex<BTreeMap<u64, u8>> = Mutex::new(BTreeMap::new());
+
+/// Replaces planted breakpoint bytes in `buf` (read from `addr`) with the original bytes.
+pub fn unshadow(addr: u64, buf: &mut [u8]) {
+    let g = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_empty() {
+        return;
+    }
+    for (a, b) in g.range(addr..addr.saturating_add(buf.len() as u64)) {
+        buf[(a - addr) as usize] = *b;
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn shadow_set(addr: u64, orig: Option<u8>) {
+    let mut g = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
+    match orig {
+        Some(b) => g.insert(addr, b),
+        None => g.remove(&addr),
+    };
+}
 
 #[cfg(not(target_os = "linux"))]
 pub fn handle(_relay: &Relay, _req: &Map<String, Value>) -> Value {
@@ -30,7 +56,7 @@ pub use imp::{detach_all, handle};
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -424,6 +450,7 @@ mod imp {
         fn detach(&mut self) {
             self.need_stopped();
             for (a, b) in std::mem::take(&mut self.bps) {
+                shadow_set(a, None);
                 let _ = self.write_byte(a, b);
             }
             self.hw = [None, None, None, None];
@@ -525,8 +552,10 @@ mod imp {
                                 return failed(e);
                             }
                             self.bps.insert(addr, b[0]);
+                            shadow_set(addr, Some(b[0]));
                         }
                     } else if let Some(orig) = self.bps.remove(&addr) {
+                        shadow_set(addr, None);
                         if let Err(e) = self.write_byte(addr, orig) {
                             return failed(e);
                         }

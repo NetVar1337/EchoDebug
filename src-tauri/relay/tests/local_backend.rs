@@ -101,6 +101,13 @@ async fn local_backend_against_a_live_process() {
     assert_eq!(d["state"], "stopped", "{d}");
     let st = call(json!({ "type": "dbg_step" })).await;
     assert_eq!(st["success"], true, "{st}");
+    // a planted int3 is invisible to read (the original byte comes back, like gdb's shadow)
+    let orig = call(json!({ "type": "read", "address": ex["address"], "size": 1 })).await;
+    let bp = call(json!({ "type": "dbg_break", "address": ex["address"] })).await;
+    assert_eq!(bp["success"], true, "{bp}");
+    let shown = call(json!({ "type": "read", "address": ex["address"], "size": 1 })).await;
+    assert_eq!(shown["data"], orig["data"], "breakpoint byte hidden from reads");
+    call(json!({ "type": "dbg_break", "address": ex["address"], "enabled": false })).await;
     let c = call(json!({ "type": "dbg_continue" })).await;
     assert_eq!(c["state"], "running");
     let dd = call(json!({ "type": "detach" })).await;

@@ -15,11 +15,12 @@ export type Flow = { kind: "ret" | "jmp" | "jcc" | "call" | "indirect-jmp" | "st
 
 /** What an instruction does to control flow; `target` for direct branches. */
 export function flowOf(text: string): Flow {
-  const t = text.trim().toLowerCase().replace(/\s+/g, " ");
+  // prefixes that do not change control flow: CET notrack, MPX bnd, branch hints
+  const t = text.trim().toLowerCase().replace(/\s+/g, " ").replace(/^(?:(?:notrack|bnd|ds|cs|rep|repz|repnz|lock) )+/, "");
   const sp = t.indexOf(" ");
   const mn = sp < 0 ? t : t.slice(0, sp);
   const op = sp < 0 ? "" : t.slice(sp + 1).split(";")[0].trim();
-  const direct = /^(?:qword ptr |near |short )?\$?(0x[0-9a-f]+)$/.exec(op);
+  const direct = /^(?:qword ptr |near |short )?\$?(0x[0-9a-f]+)(?: <[^>]*>)?$/.exec(op);
   const target = direct ? BigInt(direct[1]) : null;
   if (/^ret[qnfw]?$|^iret[dq]?$|^sysret|^retf/.test(mn)) return { kind: "ret", target: null };
   if (mn === "int3" || mn === "hlt" || mn === "ud2" || mn === "ud1" || mn === "int" && op === "0x29") return { kind: "stop", target: null };

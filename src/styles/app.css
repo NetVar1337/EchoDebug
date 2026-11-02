@@ -335,3 +335,10 @@ html[data-motion="off"] *::after {
 .cfg-edge[data-kind="taken"] { stroke: var(--success); }
 .cfg-edge[data-kind="fallthrough"] { stroke: var(--danger); }
 .cfg-edge[data-kind="jump"], .cfg-edge[data-kind="case"] { stroke: var(--accent); }
+
+/* narrow listings: drop the bytes column before the instruction text loses its space */
+.listing { container-type: inline-size; }
+@container (max-width: 560px) {
+  .insn-row { grid-template-columns: 136px minmax(0, 1fr); }
+  .insn-row .insn-bytes { display: none; }
+}
