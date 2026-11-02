@@ -25,6 +25,7 @@ import { log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
 import { Boundary } from "@/components/ui";
+import { startProvider } from "@/lib/provider";
 
 const kLeft = { targets: TargetsPanel, modules: ModulesPanel, watch: WatchPanel, names: NamesPanel, mcp: McpPanel };
 
@@ -35,6 +36,7 @@ export default function App() {
   useEffect(() => {
     log("info", "app", `EchoDebug v${useConn.getState().appVersion}${isTauri() ? "" : " (browser mode)"}`);
     void useConn.getState().init();
+    startProvider();
     if (isTauri()) {
       void hostOs().then((os) => {
         if (os !== "windows") {

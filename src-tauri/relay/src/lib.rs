@@ -9,8 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,6 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+pub mod auth;
 pub mod local;
 
 pub const DEFAULT_PORT: u16 = 47110;
@@ -57,7 +59,17 @@ static PROMPTS: LazyLock<Vec<Value>> = LazyLock::new(|| {
       { "name": "scan_value", "description": "Walk a Cheat-Engine-style value scan: first scan, then narrow with changed/increased/decreased until few candidates remain.",
         "arguments": [{ "name": "value_type", "description": "u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bytes string wstring", "required": true }, { "name": "value", "description": "Value to search for on the first scan", "required": true }] },
       { "name": "triage_module", "description": "Read a module's PE headers, imports and sections from live memory and flag what deserves a second look.",
-        "arguments": [{ "name": "module", "description": "Module name", "required": true }] }
+        "arguments": [{ "name": "module", "description": "Module name", "required": true }] },
+      { "name": "find_vtable", "description": "Find the vtable of a C++ class by name and list its virtual functions.",
+        "arguments": [{ "name": "class", "description": "Class name, e.g. CPlayer", "required": true }, { "name": "module", "description": "Module name; default main executable" }] },
+      { "name": "make_signature", "description": "Build a unique, update-resistant byte signature for the function at an address and verify it.",
+        "arguments": [{ "name": "address", "description": "0x-prefixed address inside the function", "required": true }] },
+      { "name": "diff_snapshots", "description": "Capture memory before and after an action and explain which bytes changed.",
+        "arguments": [{ "name": "address", "description": "Start of the window to watch", "required": true }, { "name": "size", "description": "Window size in bytes, default 4096" }] },
+      { "name": "unpack_module", "description": "Find the original entry point of a packed module with the emulator, then dump it and rebuild its imports.",
+        "arguments": [{ "name": "module", "description": "Module name", "required": true }] },
+      { "name": "decrypt_strings", "description": "Find a string-decryption routine and run it on every call site with the decrypt oracle.",
+        "arguments": [{ "name": "address", "description": "Address of the decryption routine", "required": true }] }
     ]"#).expect("prompts")
 });
 
@@ -77,7 +89,13 @@ const MCP_LOG_CAP: usize = 200;
 pub(crate) enum Kind {
     Agent,
     Ext,
+    /// a `/client` (the desktop UI) that serves `ui_*` analysis verbs in TypeScript
+    Provider,
 }
+
+/// Verbs with this prefix are answered by the app window (the analyses live in the UI's
+/// TypeScript), so MCP clients can use them; see PROTOCOL.md "Provider verbs".
+pub const PROVIDER_PREFIX: &str = "ui_";
 
 struct Upstream {
     conn: u64,
@@ -95,6 +113,7 @@ struct Pending {
 struct Shared {
     agent: Option<Upstream>,
     ext: Option<Upstream>,
+    provider: Option<Upstream>,
     pending: HashMap<u64, Pending>,
     ext_version: String,
     target: Value,
@@ -105,6 +124,7 @@ impl Shared {
         match kind {
             Kind::Agent => &mut self.agent,
             Kind::Ext => &mut self.ext,
+            Kind::Provider => &mut self.provider,
         }
     }
 }
@@ -118,6 +138,8 @@ struct Inner {
     mcp_log: Mutex<VecDeque<Value>>,
     /// serve verbs from /proc when no Echo upstream is connected (Linux default; tests turn it off)
     local_backend: AtomicBool,
+    /// shared secret for /client and /mcp (None: authentication off)
+    token: Mutex<Option<String>>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -138,7 +160,22 @@ impl Relay {
             events: broadcast::channel(1024).0,
             mcp_log: Mutex::new(VecDeque::new()),
             local_backend: AtomicBool::new(local::available()),
+            token: Mutex::new(None),
         }))
+    }
+
+    /// Builder: require this token on `/client` and `/mcp` (see `auth`). `None` disables auth.
+    pub fn with_token(self, token: Option<String>) -> Self {
+        *self.0.token.lock().unwrap_or_else(|e| e.into_inner()) = token;
+        self
+    }
+
+    fn token(&self) -> Option<String> {
+        self.0.token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn emit(&self, frame: Value) {
+        let _ = self.0.events.send(frame.to_string());
     }
 
     /// Builder: enable/disable the local /proc backend (default: on for Linux, off elsewhere).
@@ -168,6 +205,7 @@ impl Relay {
             "type": ty,
             "agent": s.agent.is_some(),
             "ext": s.ext.is_some(),
+            "provider": s.provider.is_some(),
             "ext_version": s.ext_version,
             "app_version": self.0.app_version,
             "target": s.target,
@@ -221,12 +259,13 @@ impl Relay {
                     "type": "mcp_meta_result", "id": orig, "success": true,
                     "serverInfo": { "name": "echodebug", "version": self.0.app_version },
                     "protocolVersion": "2025-06-18",
-                    "capabilities": { "tools": {}, "prompts": {}, "resources": {} },
+                    "capabilities": capabilities(),
                     "prompts": *PROMPTS,
                     "resources": *RESOURCES,
                     "tools": TOOLS.len(),
                 });
             }
+            v if v.starts_with(PROVIDER_PREFIX) => Kind::Provider,
             v if NATIVE_VERBS.contains(&v) => Kind::Agent,
             _ => Kind::Ext,
         };
@@ -240,21 +279,30 @@ impl Relay {
             s.slot(kind).as_ref().map(|up| (up.conn, up.tx.clone()))
         };
         let Some((conn, up_tx)) = upstream else {
+            if kind == Kind::Provider {
+                return error(orig, 2005, "this tool runs in the EchoDebug app window; open the app (the headless relay cannot serve it)");
+            }
             // No Echo upstream: on Linux the relay serves the verbs itself from /proc.
             if self.0.local_backend.load(Ordering::Relaxed) && local::available() {
                 return match kind {
                     Kind::Agent => local::handle_native(self, req, &orig).await
                         .unwrap_or_else(|| error(orig.clone(), 2001, "echo memory server not connected")),
-                    Kind::Ext => local::handle_ext(self, req, &orig).await
+                    Kind::Ext | Kind::Provider => local::handle_ext(self, req, &orig).await
                         .unwrap_or_else(|| error(orig.clone(), 2002, "EchoDebug agent not connected")),
                 };
             }
             return match kind {
                 Kind::Agent => error(orig, 2001, "echo memory server not connected"),
-                Kind::Ext => error(orig, 2002, "EchoDebug agent not connected"),
+                Kind::Ext | Kind::Provider => error(orig, 2002, "EchoDebug agent not connected"),
             };
         };
-        let sent = up_tx.send(Value::Object(req).to_string());
+        let frame = if kind == Kind::Provider {
+            req.remove("id");
+            json!({ "type": "provider_call", "call": id, "verb": verb, "args": Value::Object(req) })
+        } else {
+            Value::Object(req)
+        };
+        let sent = up_tx.send(frame.to_string());
         drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
         if sent.is_err() {
             return error(orig, 2004, "upstream disconnected");
@@ -420,9 +468,34 @@ impl Relay {
         }
     }
 
+    /// A provider reply `{type:"provider_reply", call, result|error}` from the app window.
+    fn on_provider_reply(&self, msg: &Value) {
+        let Some(call) = msg["call"].as_u64() else { return };
+        let Some(p) = self.lock().pending.remove(&call) else { return };
+        let reply = if let Some(e) = msg.get("error").filter(|e| !e.is_null()) {
+            json!({ "type": "error", "id": p.orig, "code": 3003, "message": e.as_str().map(str::to_owned).unwrap_or_else(|| e.to_string()) })
+        } else {
+            let mut r = match msg.get("result") {
+                Some(Value::Object(m)) => m.clone(),
+                Some(other) => {
+                    let mut m = Map::new();
+                    m.insert("result".into(), other.clone());
+                    m
+                }
+                None => Map::new(),
+            };
+            r.insert("type".into(), json!(format!("{}_result", msg["verb"].as_str().unwrap_or("provider"))));
+            r.insert("success".into(), true.into());
+            r.insert("id".into(), p.orig);
+            Value::Object(r)
+        };
+        let _ = p.reply.send(reply);
+    }
+
     async fn client(self, socket: WebSocket) {
         let (mut sink, mut stream) = socket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let conn = self.next_id();
         let mut events = self.0.events.subscribe();
         let _ = tx.send(Value::Object(self.status("status")).to_string());
 
@@ -448,13 +521,39 @@ impl Relay {
                 Message::Close(_) => break,
                 _ => continue,
             };
+            let req: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            match req["type"].as_str() {
+                // The app window registers itself as the server of the ui_* verbs.
+                Some("provide") => {
+                    self.lock().provider = Some(Upstream { conn, tx: tx.clone() });
+                    self.broadcast_status();
+                    let _ = tx.send(json!({ "type": "provide_result", "id": req["id"], "success": true }).to_string());
+                    continue;
+                }
+                Some("provider_reply") => {
+                    self.on_provider_reply(&req);
+                    continue;
+                }
+                _ => {}
+            }
             let (relay, tx) = (self.clone(), tx.clone());
             tokio::spawn(async move {
-                let req = serde_json::from_str(&text).unwrap_or(Value::Null);
                 let _ = tx.send(relay.request(req).await.to_string());
             });
         }
         writer.abort();
+        let was_provider = {
+            let mut s = self.lock();
+            let mine = s.provider.as_ref().is_some_and(|p| p.conn == conn);
+            if mine {
+                s.provider = None;
+                s.pending.retain(|_, p| !(p.kind == Kind::Provider && p.conn == conn));
+            }
+            mine
+        };
+        if was_provider {
+            self.broadcast_status();
+        }
     }
 
     /// Handles one JSON-RPC message; `None` for notifications and client responses.
@@ -475,7 +574,7 @@ impl Relay {
         let result = match method {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                "capabilities": { "tools": {}, "prompts": {}, "resources": {} },
+                "capabilities": capabilities(),
                 "serverInfo": { "name": "echodebug", "version": self.0.app_version },
                 "instructions": "Reverse-engineering tools over Echo's hypervisor-backed memory API. Attach with the attach tool before reading/writing memory. Addresses are 0x-prefixed hex strings; byte payloads are lowercase hex. See prompts/list for canned workflows and resources/read for live status.",
             })),
@@ -498,6 +597,8 @@ impl Relay {
                 Ok(prompt_messages(p, &args))
             }
             "resources/list" => Ok(json!({ "resources": *RESOURCES })),
+            // Updates go out on the GET /mcp event stream to every listener; subscribing is an ack.
+            "resources/subscribe" | "resources/unsubscribe" | "logging/setLevel" => Ok(json!({})),
             "resources/read" => {
                 let Some(uri) = params["uri"].as_str() else {
                     return Some(rpc_error(id, -32602, "missing resource uri".to_owned()));
@@ -611,9 +712,44 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
             "Run a value scan of type {{value_type}} for {{value}}: first scan with compare 'exact' (or 'unknown' if the value is not known yet), then narrow with changed/increased/decreased/unchanged scans until under 50 candidates remain. Report the surviving addresses and their current values.")],
         "triage_module" => vec![text("module",
             "Triage the module {{module}}: read its PE headers (sections, imports with IAT addresses, exports), compute per-section entropy from live memory, list suspicious imports (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread,NtProtectVirtualMemory, IsDebuggerPresent, …) with their call sites, and check for INT 2D / VMCALL / PEB-read anti-debug patterns. Summarize the findings.")],
+        "find_vtable" => vec![text("class",
+            "Find the vtable of the C++ class {{class}} (module: {{module}}): call ui_rtti_classes to list the module's classes, pick the one whose name matches, then disassemble the first instructions of each virtual function and summarize what each one does.")],
+        "make_signature" => vec![text("address",
+            "Make a signature for the function containing {{address}}: call ui_make_signature with that address, then confirm with signature_scan that it matches exactly once. Report the IDA-style pattern and the offset from the match to the function start.")],
+        "diff_snapshots" => vec![text("address",
+            "Read {{size}} bytes (default 4096) at {{address}} with read_memory, ask me to perform the action, read the same range again, and report every changed byte range with the old and new values decoded as integers, floats and pointers where plausible.")],
+        "unpack_module" => vec![text("module",
+            "Unpack {{module}}: call ui_find_oep to emulate from the entry point until execution leaves the unpacking stub, then ui_rebuild_imports to recover the import table, and report the original entry point, the recovered imports and where the rebuilt image was written.")],
+        "decrypt_strings" => vec![text("address",
+            "Treat {{address}} as a string-decryption routine: call ui_xrefs_to to find its call sites, then ui_batch_decrypt to run the routine on the arguments set up at each site, and list the decrypted strings with their call sites.")],
         _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],
     };
     json!({ "description": prompt["description"], "messages": msgs })
+}
+
+fn capabilities() -> Value {
+    json!({ "tools": {}, "prompts": {}, "resources": { "subscribe": true }, "logging": {} })
+}
+
+/// Maps one relay broadcast onto the MCP notifications it implies (sent on `GET /mcp` streams).
+fn notifications_for(frame: &Value) -> Vec<Value> {
+    let note = |method: &str, params: Value| json!({ "jsonrpc": "2.0", "method": method, "params": params });
+    match (frame["type"].as_str(), frame["event"].as_str()) {
+        (Some("status"), _) => vec![
+            note("notifications/resources/updated", json!({ "uri": "echodebug://status" })),
+            note("notifications/resources/updated", json!({ "uri": "echodebug://target/modules" })),
+        ],
+        (Some("event"), Some("progress")) => vec![],
+        (Some("event"), Some(ev)) => {
+            let level = match frame["level"].as_str() {
+                Some("error") => "error",
+                Some("warn") => "warning",
+                _ => "info",
+            };
+            vec![note("notifications/message", json!({ "level": level, "logger": ev, "data": frame }))]
+        }
+        _ => vec![],
+    }
 }
 
 fn rpc_error(id: Value, code: i32, message: String) -> Value {
@@ -679,10 +815,14 @@ async fn health(State(relay): State<Relay>) -> Json<Value> {
 async fn client_ws(
     State(relay): State<Relay>,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !origin_allowed(&headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !auth::authorized(relay.token().as_deref(), &headers, query.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     ws.on_upgrade(move |s| relay.client(s))
 }
@@ -707,13 +847,106 @@ async fn ext_ws(State(relay): State<Relay>, headers: HeaderMap, ws: WebSocketUpg
     upstream_ws(relay, Kind::Ext, &headers, ws)
 }
 
-async fn mcp(State(relay): State<Relay>, headers: HeaderMap, body: Bytes) -> Response {
-    if !origin_allowed(&headers) {
-        return StatusCode::FORBIDDEN.into_response();
+fn wants_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"))
+}
+
+fn mcp_guard(relay: &Relay, headers: &HeaderMap, query: Option<&str>) -> Option<Response> {
+    if !origin_allowed(headers) {
+        return Some(StatusCode::FORBIDDEN.into_response());
+    }
+    if !auth::authorized(relay.token().as_deref(), headers, query) {
+        return Some(
+            (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "missing or wrong relay token").into_response(),
+        );
+    }
+    None
+}
+
+/// `GET /mcp` with `Accept: text/event-stream`: server-initiated notifications
+/// (`notifications/resources/updated`, `notifications/message`) for as long as the client listens.
+async fn mcp_events(State(relay): State<Relay>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    if let Some(r) = mcp_guard(&relay, &headers, query.as_deref()) {
+        return r;
+    }
+    if !wants_sse(&headers) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let rx = relay.0.events.subscribe();
+    let stream = futures_util::stream::unfold((rx, VecDeque::<Value>::new()), |(mut rx, mut queue)| async move {
+        loop {
+            if let Some(n) = queue.pop_front() {
+                let ev: Result<Event, std::convert::Infallible> = Ok(Event::default().event("message").data(n.to_string()));
+                return Some((ev, (rx, queue)));
+            }
+            match rx.recv().await {
+                Ok(text) => {
+                    if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                        queue.extend(notifications_for(&frame));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+/// A single `tools/call` that asked for SSE and gave a `progressToken`: agent progress events
+/// stream as `notifications/progress` until the result arrives as the final event.
+fn mcp_streaming_call(relay: Relay, msg: Value) -> Response {
+    let token = msg["params"]["_meta"]["progressToken"].clone();
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let mut events = relay.0.events.subscribe();
+    let progress_tx = tx.clone();
+    let forward = tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(text) => {
+                    let Ok(f) = serde_json::from_str::<Value>(&text) else { continue };
+                    if f["event"] == "progress" {
+                        let n = json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": {
+                            "progressToken": token, "progress": f["done"], "total": f["total"], "message": f["job"],
+                        } });
+                        if progress_tx.send(n).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let reply = relay.rpc(msg).await;
+        forward.abort();
+        if let Some(r) = reply {
+            let _ = tx.send(r);
+        }
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        let v = rx.recv().await?;
+        let ev: Result<Event, std::convert::Infallible> = Ok(Event::default().event("message").data(v.to_string()));
+        Some((ev, rx))
+    });
+    Sse::new(stream).into_response()
+}
+
+async fn mcp(State(relay): State<Relay>, headers: HeaderMap, RawQuery(query): RawQuery, body: Bytes) -> Response {
+    if let Some(r) = mcp_guard(&relay, &headers, query.as_deref()) {
+        return r;
     }
     let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
         return Json(rpc_error(Value::Null, -32700, "parse error".into())).into_response();
     };
+    if wants_sse(&headers) && msg["method"] == "tools/call" && !msg["params"]["_meta"]["progressToken"].is_null() {
+        return mcp_streaming_call(relay, msg);
+    }
     let reply = match msg {
         Value::Array(batch) if batch.is_empty() => {
             Some(rpc_error(Value::Null, -32600, "empty batch".into()))
@@ -741,7 +974,7 @@ pub fn router(relay: Relay) -> Router {
         .route("/ext", get(ext_ws))
         .route("/client", get(client_ws))
         .route("/health", get(health))
-        .route("/mcp", post(mcp))
+        .route("/mcp", post(mcp).get(mcp_events))
         .with_state(relay)
 }
 
@@ -758,8 +991,14 @@ pub async fn run(listener: TcpListener, relay: Relay) -> std::io::Result<()> {
     axum::serve(tokio::net::TcpListener::from_std(listener)?, router(relay)).await
 }
 
+/// Headless entry point: binds, loads (or creates) the relay token and serves.
 pub async fn serve(port: u16, app_version: String) -> std::io::Result<()> {
-    run(bind(port)?, Relay::new(app_version, DEFAULT_TIMEOUT)).await
+    let token = auth::default_token()?;
+    match &token {
+        Some(_) => eprintln!("relay token: {} (send as 'Authorization: Bearer <token>')", auth::token_path().display()),
+        None => eprintln!("relay authentication is OFF (ECHODEBUG_AUTH=0)"),
+    }
+    run(bind(port)?, Relay::new(app_version, DEFAULT_TIMEOUT).with_token(token)).await
 }
 
 #[cfg(test)]

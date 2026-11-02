@@ -28,7 +28,8 @@ export default function McpPanel() {
   const [running, setRunning] = useState(false);
 
   const endpoint = `http://127.0.0.1:${c.port}/mcp`;
-  const addCmd = `claude mcp add --transport http echodebug ${endpoint}`;
+  const authHeader = c.token ? `Authorization: Bearer ${c.token}` : "";
+  const addCmd = `claude mcp add --transport http echodebug ${endpoint}${c.token ? ` --header "${authHeader}"` : ""}`;
 
   const loadMeta = async () => {
     const m = await attempt("mcp_meta", request<Meta>("mcp_meta"));
@@ -87,9 +88,19 @@ export default function McpPanel() {
         <CopyChip text={endpoint} copied={copied} onCopy={copy} />
         <div className="label" style={{ marginTop: 6 }}>Connect a client (Claude Code)</div>
         <CopyChip text={addCmd} copied={copied} onCopy={copy} />
+        {c.token ? (
+          <>
+            <div className="label" style={{ marginTop: 6 }}>Auth header (other clients)</div>
+            <CopyChip text={authHeader} copied={copied} onCopy={copy} />
+            <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>The relay rejects <span className="mono">/client</span> and <span className="mono">/mcp</span> requests without this token, so other programs on this machine cannot reach the target's memory. Keep it private.</div>
+          </>
+        ) : (
+          <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>Relay authentication is off (<span className="mono">ECHODEBUG_AUTH=0</span>): any local program can use the relay.</div>
+        )}
+        <div className="row" style={{ marginTop: 6 }}><span className="dot" data-state={c.provider ? "ok" : "warn"} /> App analyses over MCP ({kTools.filter((t) => t.verb.startsWith("ui_")).length} <span className="mono">ui_*</span> tools) {c.provider ? "served by this window" : "unavailable"}</div>
         <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
           Any MCP client works — the relay speaks Streamable HTTP JSON-RPC 2.0 on <span className="mono">POST /mcp</span> (batch supported).
-          Capabilities: tools ({meta?.tools ?? kTools.length}), prompts, resources.
+          Capabilities: tools ({meta?.tools ?? kTools.length}), prompts, resources (subscribe), logging. <span className="mono">GET /mcp</span> with <span className="mono">Accept: text/event-stream</span> streams resource updates and agent events; a <span className="mono">tools/call</span> with a <span className="mono">progressToken</span> streams scan progress.
         </div>
       </div>
 

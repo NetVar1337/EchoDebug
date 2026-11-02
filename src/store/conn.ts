@@ -2,7 +2,7 @@
 import { create } from "zustand";
 import { client, request, type Frame } from "@/lib/client";
 import { type Module } from "@/lib/hex";
-import { hostOs, relayInfo } from "@/lib/tauri";
+import { hostOs, relayInfo, type RelayInfo } from "@/lib/tauri";
 import { clearImages } from "@/lib/memory";
 import { log } from "./output";
 import pkg from "../../package.json";
@@ -12,10 +12,14 @@ export type Progress = { job: string; done: number; total: number } | null;
 
 type ConnStore = {
   port: number;
+  /** relay bearer token, shown in the MCP panel's connect command */
+  token: string;
   relay: boolean;
   relayError: string;
   agent: boolean;
   ext: boolean;
+  /** this or another app window serves the ui_* MCP verbs */
+  provider: boolean;
   extVersion: string;
   appVersion: string;
   /** "echo" (Windows memory server), "local" (Linux /proc backend) or "none" */
@@ -50,10 +54,12 @@ function targetFrom(f: Frame): Target | null {
 
 export const useConn = create<ConnStore>((set, get) => ({
   port: 47110,
+  token: "",
   relay: false,
   relayError: "",
   agent: false,
   ext: false,
+  provider: false,
   extVersion: "",
   appVersion: pkg.version,
   backend: "none",
@@ -67,9 +73,9 @@ export const useConn = create<ConnStore>((set, get) => ({
   init: async () => {
     if (started) return; // StrictMode mounts effects twice in dev
     started = true;
-    const info = await relayInfo().catch((e) => ({ port: 47110, error: String(e) }));
+    const info: RelayInfo = await relayInfo().catch((e) => ({ port: 47110, error: String(e) }));
     const os = await hostOs().catch(() => "browser");
-    set({ port: info.port, relayError: info.error ?? "", os });
+    set({ port: info.port, token: info.token ?? "", relayError: info.error ?? "", os });
     if (info.error) log("error", "relay", info.error);
     client.onState((up) => {
       set({ relay: up });
@@ -91,7 +97,7 @@ export const useConn = create<ConnStore>((set, get) => ({
         for (const l of eventListeners) l(f);
       }
     });
-    client.connect(info.port);
+    client.connect(info.port, info.token);
   },
 
   refreshStatus: async () => {
@@ -132,7 +138,7 @@ function applyStatus(f: Frame): void {
   const backend = String(f.backend ?? (agent ? "echo" : "none"));
   const target = targetFrom(f) ?? (agent || backend === "local" ? s.target : null);
   const changed = agent !== s.agent || target?.pid !== s.target?.pid;
-  useConn.setState({ agent, ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
+  useConn.setState({ agent, provider: Boolean(f.provider), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
   if (changed) {
     clearImages();
     void s.refreshModules();
