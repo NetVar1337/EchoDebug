@@ -23,7 +23,9 @@ const step = async (name, f) => {
     console.log(`  ✓ ${name} (${Date.now() - t0} ms)`);
   } catch (e) {
     failures.push(name);
-    console.log(`  ✗ ${name}\n    ${String(e?.message ?? e).split("\n").join("\n    ")}`);
+    const shot = join(work, `failed-${failures.length}.png`);
+    await page?.screenshot({ path: shot }).catch(() => undefined);
+    console.log(`  ✗ ${name}\n    ${String(e?.message ?? e).split("\n").slice(0, 8).join("\n    ")}\n    screenshot: ${shot}`);
   }
 };
 const expect = (cond, msg) => { if (!cond) throw new Error(msg); };
@@ -57,9 +59,19 @@ const sym = (n) => "0x" + new RegExp(`^([0-9a-f]+) [TtDdBb] ${n}$`, "m").exec(nm
 
 let target = start(targetBin, []);
 const relay = start(relayBin, [String(PORT)], { env: { ...process.env, ECHODEBUG_TOKEN: TOKEN, XDG_CONFIG_HOME: work } });
-const vite = start(join(root, "node_modules/.bin/vite"), ["--port", "1430", "--strictPort"], { cwd: root });
-await until(async () => (await fetch(`http://127.0.0.1:${PORT}/health`)).ok);
-await until(async () => (await fetch("http://127.0.0.1:1430/")).ok, 60000);
+// bind IPv4 explicitly: "localhost" resolves to ::1 on some hosts (GitHub's runners)
+const vite = start(join(root, "node_modules/.bin/vite"), ["--host", "127.0.0.1", "--port", "1430", "--strictPort"], { cwd: root });
+const startup = async (what, url, ms, log) => {
+  try {
+    await until(async () => (await fetch(url)).ok, ms);
+  } catch {
+    console.log(`${what} did not come up at ${url}\n${log().slice(-3000)}`);
+    cleanup();
+    process.exit(1);
+  }
+};
+await startup("relay", `http://127.0.0.1:${PORT}/health`, 30000, relay.log);
+await startup("vite", "http://127.0.0.1:1430/", 90000, vite.log);
 
 const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
 const page = await browser.newPage({ viewport: { width: 1600, height: 950 } });
@@ -91,6 +103,8 @@ await step("disassembly lists the target's functions and its text", async () => 
   await tab("Disassembly");
   await page.keyboard.press("Control+g");
   await page.keyboard.type(`e2e-target+${sym("classify")}`);
+  // Enter only navigates once the dialog resolved the module-relative address
+  await until(async () => /^0x[0-9a-f]+$/.test((await page.locator("[role=dialog] .mono.faint").innerText()).trim()));
   await page.keyboard.press("Enter");
   await until(async () => (await page.locator(".insn-row").count()) > 5);
   const text = await page.locator(".insn-row .insn-text").first().innerText();
