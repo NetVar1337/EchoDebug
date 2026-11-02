@@ -32,11 +32,17 @@ pub fn is_read_only(verb: &str) -> bool {
     !DESTRUCTIVE.contains(&verb) && !STATEFUL.contains(&verb)
 }
 
+/// What the ask / read-only policies gate: calls that change the target's memory, plus dumps
+/// (they write files). Attach, scans and the emulator change only EchoDebug's own state.
+pub fn is_gated(verb: &str) -> bool {
+    DESTRUCTIVE.contains(&verb) || verb == "dump"
+}
+
 /// What MCP clients may call. Set by the app (Settings → MCP), kept in memory by the relay.
 #[derive(Clone, Debug)]
 pub struct Policy {
-    /// "allow": everything; "ask": the app window approves every call that is not read-only;
-    /// "readonly": calls that are not read-only are refused
+    /// "allow": everything; "ask": the app window approves every gated call (`is_gated`);
+    /// "readonly": gated calls are refused
     pub mode: String,
     /// when non-empty, only these tools may be called
     pub allow: Vec<String>,
@@ -83,7 +89,7 @@ pub fn decide(p: &Policy, tool: &str, verb: &str) -> Decision {
     if !p.allow.is_empty() && !p.allow.iter().any(|a| a == tool) {
         return Decision::Deny(format!("'{tool}' is not on the allow list (EchoDebug → Settings → MCP)"));
     }
-    if is_read_only(verb) {
+    if !is_gated(verb) {
         return Decision::Allow;
     }
     match p.mode.as_str() {
@@ -213,6 +219,8 @@ mod tests {
         p.mode = "readonly".into();
         assert!(matches!(decide(&p, "freeze_value", "freeze"), Decision::Deny(_)));
         assert_eq!(decide(&p, "disassemble", "disassemble"), Decision::Allow);
+        assert_eq!(decide(&p, "emu_step", "emu_step"), Decision::Allow);
+        assert!(matches!(decide(&p, "dump_module", "dump"), Decision::Deny(_)));
         p.mode = "allow".into();
         p.deny = vec!["dump_module".into()];
         assert!(matches!(decide(&p, "dump_module", "dump"), Decision::Deny(_)));

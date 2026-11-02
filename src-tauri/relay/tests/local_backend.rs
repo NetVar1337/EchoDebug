@@ -92,6 +92,21 @@ async fn local_backend_against_a_live_process() {
     let emu = call(json!({ "type": "emulate", "start": ex["address"], "end": "0x1", "max_insns": 1 })).await;
     assert_eq!(emu["instructions"], 1, "{emu}");
 
+    // emulated debugger over the same code: step twice, edit a register, break, close
+    let es = call(json!({ "type": "emu_start", "start": ex["address"] })).await;
+    assert_eq!(es["success"], true, "{es}");
+    assert_eq!(es["rip"], ex["address"]);
+    assert!(!es["next"].as_array().unwrap().is_empty(), "decodes from process memory: {es}");
+    let st = call(json!({ "type": "emu_step", "count": 1 })).await;
+    assert_eq!(st["stop"]["reason"], "step", "{st}");
+    assert_eq!(st["instructions"], 1);
+    let ed = call(json!({ "type": "emu_set", "regs": { "r15": "0x1234" } })).await;
+    assert_eq!(ed["regs"]["r15"], "0x1234", "{ed}");
+    let rd = call(json!({ "type": "emu_read", "address": ex["address"], "size": 8 })).await;
+    assert_eq!(rd["success"], true, "{rd}");
+    let cl = call(json!({ "type": "emu_close" })).await;
+    assert_eq!(cl["closed"], true);
+
     // pointer scan runs (results depend on the process)
     let ps = call(json!({ "type": "pointer_scan", "target": a, "max_depth": 1, "max_results": 10 })).await;
     assert_eq!(ps["type"], "pointer_scan_result", "{ps}");

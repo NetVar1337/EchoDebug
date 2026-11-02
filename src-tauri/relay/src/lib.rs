@@ -23,6 +23,7 @@ pub mod auth;
 pub mod local;
 pub mod local_dbg;
 pub mod local_emu;
+pub mod local_emudbg;
 pub mod local_ext;
 pub mod mcp;
 pub mod symbols;

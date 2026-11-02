@@ -23,7 +23,7 @@ export default function ApprovalDialog() {
       <div className="modal" role="alertdialog" aria-label="Approve MCP tool call" style={{ width: 520 }}>
         <div className="modal-body">
           <div className="row"><ShieldAlert size={16} /><span className="label grow">An MCP client wants to run <span className="mono">{a.tool}</span></span>{queue.length > 1 && <span className="faint">+{queue.length - 1} more</span>}</div>
-          <div className="faint" style={{ fontSize: 12 }}>This call changes the target (verb <span className="mono">{a.verb}</span>). The policy is set to ask (Settings → MCP). It is denied automatically in {left}s.</div>
+          <div className="faint" style={{ fontSize: 12 }}>This call changes the target or writes a file (verb <span className="mono">{a.verb}</span>). The policy is set to ask (Settings → MCP). It is denied automatically in {left}s.</div>
           <pre className="mcp-result" style={{ maxHeight: 240 }}>{args.length > 4000 ? args.slice(0, 4000) + "…" : args}</pre>
           <div className="row">
             <button className="btn primary" autoFocus onClick={() => answer(a.id, true)}>Allow</button>

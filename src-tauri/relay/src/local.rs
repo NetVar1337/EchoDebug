@@ -273,6 +273,17 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
         "reopen_socket" => {
             return Some(err(orig, 3003, "operation failed", "no Echo memory socket on the local Linux backend"));
         }
+        // the emulated debugger: emu_start without 'code' needs an attached process (checked inside)
+        v if v.starts_with("emu_") => {
+            let req2 = req.clone();
+            let mut r = tokio::task::spawn_blocking(move || crate::local_emudbg::handle(&req2))
+                .await
+                .unwrap_or_else(|e| err(orig, 3003, "emulator failed", &e.to_string()));
+            if let Value::Object(m) = &mut r {
+                m.insert("id".into(), orig.clone());
+            }
+            return Some(r);
+        }
         v if v.starts_with("dbg_") => {
             let (relay2, req2) = (relay.clone(), req.clone());
             let mut r = tokio::task::spawn_blocking(move || crate::local_dbg::handle(&relay2, &req2))
