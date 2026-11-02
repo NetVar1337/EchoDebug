@@ -1,22 +1,16 @@
-import { useEffect, useRef } from "react";
+import { lazy, useEffect, useRef } from "react";
 import ActivityRail from "@/components/ActivityRail";
 import CommandPalette from "@/components/CommandPalette";
 import GotoDialog from "@/components/GotoDialog";
 import InspectorPanel from "@/components/InspectorPanel";
 import OutputPanel from "@/components/OutputPanel";
 import ScannerPanel from "@/components/ScannerPanel";
-import SettingsModal from "@/components/SettingsModal";
 import Splash from "@/components/Splash";
 import Splitter from "@/components/Splitter";
 import StatusBar from "@/components/StatusBar";
 import TitleBar from "@/components/TitleBar";
 import TooltipLayer from "@/components/TooltipLayer";
 import WorkspacePanel from "@/components/WorkspacePanel";
-import McpPanel from "@/components/panels/McpPanel";
-import ModulesPanel from "@/components/panels/ModulesPanel";
-import NamesPanel from "@/components/panels/NamesPanel";
-import TargetsPanel from "@/components/panels/TargetsPanel";
-import WatchPanel from "@/components/panels/WatchPanel";
 import { hostOs, installAgent, isTauri } from "@/lib/tauri";
 import { exportSession, importSession } from "@/lib/session";
 import { useConn } from "@/store/conn";
@@ -24,9 +18,17 @@ import { applyMotion, useMotion } from "@/store/motion";
 import { log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
-import { Boundary } from "@/components/ui";
+import { Boundary, Lazy } from "@/components/ui";
 
-const kLeft = { targets: TargetsPanel, modules: ModulesPanel, watch: WatchPanel, names: NamesPanel, mcp: McpPanel };
+// Rail panels and settings load on first use, like the workspace views (see WorkspacePanel).
+const kLeft = {
+  targets: lazy(() => import("@/components/panels/TargetsPanel")),
+  modules: lazy(() => import("@/components/panels/ModulesPanel")),
+  watch: lazy(() => import("@/components/panels/WatchPanel")),
+  names: lazy(() => import("@/components/panels/NamesPanel")),
+  mcp: lazy(() => import("@/components/panels/McpPanel")),
+};
+const SettingsModal = lazy(() => import("@/components/SettingsModal"));
 
 export default function App() {
   const appRef = useRef<HTMLDivElement>(null);
@@ -87,7 +89,7 @@ export default function App() {
     }
   }, [ui.sessionExportOpen, ui.sessionImportOpen]);
 
-  const Left = kLeft[ui.rail] ?? TargetsPanel;
+  const Left = kLeft[ui.rail] ?? kLeft.targets;
   return (
     <div className="app" ref={appRef}>
       <TitleBar />
@@ -96,7 +98,7 @@ export default function App() {
       ) : (
         <div className="app-body">
           <ActivityRail />
-          <Boundary key={ui.rail}><Left /></Boundary>
+          <Boundary key={ui.rail}><Lazy><Left /></Lazy></Boundary>
           <Splitter axis="x" variable="--left-w" target={appRef} min={220} max={700} />
           <div className="center-col">
             <div className="center-top">
@@ -113,7 +115,7 @@ export default function App() {
       )}
       <StatusBar />
       <TooltipLayer />
-      {ui.settingsOpen && <Boundary><SettingsModal /></Boundary>}
+      {ui.settingsOpen && <Boundary><Lazy><SettingsModal /></Lazy></Boundary>}
       {ui.gotoOpen && <GotoDialog />}
       {ui.paletteOpen && <CommandPalette />}
     </div>

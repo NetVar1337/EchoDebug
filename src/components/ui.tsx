@@ -1,5 +1,5 @@
 // shared primitives: panel chrome, tabs, empty states, small inputs
-import { Component, type ReactNode, useEffect, useState } from "react";
+import { Component, type ReactNode, Suspense, useEffect, useState } from "react";
 import { Check, Copy, PlugZap } from "lucide-react";
 import { useConn } from "@/store/conn";
 
@@ -109,6 +109,11 @@ export function CopyChip({ text, copied, onCopy }: { text: string; copied: strin
       {copied === text ? <Check size={11} /> : <Copy size={11} />}
     </button>
   );
+}
+
+/** Suspense wrapper for React.lazy views / panels, styled like an empty state. */
+export function Lazy({ children }: { children: ReactNode }) {
+  return <Suspense fallback={<Empty title="Loading…" />}>{children}</Suspense>;
 }
 
 /** Keeps one broken view from blanking the whole window. */
