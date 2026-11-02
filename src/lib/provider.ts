@@ -45,6 +45,11 @@ import { batchDecrypt, exportIndex, oepCandidates } from "./unpacklive";
 import { functionsFromImage } from "./diffinput";
 import { parseSignature, authenticodeHash } from "./analysis/authenticode";
 import { invoke } from "@tauri-apps/api/core";
+import { guessFields } from "./analysis/structguess";
+import { toCpp } from "./analysis/struct";
+import { toBinja, toC, toGhidra, toIdaPython, toReclassXml } from "./analysis/typeexport";
+import { pointerClassifier } from "./ptrkind";
+import { useTypes } from "@/store/types";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 
@@ -434,6 +439,25 @@ provide("ui_binary_diff", async (args) => {
   const newFns = (await moduleFunctions(m)).slice(0, 6000).map((f) => ({ rva: Number(toBig(f.address) - nb), size: f.size, name: useNames.getState().nameOf(f.address) }));
   const r = diffFunctions(await functionsFromImage(oldImg, oldPe.imageBase, oldFns), await functionsFromImage(newImg, nb, newFns), Number(oldPe.imageBase), Number(nb));
   return { module: m.name, matched: r.pairs.length, changed: r.pairs.filter((p) => p.changed).map((p) => ({ old_rva: p.old.rva, new: labelAddr(nb + BigInt(p.new.rva), modules()), kind: p.kind, similarity: Number(p.similarity.toFixed(3)) })).slice(0, 2000), added: r.onlyNew.map((f) => labelAddr(nb + BigInt(f.rva), modules())).slice(0, 2000), removed: r.onlyOld.map((f) => f.rva).slice(0, 2000) };
+});
+
+provide("ui_guess_struct", async (args) => {
+  const a = addrArg(args);
+  const size = num(args, "size", 0x100, 0x4000);
+  const b = await readBytes(a, size);
+  if (!b) throw new Error("not readable");
+  const fields = guessFields(b, { kindOf: await pointerClassifier(modules()) });
+  const name = typeof args.name === "string" ? args.name : `Guess_${a.toString(16)}`;
+  if (args.save) useTypes.getState().add(name, fields);
+  return { address: labelAddr(a, modules()), size, fields, cpp: toCpp(name, fields), saved: Boolean(args.save) };
+});
+
+provide("ui_export_struct", async (args) => {
+  const t = typeof args.name === "string" ? useTypes.getState().find(args.name) : undefined;
+  if (!t) throw new Error(`no type '${args.name}' in the app's catalog (${useTypes.getState().types.map((x) => x.name).join(", ") || "empty"})`);
+  const fmt = String(args.format ?? "cpp");
+  const text = fmt === "c" ? toC(t.name, t.fields) : fmt === "ida" ? toIdaPython(t.name, t.fields) : fmt === "ghidra" ? toGhidra(t.name, t.fields) : fmt === "binja" ? toBinja(t.name, t.fields) : fmt === "reclass" ? toReclassXml([t]) : toCpp(t.name, t.fields);
+  return { name: t.name, format: fmt, text };
 });
 
 // ------------------------------------------------------------------------------------------------
