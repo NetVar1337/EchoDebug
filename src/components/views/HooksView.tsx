@@ -46,8 +46,8 @@ export default function HooksView() {
           <ModulePicker />
           <button className="btn primary small" disabled={!!busy || !m} onClick={() => void attempt("hooks", scan(false))}>Scan module</button>
           <button className="btn small" disabled={!!busy} onClick={() => void attempt("hooks", scan(true))}>Scan all modules</button>
-          <label className="row" title="Compare executable sections with the file on disk (rebased with its relocations)"><input type="checkbox" checked={useFile} onChange={(e) => setUseFile(e.target.checked)} />compare with file</label>
-          <label className="row" title="Also list imports resolved into a different module (usually API forwarding)"><input type="checkbox" checked={showInfo} onChange={(e) => setShowInfo(e.target.checked)} />forwarded imports</label>
+          <label className="row small-label" title="Compare executable sections with the file on disk (rebased with its relocations)"><input type="checkbox" checked={useFile} onChange={(e) => setUseFile(e.target.checked)} />compare with file</label>
+          <label className="row small-label" title="Also list imports resolved into a different module (usually API forwarding)"><input type="checkbox" checked={showInfo} onChange={(e) => setShowInfo(e.target.checked)} />forwarded imports</label>
           {busy && <span className="faint">scanning {busy}…</span>}
         </div>
         {reports.length === 0 && !busy && <div className="empty"><div className="empty-title">No scan yet.</div><div className="empty-hint">Finds inline hooks (jmp/push-ret/int3 at exports), patched code (memory vs the file on disk) and IAT entries redirected outside their DLL. PE modules only.</div></div>}

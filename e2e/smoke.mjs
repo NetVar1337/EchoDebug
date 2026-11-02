@@ -77,9 +77,17 @@ const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: p
 const page = await browser.newPage({ viewport: { width: 1600, height: 950 } });
 const errors = [];
 page.on("pageerror", (e) => errors.push(String(e)));
-const tab = (name) => page.locator(".tab", { hasText: new RegExp(`^${name}$`) }).click();
+// views that are not in the tab strip open through the "All views" menu
+const tab = async (name) => {
+  const t = page.locator(".tab", { hasText: new RegExp(`^${name}$`) });
+  if (await t.count()) return t.first().click();
+  await page.locator("[aria-label='All views']").click();
+  await page.locator('input[placeholder="Find a view…"]').fill(name);
+  await page.locator(".views-item", { hasText: new RegExp(`^${name}`) }).first().click();
+};
 const attach = async (pid) => {
-  await page.locator(".rail-button[aria-label=Targets]").click();
+  // the active rail button folds the panel away: only click when the process list is not shown
+  if (!(await page.locator('input[placeholder="Filter processes…"]').count())) await page.locator(".rail-button[aria-label=Targets]").click();
   await page.locator('input[placeholder="Filter processes…"]').fill("e2e-target");
   await page.locator(".panel-header, .panel-head").first().locator("[aria-label=Refresh]").click().catch(() => undefined);
   await until(async () => (await page.locator("tr", { hasText: String(pid) }).count()) > 0);
@@ -202,6 +210,21 @@ await step("module projects bring the name back after the target restarts at a n
   await attach(target.p.pid);
   await tab("Disassembly");
   await until(async () => (await page.locator(".fn-row", { hasText: "classify_e2e" }).count()) > 0, 20000);
+});
+
+await step("views menu, tab close and panel toggles", async () => {
+  await page.locator("[aria-label='All views']").click();
+  await page.locator('input[placeholder="Find a view…"]').fill("hooks");
+  await page.keyboard.press("Enter");
+  await until(async () => (await page.locator(".tabs-wrap .tab[data-active=true]").innerText()).startsWith("Hooks"));
+  await page.locator("[aria-label='Close Hooks']").click();
+  await until(async () => (await page.locator(".tabs-wrap .tab", { hasText: /^Hooks$/ }).count()) === 0);
+  await page.keyboard.press("Control+j");
+  await until(async () => (await page.locator("[aria-label='Toggle output'][data-active=false]").count()) > 0);
+  await page.keyboard.press("Control+j");
+  await page.keyboard.press("F1");
+  await until(async () => (await page.locator("[aria-label='Keyboard shortcuts'][role=dialog]").count()) > 0);
+  await page.keyboard.press("Escape");
 });
 
 await step("no uncaught errors in the page", async () => expect(errors.length === 0, errors.join("\n")));

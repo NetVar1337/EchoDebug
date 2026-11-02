@@ -13,6 +13,7 @@ export default function TargetsPanel() {
   const [procs, setProcs] = useState<Proc[]>([]);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState<number | null>(null);
+  const recentLower = useUi((s) => s.recentTargets).map((n) => n.toLowerCase());
 
   const load = async () => {
     const r = await attempt("processes", request<{ processes: Proc[] }>("processes"));
@@ -24,8 +25,12 @@ export default function TargetsPanel() {
 
   const shown = useMemo(() => {
     const f = filter.toLowerCase();
-    return f ? procs.filter((p) => p.name.toLowerCase().includes(f) || String(p.pid).includes(f)) : procs;
-  }, [procs, filter]);
+    // without a filter, hide processes with no user memory (kernel threads): they cannot be attached
+    const list = f ? procs.filter((p) => p.name.toLowerCase().includes(f) || String(p.pid).includes(f)) : procs.filter((p) => p.memory > 0 || !procs.some((q) => q.memory > 0));
+    // processes you attached to before come first
+    const rank = (p: Proc) => { const i = recentLower.indexOf(p.name.toLowerCase()); return i < 0 ? 99 : i; };
+    return [...list].sort((a, b) => rank(a) - rank(b));
+  }, [procs, filter, recentLower.join("|")]);
 
   const attach = async (p: Proc) => {
     setBusy(p.pid);
@@ -44,7 +49,7 @@ export default function TargetsPanel() {
 
   return (
     <Panel
-      title={<>Targets <span className="faint">{procs.length} processes</span></>}
+      title={<>Targets <span className="faint">{shown.length === procs.length ? `${procs.length} processes` : `${shown.length} of ${procs.length}`}</span></>}
       actions={
         <>
           {c.target && <IconButton tip="Detach" onClick={() => void attempt("detach", c.detach())}><Unplug size={14} /></IconButton>}
@@ -73,22 +78,24 @@ export default function TargetsPanel() {
         ) : (
           <>
             <div className="row"><span className="dot" data-state={c.backend === "local" ? "ok" : "warn"} /> Backend {c.backend === "local" ? "local /proc (Linux)" : "none — attach below"}</div>
-            <div className="faint" style={{ fontSize: 12 }}>
+            <details className="faint" style={{ fontSize: 12 }}>
+              <summary>How the Linux backend works</summary>
               The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze, watch, pointer scan, Unicorn emulation, exports, the loader's module list, Itanium RTTI and a ptrace debugger all run locally.
-            </div>
+            </details>
           </>
         )}
-        <label className="search"><Search size={13} /><input placeholder="Filter processes…" value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
+        <label className="search"><Search size={13} /><input placeholder="Filter processes…" value={filter} onChange={(e) => setFilter(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && shown.length === 1) void attach(shown[0]); }} title="Enter attaches when one process matches" /></label>
       </div>
       <div className="panel-body">
         <table className="table">
-          <colgroup><col style={{ width: 62 }} /><col /><col style={{ width: 64 }} /></colgroup>
-          <thead><tr><th>PID</th><th>Name</th><th /></tr></thead>
+          <colgroup><col style={{ width: 62 }} /><col /><col style={{ width: 58 }} /><col style={{ width: 64 }} /></colgroup>
+          <thead><tr><th>PID</th><th>Name</th><th title="resident memory">Mem</th><th /></tr></thead>
           <tbody>
             {shown.map((p) => (
               <tr key={p.pid} data-selected={c.target?.pid === p.pid} onDoubleClick={() => void attach(p)} title={p.path}>
                 <td className="mono dim">{p.pid}</td>
-                <td>{p.name}</td>
+                <td className="ellipsis">{recentLower.includes(p.name.toLowerCase()) && <span className="accent" title="attached before">★ </span>}{p.name}</td>
+                <td className="mono dim">{p.memory ? (p.memory >= 1 << 30 ? `${(p.memory / (1 << 30)).toFixed(1)}G` : `${Math.round(p.memory / (1 << 20))}M`) : ""}</td>
                 <td><button className="row-action" disabled={(!c.ext && !c.localAvailable) || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
               </tr>
             ))}

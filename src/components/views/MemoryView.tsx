@@ -241,7 +241,14 @@ export default function MemoryView() {
           {finding !== null && <Progress value={0.5} />}
           <div className="split-h" style={{ gridTemplateColumns: showInspect ? "minmax(0, 1fr) 250px" : "minmax(0, 1fr)", flex: 1, minHeight: 0, height: "auto" }}>
             {base === null ? (
-              <div className="empty"><div className="empty-title">Enter an address or pick a region.</div></div>
+              <div className="empty">
+                <div className="empty-title">Enter an address or pick a region.</div>
+                <div className="row wrap" style={{ justifyContent: "center" }}>
+                  {ui.selected && <button className="btn small primary" onClick={() => ui.goMemory(ui.selected!)}>Selection {ui.selected}</button>}
+                  {modules.slice().sort((a, b) => Number(b.base === useConn.getState().target?.base) - Number(a.base === useConn.getState().target?.base) || b.size - a.size).slice(0, 3).map((m) => <button key={m.base} className="btn small" onClick={() => ui.goMemory(m.base)}>{m.name}</button>)}
+                  {bookmarks.slice(0, 3).map((b) => <button key={b.address} className="btn small" onClick={() => ui.goMemory(b.address)}>★ {b.label || b.address}</button>)}
+                </div>
+              </div>
             ) : !data ? (
               <div className="empty"><div className="empty-title">Unreadable memory.</div><div className="empty-hint">{fmtAddr(base)} could not be read.</div></div>
             ) : (
