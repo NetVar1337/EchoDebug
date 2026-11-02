@@ -203,6 +203,24 @@ button:disabled { opacity: 0.45; cursor: default; }
 .insn-comment { color: var(--text-faint); font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .iat-symbol { color: var(--success); margin-left: 8px; font-size: 11.5px; }
 
+/* --- control-flow graph / pseudocode --------------------------------------- */
+.cfg-canvas { position: relative; flex: 1; min-height: 0; overflow: hidden; cursor: grab; background: var(--bg-1); touch-action: none; }
+.cfg-canvas:active { cursor: grabbing; }
+.cfg-zoom { position: absolute; top: var(--pad-sm); right: var(--pad-sm); display: flex; gap: var(--pad-xs); z-index: 1; }
+.cfg-head { font-family: var(--font-mono); font-size: 11px; fill: var(--text-faint); }
+.cfg-insn { font-family: var(--font-mono); font-size: 11.5px; cursor: pointer; white-space: pre; }
+.cfg-insn rect { fill: transparent; }
+.cfg-insn:hover rect { fill: var(--selection); }
+.cfg-insn text { fill: var(--text); }
+.cfg-insn .faint { fill: var(--text-faint); }
+.pseudo { white-space: pre; padding-bottom: var(--pad-md); }
+.pseudo-note { padding: var(--pad-sm) 10px; margin-bottom: var(--pad-sm); font-family: var(--font-ui); font-size: var(--type-small); color: var(--warning); white-space: normal; border-bottom: 1px solid var(--border-soft); }
+.pseudo-line { line-height: var(--row-h); }
+.pseudo-line[data-link="true"] { cursor: pointer; }
+.pseudo-line[data-link="true"]:hover { background: var(--bg-2); }
+.pseudo-line[data-kind="comment"] { color: var(--text-faint); }
+.pseudo-line[data-kind="label"] { color: var(--accent); }
+
 /* --- binary map ----------------------------------------------------------- */
 .map-bar { display: flex; height: 22px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .map-seg { display: grid; place-items: center; min-width: 0; overflow: hidden; font-size: 10px; color: var(--text-faint); background: var(--bg-2); border-right: 1px solid var(--bg-1); }
