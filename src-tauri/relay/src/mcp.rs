@@ -6,12 +6,13 @@ use std::io::Write;
 use serde_json::{json, Map, Value};
 
 /// Verbs that change the target process (memory, threads, execution).
-const DESTRUCTIVE: &[&str] = &["write", "freeze"];
+const DESTRUCTIVE: &[&str] = &["write", "freeze", "freeze_group"];
 /// Verbs that change state but not the target's memory: attach/detach, execution control, files.
 const STATEFUL: &[&str] = &[
     "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
     "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
-    "module_monitor", "page_monitor",
+    "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
+    "ptr_save", "cancel", "agent_config",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.

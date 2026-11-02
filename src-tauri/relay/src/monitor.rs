@@ -186,6 +186,18 @@ pub fn module_timeline(relay: &Relay) -> Value {
 
 /// Hashes of every page in [start, start+size): one `read` per 64 KiB chunk.
 async fn hash_range(relay: &Relay, start: u64, size: u64) -> Vec<u64> {
+    // the backend hashes its own pages (agent or local): only 16 hex digits per page travel
+    let mut req = Map::new();
+    req.insert("type".into(), json!("hash_pages"));
+    req.insert("ranges".into(), json!([{ "address": hex_addr(start), "size": size }]));
+    let r = ask(relay, req).await;
+    if let Some(packed) = r["ranges"][0]["hashes"].as_str() {
+        let hs: Vec<u64> = (0..packed.len() / 16).filter_map(|i| u64::from_str_radix(&packed[i * 16..i * 16 + 16], 16).ok()).collect();
+        if hs.len() as u64 == size.div_ceil(PAGE) {
+            return hs;
+        }
+    }
+    // older agents: read the pages
     let mut out = Vec::with_capacity((size / PAGE) as usize);
     let mut a = start;
     while a < start + size {

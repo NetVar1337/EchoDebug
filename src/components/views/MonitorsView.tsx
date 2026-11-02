@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
+import { request } from "@/lib/client";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useMonitors } from "@/store/monitors";
@@ -9,6 +10,82 @@ import { useUi } from "@/store/ui";
 import { IconButton, NeedsAgent } from "../ui";
 
 const time = (ts: number) => new Date(ts).toLocaleTimeString();
+
+type DiffRange = { address: string; size: number; old: string; new: string };
+
+/** Backend-side snapshots: copy a range (or a module) once, then list only what changed. */
+function SnapshotDiff() {
+  const modules = useConn((s) => s.modules);
+  const ui = useUi();
+  const [where, setWhere] = useState("");
+  const [size, setSize] = useState("0x10000");
+  const [taken, setTaken] = useState<string | null>(null);
+  const [diff, setDiff] = useState<{ changed_bytes: number; ranges: DiffRange[]; truncated: boolean } | null>(null);
+  const take = async () => {
+    const m = modules.find((x) => x.name.toLowerCase() === where.trim().toLowerCase());
+    const a = m ? null : parseAddress(where, modules);
+    if (!m && a === null) return log("warn", "snapshot", "a module name or an address");
+    const r = await attempt("mem_snapshot", request<{ address: string; size: number }>("mem_snapshot", m ? { name: "ui", module: m.name } : { name: "ui", address: fmtAddr(a!), size: Number(size) }));
+    if (r) { setTaken(`${r.address} (${(r.size / 1024).toFixed(0)} KiB)`); setDiff(null); }
+  };
+  const compare = async (update: boolean) => {
+    const r = await attempt("mem_diff", request<{ changed_bytes: number; ranges: DiffRange[]; truncated: boolean }>("mem_diff", { name: "ui", update, max_ranges: 500 }));
+    if (r) setDiff(r);
+  };
+  return (
+    <div className="panel-section">
+      <div className="label">Snapshot diff <span className="faint">(kept in the backend; only changes travel)</span></div>
+      <div className="row">
+        <input className="input mono grow" placeholder="module name or address" value={where} onChange={(e) => setWhere(e.target.value)} />
+        <input className="input mono" style={{ width: 90 }} value={size} onChange={(e) => setSize(e.target.value)} title="size (ignored for a module)" />
+        <button className="btn small primary" onClick={() => void take()}>Snapshot</button>
+      </div>
+      {taken && (
+        <div className="row">
+          <span className="faint grow" style={{ fontSize: 12 }}>baseline {taken}</span>
+          <button className="btn small" onClick={() => void compare(false)}>What changed?</button>
+          <button className="btn small" onClick={() => void compare(true)} title="show changes and make the current contents the new baseline">Diff &amp; rebase</button>
+        </div>
+      )}
+      {diff && (
+        <table className="table mono"><tbody>
+          <tr><td colSpan={3} className="faint">{diff.changed_bytes} bytes changed in {diff.ranges.length}{diff.truncated ? "+" : ""} ranges</td></tr>
+          {diff.ranges.map((d) => <tr key={d.address}><td className="link" style={{ width: 170 }} onClick={() => ui.goMemory(d.address)}>{labelAddr(d.address, modules)}</td><td className="faint">{d.size}b</td><td className="ellipsis"><span className="faint">{d.old}</span> → <span className="warn">{d.new}</span></td></tr>)}
+        </tbody></table>
+      )}
+    </div>
+  );
+}
+
+/** The running job, per-verb stats and the write journal of the backend (agent or local). */
+function Backend() {
+  const [stats, setStats] = useState<{ verbs: { verb: string; calls: number; ms: number }[]; job?: string; job_ms?: number; queued_events?: number } | null>(null);
+  const [journal, setJournal] = useState<{ t: number | string; kind: string; address: string; old: string; new: string }[] | null>(null);
+  const loadStats = async () => setStats((await attempt("stats", request<NonNullable<typeof stats>>("stats"))) ?? null);
+  const loadJournal = async () => setJournal((await attempt("journal", request<{ entries: NonNullable<typeof journal> }>("journal", { limit: 100 })))?.entries ?? null);
+  return (
+    <div className="panel-section">
+      <div className="row">
+        <span className="label grow">Backend</span>
+        <button className="btn small" onClick={() => void attempt("cancel", request("cancel")).then(() => log("info", "backend", "cancel requested"))}>Cancel running job</button>
+        <button className="btn small" onClick={() => void loadStats()}>Stats</button>
+        <button className="btn small" onClick={() => void loadJournal()}>Write journal</button>
+      </div>
+      {stats && (
+        <table className="table mono"><tbody>
+          {stats.job ? <tr><td colSpan={3} className="warn">running {stats.job} for {Math.round((stats.job_ms ?? 0) / 1000)} s</td></tr> : null}
+          {[...stats.verbs].sort((a, b) => b.ms - a.ms).slice(0, 15).map((v) => <tr key={v.verb}><td>{v.verb}</td><td className="faint">{v.calls}×</td><td className="faint">{v.ms} ms</td></tr>)}
+        </tbody></table>
+      )}
+      {journal && (
+        <table className="table mono"><tbody>
+          {journal.length === 0 && <tr><td className="faint">no writes or freezes recorded</td></tr>}
+          {journal.slice().reverse().map((j, i) => <tr key={i}><td className="faint" style={{ width: 60 }}>{j.kind}</td><td>{j.address}</td><td className="ellipsis"><span className="faint">{j.old}</span> → {j.new}</td></tr>)}
+        </tbody></table>
+      )}
+    </div>
+  );
+}
 
 export default function MonitorsView() {
   const mon = useMonitors();
@@ -49,6 +126,8 @@ export default function MonitorsView() {
               <tr key={i}><td className="faint" style={{ width: 80 }}>{time(e.ts)}</td><td className={e.event === "module_loaded" ? "ok" : "warn"} style={{ width: 24 }}>{e.event === "module_loaded" ? "+" : "−"}</td><td className="link" onClick={() => ui.goMemory(e.base)}>{e.name}</td><td className="faint">{e.base}</td></tr>
             ))}
           </tbody></table>
+          <SnapshotDiff />
+          <Backend />
         </div>
         <div className="list-col vlist" style={{ borderRight: "none" }}>
           <div className="panel-section">
