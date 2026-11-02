@@ -21,6 +21,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub mod auth;
 pub mod local;
+pub mod local_dbg;
+pub mod local_emu;
+pub mod local_ext;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);

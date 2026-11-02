@@ -184,7 +184,7 @@ pub fn available() -> bool {
     }
 }
 
-fn with_state<R>(f: impl FnOnce(&mut LocalState) -> R) -> Option<R> {
+pub(crate) fn with_state<R>(f: impl FnOnce(&mut LocalState) -> R) -> Option<R> {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     g.as_mut().map(f)
 }
@@ -193,19 +193,19 @@ pub fn attached_pid() -> Option<u32> {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.pid)
 }
 
-fn io(pid: u32) -> Option<ProcIo> {
+pub(crate) fn io(pid: u32) -> Option<ProcIo> {
     ProcIo::open(pid).ok()
 }
 
-fn err(id: &Value, code: i64, message: &str, detail: &str) -> Value {
+pub(crate) fn err(id: &Value, code: i64, message: &str, detail: &str) -> Value {
     json!({ "type": "error", "id": id, "code": code, "message": message, "detail": detail })
 }
 
-fn hex_addr(v: u64) -> String {
+pub(crate) fn hex_addr(v: u64) -> String {
     format!("0x{v:x}")
 }
 
-fn hex_bytes(b: &[u8]) -> String {
+pub(crate) fn hex_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -236,9 +236,9 @@ pub async fn handle_native(_relay: &Relay, req: Map<String, Value>, orig: &Value
         "disassemble" => native_disassemble(&mem, &req),
         "enumerate_functions" => native_functions(&mem, &req),
         "resolve_relative" => native_resolve_relative(&mem, &req),
-        "rtti_resolve" | "rtti_resolve_batch" => {
-            return Some(err(orig, 1008, "not supported by the local Linux backend", "RTTI is an MSVC/Windows concept"));
-        }
+        // GCC/Clang objects carry Itanium C++ ABI type info instead of MSVC RTTI.
+        "rtti_resolve" => crate::local_ext::itanium_resolve(&mem, &req),
+        "rtti_resolve_batch" => crate::local_ext::itanium_resolve_batch(&mem, &req),
         _ => return Some(err(orig, 1000, "unknown message type", &verb)),
     };
     let mut r = match reply {
@@ -266,14 +266,15 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
         "reopen_socket" => {
             return Some(err(orig, 3003, "operation failed", "no Echo memory socket on the local Linux backend"));
         }
-        "freeze" | "freeze_list" | "emulate" | "pointer_scan" | "peb_walk" | "watch" | "unwatch"
-        | "watch_list" | "resolve_export" => {
-            return Some(err(
-                orig,
-                3003,
-                "requires the Echo agent",
-                "this verb only exists in the Windows AngelScript agent (echo_debug.as)",
-            ));
+        v if v.starts_with("dbg_") => {
+            let (relay2, req2) = (relay.clone(), req.clone());
+            let mut r = tokio::task::spawn_blocking(move || crate::local_dbg::handle(&relay2, &req2))
+                .await
+                .unwrap_or_else(|e| err(orig, 3003, "debugger failed", &e.to_string()));
+            if let Value::Object(m) = &mut r {
+                m.insert("id".into(), orig.clone());
+            }
+            return Some(r);
         }
         _ => {
             let Some(pid) = attached_pid() else {
@@ -294,6 +295,29 @@ pub async fn handle_ext(relay: &Relay, req: Map<String, Value>, orig: &Value) ->
                 "read_typed" => ext_read_typed(&mem, &req),
                 "region_stats" => ext_region_stats(&mem, &req),
                 "dump" => ext_dump(&mem, &req),
+                "freeze" => crate::local_ext::freeze(relay, &mem, &req),
+                "freeze_list" => crate::local_ext::freeze_list(),
+                "watch" => crate::local_ext::watch(relay, &mem, &req),
+                "unwatch" => crate::local_ext::unwatch(&req),
+                "watch_list" => crate::local_ext::watch_list(),
+                "pointer_scan" => {
+                    let req2 = req.clone();
+                    let relay2 = relay.clone();
+                    tokio::task::spawn_blocking(move || crate::local_ext::pointer_scan(&relay2, &mem, &req2))
+                        .await
+                        .unwrap_or_else(|e| json!({ "type": "error", "code": 3003, "message": "pointer scan failed", "detail": e.to_string() }))
+                }
+                "resolve_export" => crate::local_ext::resolve_export(&mem, &req),
+                // Linux stand-in for the PEB walk: the dynamic loader's r_debug/link_map chain.
+                "peb_walk" | "link_map" => crate::local_ext::link_map_walk(&mem, pid),
+                "itanium_classes" => crate::local_ext::itanium_classes(&mem, &req),
+                "module_file" => crate::local_ext::module_file(&mem, &req),
+                "emulate" => {
+                    let req2 = req.clone();
+                    tokio::task::spawn_blocking(move || crate::local_emu::emulate(&mem, &req2))
+                        .await
+                        .unwrap_or_else(|e| json!({ "type": "error", "code": 3003, "message": "emulation failed", "detail": e.to_string() }))
+                }
                 _ => return Some(err(orig, 3000, "unknown verb", &verb)),
             }
         }
@@ -318,7 +342,7 @@ fn modules_base(mem: &impl MemIo) -> Value {
 // Native verbs
 // ---------------------------------------------------------------------------------------------
 
-fn arg_addr(req: &Map<String, Value>, k: &str) -> Option<u64> {
+pub(crate) fn arg_addr(req: &Map<String, Value>, k: &str) -> Option<u64> {
     match req.get(k)? {
         Value::String(s) => u64::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
         Value::Number(n) => n.as_u64(),
@@ -590,15 +614,24 @@ fn native_functions(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     }
 }
 
+/// Load bias of an ELF mapped at `base`: symbol addresses are file vaddrs, so a shared object
+/// (lowest PT_LOAD vaddr 0) lives at `base + vaddr` and a non-PIE executable at `vaddr` itself.
+pub fn load_bias(file: &object::File, base: u64) -> u64 {
+    use object::{Object, ObjectSegment};
+    let lowest = file.segments().map(|s| s.address()).min().unwrap_or(0) & !0xfff;
+    base.wrapping_sub(lowest)
+}
+
 /// ELF symbol table (.symtab + .dynsym) functions inside [base, base+size). Best-effort preview data.
 pub fn functions_in_file(path: &str, base: u64, size: u64) -> Result<Vec<(u64, u64)>, String> {
     use object::{Object, ObjectSymbol};
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let file = object::File::parse(&*data).map_err(|e| e.to_string())?;
+    let bias = load_bias(&file, base);
     let mut out = Vec::new();
     let push = |sym: object::Symbol, out: &mut Vec<(u64, u64)>| {
-        if sym.kind() == object::SymbolKind::Text {
-            let addr = sym.address();
+        if sym.kind() == object::SymbolKind::Text && sym.address() != 0 {
+            let addr = sym.address().wrapping_add(bias);
             if addr >= base && addr < base + size {
                 out.push((addr, sym.size().max(1)));
             }
@@ -632,6 +665,7 @@ fn local_attach(relay: &Relay, req: &Map<String, Value>, orig: &Value) -> Value 
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = Some(LocalState { pid, scan: None });
     }
+    crate::local_ext::start_ticker(relay, pid);
     relay.broadcast_status();
     let mem = io(pid).unwrap();
     let base = modules_base(&mem);
@@ -642,6 +676,13 @@ fn local_attach(relay: &Relay, req: &Map<String, Value>, orig: &Value) -> Value 
 }
 
 fn local_detach(relay: &Relay, orig: &Value) -> Value {
+    if let Some(pid) = attached_pid() {
+        if let Some(mem) = io(pid) {
+            crate::local_ext::restore_frozen(&mem);
+        }
+    }
+    crate::local_ext::stop_ticker();
+    crate::local_dbg::detach_all();
     {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = None;
@@ -650,7 +691,7 @@ fn local_detach(relay: &Relay, orig: &Value) -> Value {
     json!({ "type": "detach_result", "id": orig, "success": true })
 }
 
-fn find_pid_by_name(name: &str) -> Option<u32> {
+pub(crate) fn find_pid_by_name(name: &str) -> Option<u32> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
@@ -677,7 +718,7 @@ fn ext_write(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     }
 }
 
-fn region_of(mem: &impl MemIo, addr: u64) -> Value {
+pub(crate) fn region_of(mem: &impl MemIo, addr: u64) -> Value {
     let maps = mem.maps().unwrap_or_default();
     for m in &maps {
         if addr >= m.start && addr < m.end {

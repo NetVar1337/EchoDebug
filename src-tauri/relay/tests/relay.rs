@@ -412,7 +412,7 @@ async fn hello_attached_without_agent_pokes_reopen_socket() {
     assert_eq!(st["agent"], false);
 
     // not poked when the native server is connected, or when not attached
-    let mut agent = connect(addr, "/agent").await;
+    let _agent = connect(addr, "/agent").await;
     let _ = recv_until(&mut client, |v| v["type"] == "status" && v["agent"] == true).await;
     send(
         &mut ext,
@@ -523,7 +523,7 @@ async fn local_backend_serves_verbs_without_upstream() {
     send(&mut client, json!({ "type": "modules", "id": 3 })).await;
     let r = recv_until(&mut client, |v| v["id"] == 3).await;
     assert_eq!(r["type"], "modules_result");
-    assert!(r["modules"].as_array().unwrap().len() > 0, "own process has modules: {r}");
+    assert!(!r["modules"].as_array().unwrap().is_empty(), "own process has modules: {r}");
 
     // status reports the local backend
     send(&mut client, json!({ "type": "status", "id": 4 })).await;

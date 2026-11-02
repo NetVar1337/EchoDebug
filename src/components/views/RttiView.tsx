@@ -11,6 +11,54 @@ import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
+import { request } from "@/lib/client";
+import { isElf } from "@/lib/analysis/elf";
+import type { Module } from "@/lib/hex";
+
+type ItaniumClass = { name: string; mangled: string; typeinfo: string | null; vtable: string | null; slots: number; bases: string[] };
+
+/** GCC/Clang modules: classes from the _ZTI/_ZTV symbols (Itanium C++ ABI), via the local backend. */
+function ItaniumClasses({ m }: { m: Module }) {
+  const ui = useUi();
+  const modules = useConn((s) => s.modules);
+  const [list, setList] = useState<ItaniumClass[] | null>(null);
+  const [filter, setFilter] = useState("");
+  useEffect(() => {
+    let live = true;
+    setList(null);
+    void attempt("rtti", request<{ classes: ItaniumClass[] }>("itanium_classes", { module: m.name })).then((r) => {
+      if (!live) return;
+      setList(r?.classes ?? []);
+      if (r) log("info", "rtti", `${r.classes.length} Itanium classes in ${m.name}`);
+    });
+    return () => { live = false; };
+  }, [m.name, m.base]);
+  const f = filter.toLowerCase();
+  const shown = (list ?? []).filter((c) => !f || c.name.toLowerCase().includes(f));
+  return (
+    <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
+      <div className="toolbar">
+        <ModulePicker />
+        <label className="search grow"><Search size={13} /><input placeholder="Filter classes…" value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
+        <span className="faint" style={{ fontSize: 12 }}>Itanium C++ ABI · {shown.length} classes</span>
+      </div>
+      <div className="vlist">
+        {list === null && <div className="empty"><div className="empty-title">Reading symbols…</div></div>}
+        {list?.length === 0 && <div className="empty"><div className="empty-title">No class type info.</div><div className="empty-hint">The module exports no _ZTI/_ZTV symbols (stripped, or no polymorphic classes). Resolve a live object from the Inspector instead.</div></div>}
+        <table className="table mono"><tbody>
+          {shown.slice(0, 5000).map((c) => (
+            <tr key={c.mangled}>
+              <td className="ellipsis" title={c.mangled}>{c.name}</td>
+              <td className="faint ellipsis">{c.bases.length ? `: ${c.bases.join(", ")}` : ""}</td>
+              <td>{c.vtable ? <span className="link" onClick={() => ui.goMemory(c.vtable!)} title="vtable (first virtual slot)">{labelAddr(c.vtable, modules)}</span> : "—"}</td>
+              <td className="faint">{c.slots} slots</td>
+            </tr>
+          ))}
+        </tbody></table>
+      </div>
+    </div>
+  );
+}
 
 export default function RttiView() {
   const m = useFocusedModule();
@@ -24,6 +72,7 @@ export default function RttiView() {
   const [objAddr, setObjAddr] = useState("");
   const [obj, setObj] = useState<VObject | null>(null);
   const [objBusy, setObjBusy] = useState(false);
+  const [elf, setElf] = useState(false);
 
   useEffect(() => {
     if (!m) return;
@@ -33,6 +82,8 @@ export default function RttiView() {
     void attempt("rtti", loadImage(m, (d, t) => live && setProgress(d / t))).then((img) => {
       if (!live || !img) return;
       setProgress(1);
+      setElf(isElf(img));
+      if (isElf(img)) return;
       const found = buildRtti(img, BigInt(m.base));
       setInv(found);
       log("info", "rtti", `${found.classes.length} RTTI classes in ${m.name}`);
@@ -67,6 +118,8 @@ export default function RttiView() {
     if (r.failed) log("warn", "vtable", r.failed);
     else log("info", "vtable", `${r.className || "object"} at ${r.vtable}, ${r.slots.length} virtual slots`);
   };
+
+  if (elf && m) return <NeedsAgent><ItaniumClasses m={m} /></NeedsAgent>;
 
   return (
     <NeedsAgent>

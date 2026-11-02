@@ -54,7 +54,7 @@ export default function TargetsPanel() {
           <>
             <div className="row"><span className="dot" data-state={c.backend === "local" ? "ok" : "warn"} /> Backend {c.backend === "local" ? "local /proc (Linux)" : "none — attach below"}</div>
             <div className="faint" style={{ fontSize: 12 }}>
-              The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze / emulate / pointer-scan need the Windows agent.
+              The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze, watch, pointer scan, Unicorn emulation, exports, the loader's module list, Itanium RTTI and a ptrace debugger all run locally.
             </div>
           </>
         )}

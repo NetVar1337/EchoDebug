@@ -11,6 +11,8 @@ import { attempt } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress, Tabs } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
+import ElfView from "./ElfView";
+import { isElf } from "@/lib/analysis/elf";
 
 type Sub = "headers" | "sections" | "exports" | "imports" | "analysis" | "iat";
 const kLimit = 3000;
@@ -30,16 +32,19 @@ export default function PeView() {
   const [iat, setIat] = useState<IatMap | null>(null);
   const [importRefs, setImportRefs] = useState<Record<string, LiveXref[]>>({});
   const [importRefsSel, setImportRefsSel] = useState<IatEntry | null>(null);
+  const [elf, setElf] = useState(false);
 
   useEffect(() => {
     if (!m) return;
     let live = true;
     setPe(null);
     setErr("");
+    setElf(false);
     setProgress(0);
     void attempt("pe", loadImage(m, (d, t) => live && setProgress(d / t))).then((img) => {
       if (!live || !img) return;
       setProgress(1);
+      if (isElf(img)) return setElf(true);
       try {
         const parsed = parsePe(img);
         setPe(parsed);
@@ -197,6 +202,8 @@ export default function PeView() {
       </div>
     );
   };
+
+  if (elf && m) return <NeedsAgent><ElfView m={m} /></NeedsAgent>;
 
   return (
     <NeedsAgent>

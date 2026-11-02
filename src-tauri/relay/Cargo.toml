@@ -21,3 +21,8 @@ tower = { version = "0.5", features = ["util"] }
 [[bin]]
 name = "echodebug-relay"
 path = "src/main.rs"
+
+# Linux local backend: Unicorn for `emulate`, ptrace for the debugger.
+[target.'cfg(target_os = "linux")'.dependencies]
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
+nix = { version = "0.29", features = ["ptrace", "process", "signal"] }
