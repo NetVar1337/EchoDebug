@@ -68,7 +68,7 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | Watchlist | Live values, inline edits, freeze (rewritten by the agent at 20 Hz), bookmarks |
 | Strings | ASCII + UTF-16 extraction, category/regex filters, CSV export, xrefs per string |
 | PE browser | Headers, sections, data directories, imports (with IAT slots), exports, **Analysis tab** with per-section entropy and packer/protector heuristics |
-| Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array / x64dbg / YARA output, saved to a catalog; **FLIRT** signature files (IDA `.sig`, versions 5-10) can be loaded and matched against the module, with the CRC of the function tail verified |
+| Signatures | IDA-style sigmaker for code or raw bytes, auto-wildcards rel32/disp32, grows until unique, IDA / `\x..`+mask / byte-array / x64dbg / YARA output, saved to a catalog with a **health check** (re-scan every saved signature: same RVA / moved / multiple / broken, update moved ones in one click, export the report); **FLIRT** signature files (IDA `.sig`, versions 5-10) can be loaded and matched against the module, with the CRC of the function tail verified |
 | Pointers | Live pointer-chain resolver, bounded pointer scan whose results load straight into the resolver |
 | Call graph | The function under the cursor with its direct callees (from Echo's own disassembly) and the call sites that reference it; a module mode that draws the whole binary at once |
 | Xrefs | The whole reference graph of a module indexed in one pass: who points here, what this points at, and the most referenced addresses in the binary |
@@ -84,6 +84,7 @@ error; the MCP server, all views and the UI/UX are fully available for preview.
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported), 37 tools plus 6 prompts and 4 resources; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script |
+| Projects | Names, comments, bookmarks, saved signatures and the patch journal are stored per module as RVAs, so they survive ASLR rebases and restarts; export/import a project JSON file; when a module's build changes (size or PE timestamp), saved items are re-located by a signature made at save time, with matched/moved/lost counts |
 | Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
 | Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |
 
@@ -122,7 +123,7 @@ Requirements: Node 22+, Rust (stable, 1.90+), and on Windows the WebView2 runtim
 npm ci
 npm run tauri dev            # desktop app with hot reload
 npm run dev                  # UI only in a browser (needs a relay: cargo run -p echo-debug-relay --manifest-path src-tauri/Cargo.toml)
-npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, sessions)
+npm test                     # frontend unit tests (PE parser, sigmaker, strings, structs, CLR metadata, crypto, caves, entropy, sessions, projects)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 ```
