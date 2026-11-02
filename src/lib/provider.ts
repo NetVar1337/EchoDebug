@@ -53,6 +53,8 @@ import { useTypes } from "@/store/types";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 import { useMcp } from "@/store/mcp";
+import { scanModuleHooks } from "./hooklive";
+import { scanGrouped } from "./sigbatch";
 
 export type Args = Record<string, unknown>;
 export type Handler = (args: Args) => Promise<unknown>;
@@ -354,12 +356,9 @@ provide("ui_yara_scan", async (args) => {
 provide("ui_sig_health", async () => {
   const mods = modules();
   const main = pickModule({}).name;
-  const out = [];
-  for (const s of useSigs.getState().sigs) {
-    const hits = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern: s.ida, module: s.module || main, find_all: true }, true).catch(() => null);
-    const n = hits?.success ? hits.results.length : 0;
-    out.push({ name: s.name, module: s.module || main, ida: s.ida, hits: n, health: health(n), first: hits?.results?.[0] ? labelAddr(hits.results[0], mods) : null });
-  }
+  const sigs = useSigs.getState().sigs.map((s) => ({ ...s, module: s.module || main }));
+  const hits = await scanGrouped(sigs, 1);
+  const out = sigs.map((s, i) => ({ name: s.name, module: s.module, ida: s.ida, hits: hits[i].count, health: health(hits[i].count), first: hits[i].results[0] ? labelAddr(hits[i].results[0], mods) : null }));
   return { count: out.length, broken: out.filter((x) => x.health !== "ok").length, results: out };
 });
 
@@ -424,6 +423,26 @@ provide("ui_exports", async (args) => {
   const { m, img, base } = await moduleImage(args);
   const pe = parsePe(img);
   return { module: m.name, ...limitList(pe.exports.map((e) => ({ ...e, address: fmtAddr(base + BigInt(e.rva)) })), args, 5000) };
+});
+
+provide("ui_hook_scan", async (args) => {
+  const mods = args.module === "*" ? modules() : [pickModule(args)];
+  const out = [];
+  for (const m of mods) {
+    try {
+      const r = await scanModuleHooks(m, { file: args.file !== false });
+      const lab = (rva: number) => labelAddr(r.base + BigInt(rva), modules());
+      out.push({
+        module: m.name, file: r.file, file_error: r.fileError || undefined,
+        patches: r.patches.slice(0, 500).map((p) => ({ ...p, address: lab(p.rva), target: p.target === undefined ? undefined : labelAddr(p.target, modules()) })),
+        inline_hooks: r.inline.map((h) => ({ ...h, address: lab(h.rva), target: labelAddr(h.target, modules()) })),
+        iat_hooks: r.iat.filter((h) => h.severity === "high" || args.all).map((h) => ({ ...h, pointer: labelAddr(h.pointer, modules()) })),
+      });
+    } catch (e) {
+      out.push({ module: m.name, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return { modules: out, hooked: out.filter((x) => "patches" in x && ((x.patches?.length ?? 0) + (x.inline_hooks?.length ?? 0) + (x.iat_hooks?.length ?? 0)) > 0).map((x) => x.module) };
 });
 
 provide("ui_load_symbols", async (args) => {

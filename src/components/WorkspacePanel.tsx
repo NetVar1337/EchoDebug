@@ -9,6 +9,8 @@ import SignaturesView from "./views/SignaturesView";
 import PointersView from "./views/PointersView";
 import EmulatorView from "./views/EmulatorView";
 import EmuDebugView from "./views/EmuDebugView";
+import HooksView from "./views/HooksView";
+import MonitorsView from "./views/MonitorsView";
 import GraphView from "./views/GraphView";
 import DotnetView from "./views/DotnetView";
 import CryptoView from "./views/CryptoView";
@@ -39,6 +41,8 @@ const kViews: Record<TabId, () => JSX.Element> = {
   pointers: PointersView,
   emulator: EmulatorView,
   emudbg: EmuDebugView,
+  hooks: HooksView,
+  monitors: MonitorsView,
   graph: GraphView,
   dotnet: DotnetView,
   crypto: CryptoView,

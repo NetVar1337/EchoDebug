@@ -173,6 +173,13 @@ await step("emulated debugger steps classify and runs it to its return", async (
   await until(async () => (await page.locator("text=the function returned").count()) > 0);
 });
 
+await step("page monitor sees the counter's page change", async () => {
+  await tab("Monitors");
+  await page.locator('input[placeholder="address · module+0x…"]').last().fill(`e2e-target+${sym("counter")}`);
+  await page.locator("button.primary", { hasText: /^Watch$/ }).click();
+  await until(async () => (await page.locator("text=/[1-9][0-9]* changes/").count()) > 0, 15000);
+});
+
 await step("YARA matches the greeting", async () => {
   await tab("YARA");
   await page.locator("textarea").fill('rule greeting { strings: $g = "hello from the EchoDebug" condition: $g }');

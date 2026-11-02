@@ -3023,6 +3023,142 @@ void h_emu_close(json_obj@ r, int64 id)
     send_json(o);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Batch / bulk verbs: one round trip for work the app otherwise does with many small requests.
+// ---------------------------------------------------------------------------------------------
+
+const uint SIGB_MAX_PATTERNS = 512;
+const uint SIGB_MAX_HITS = 64;
+const uint64 DISFN_MAX_BYTES = 0x4000;
+const uint RF_MAX_FIELDS = 1024;
+
+uint64 module_or_main(const string &in mod)
+{
+    if (mod == "") return g_base;
+    return process::get_module_base(mod);
+}
+
+// sig_scan_batch: every IDA pattern scanned in Echo (process::find_signatures) in one request.
+void h_sig_scan_batch(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    string mod;
+    int64 max_hits = 16;
+    if (!opt_str(r, "module", "", mod) || !opt_int(r, "max_hits", 16, max_hits)) { bad_args(id, "module must be a string, max_hits a number"); return; }
+    if (!has_key(r, "patterns") || r.type("patterns") != json_type::array) { bad_args(id, "sig_scan_batch requires 'patterns' (array of IDA patterns)"); return; }
+    json_obj@ pats = r.get_obj("patterns");
+    if (pats.length() > SIGB_MAX_PATTERNS) { send_error(id, E_LIMIT, "limit exceeded", "at most 512 patterns"); return; }
+    if (max_hits < 1) max_hits = 1;
+    if (max_hits > SIGB_MAX_HITS) max_hits = SIGB_MAX_HITS;
+    uint64 base = module_or_main(mod);
+    if (base == 0) { send_error(id, E_FAILED, "module not found", mod); return; }
+    json_obj@ out = json::array();
+    for (uint i = 0; i < pats.length(); i++)
+    {
+        string p = pats.get_string_at(i);
+        json_obj@ e = json_obj();
+        e.set("pattern", p);
+        json_obj@ hits = json::array();
+        uint total = 0;
+        array<uint64>@ found = p == "" ? null : process::find_signatures(base, p);
+        if (found !is null)
+        {
+            total = found.length();
+            for (uint k = 0; k < found.length() && k < uint(max_hits); k++) hits.push(hex_addr(found[k]));
+        }
+        e.set("count", total);
+        e.set("results", hits);
+        out.push(e);
+    }
+    json_obj@ o = ok_reply("sig_scan_batch", id);
+    o.set("module_base", hex_addr(base));
+    o.set("results", out);
+    send_json(o);
+}
+
+// disasm_function: decode from `address` to the first ret (zydis::disasm_func), one read.
+void h_disasm_function(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    uint64 n = 0x1000;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "max_bytes", 0x1000, n)) { bad_args(id, "disasm_function requires 'address' (max_bytes optional)"); return; }
+    if (n == 0 || n > DISFN_MAX_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "max_bytes must be 1..16384"); return; }
+    array<uint8>@ b = process::read_bytes(a, uint(n));
+    if (b is null || b.length() == 0) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    array<disasm_insn@> insns;
+    bool complete = zydis::disasm_func(b, a, insns);
+    json_obj@ arr = json::array();
+    uint off = 0;
+    for (uint i = 0; i < insns.length(); i++)
+    {
+        json_obj@ x = json_obj();
+        x.set("address", hex_addr(a + off));
+        x.set("length", insns[i].length);
+        x.set("bytes", hex_of(b, off, insns[i].length));
+        x.set("text", insns[i].text);
+        arr.push(x);
+        off += insns[i].length;
+    }
+    json_obj@ o = ok_reply("disasm_function", id);
+    o.set("count", insns.length());
+    o.set("size", off);
+    o.set("complete", complete);
+    o.set("results", arr);
+    send_json(o);
+}
+
+// read_fields: many typed fields of one struct from a single process::read_buffer snapshot.
+void h_read_fields(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    uint64 size = 0;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "size", 0, size)) { bad_args(id, "read_fields requires 'address'"); return; }
+    if (!has_key(r, "fields") || r.type("fields") != json_type::array) { bad_args(id, "read_fields requires 'fields' ([{offset, type}])"); return; }
+    json_obj@ fs = r.get_obj("fields");
+    if (fs.length() > RF_MAX_FIELDS) { send_error(id, E_LIMIT, "limit exceeded", "at most 1024 fields"); return; }
+    // the snapshot covers every field (u64 width for the last one when size is not given)
+    for (uint i = 0; i < fs.length(); i++)
+    {
+        json_obj@ f = fs.get_obj_at(i);
+        uint64 off = 0;
+        if (f is null || !get_addr(f, "offset", off)) { bad_args(id, "each field needs a numeric offset"); return; }
+        if (off + 8 > size) size = off + 8;
+    }
+    if (size == 0 || size > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "fields must lie within 64 KiB"); return; }
+    memory_buffer@ mb = process::read_buffer(a, size);
+    if (mb is null) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    json_obj@ out = json::array();
+    for (uint i = 0; i < fs.length(); i++)
+    {
+        json_obj@ f = fs.get_obj_at(i);
+        uint64 off = 0;
+        get_addr(f, "offset", off);
+        string t = "u64";
+        opt_str(f, "type", "u64", t);
+        json_obj@ e = json_obj();
+        e.set("offset", off);
+        e.set("type", t);
+        if (t == "u8") e.set("value", util::format_string("{}", mb.read_uint8(off)));
+        else if (t == "u16") e.set("value", util::format_string("{}", mb.read_uint16(off)));
+        else if (t == "u32") e.set("value", util::format_string("{}", mb.read_uint32(off)));
+        else if (t == "i8") e.set("value", util::format_string("{}", mb.read_int8(off)));
+        else if (t == "i16") e.set("value", util::format_string("{}", mb.read_int16(off)));
+        else if (t == "i32") e.set("value", util::format_string("{}", mb.read_int32(off)));
+        else if (t == "i64") e.set("value", util::format_string("{}", mb.read_int64(off)));
+        else if (t == "f32") e.set("value", util::format_string("{}", mb.read_float(off)));
+        else if (t == "f64") e.set("value", util::format_string("{}", mb.read_double(off)));
+        else if (t == "ptr" || t == "u64") e.set("value", t == "ptr" ? hex_addr(mb.read_uint64(off)) : util::format_string("{}", mb.read_uint64(off)));
+        else { bad_args(id, "unknown field type: " + t + " (u8..u64, i8..i64, f32, f64, ptr)"); return; }
+        out.push(e);
+    }
+    json_obj@ o = ok_reply("read_fields", id);
+    o.set("address", hex_addr(a));
+    o.set("fields", out);
+    send_json(o);
+}
+
 // Re-points Echo's native memory server at the relay. The relay asks for this when its /agent
 // side has no connection but the agent is attached (e.g. after an app restart, the old
 // process::open_socket connection is dead and must be re-opened).
@@ -3227,6 +3363,9 @@ void on_message(string msg)
     else if (type == "watch_list") h_watch_list(r, id);
     else if (type == "read_typed") h_read_typed(r, id);
     else if (type == "region_stats") h_region_stats(r, id);
+    else if (type == "sig_scan_batch") h_sig_scan_batch(r, id);
+    else if (type == "disasm_function") h_disasm_function(r, id);
+    else if (type == "read_fields") h_read_fields(r, id);
     else send_error(id, E_UNKNOWN_VERB, "unknown verb", type);
 }
 

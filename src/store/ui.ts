@@ -6,7 +6,7 @@ export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg";
+  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -33,6 +33,8 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "rtti", label: "RTTI" },
   { id: "xrefs", label: "Xrefs" },
   { id: "antidebug", label: "Anti-Debug" },
+  { id: "hooks", label: "Hooks" },
+  { id: "monitors", label: "Monitors" },
   { id: "bindiff", label: "BinDiff" },
   { id: "unpack", label: "Unpack" },
   { id: "decrypt", label: "Decrypt" },

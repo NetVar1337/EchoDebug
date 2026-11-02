@@ -27,6 +27,7 @@ import { startUpdateLoop } from "@/store/update";
 import { Boundary } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
 import { startMcpPolicy } from "@/store/mcp";
+import { startMonitors } from "@/store/monitors";
 import ApprovalDialog from "@/components/ApprovalDialog";
 import { redo, undo } from "@/lib/history";
 import { startProjects } from "@/lib/projects";
@@ -44,6 +45,7 @@ export default function App() {
     void useConn.getState().init();
     startProvider();
     startMcpPolicy();
+    startMonitors();
     startProjects();
     startWorkspace();
     startAutoPatches();

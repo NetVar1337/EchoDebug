@@ -1,6 +1,5 @@
 // The process the end-to-end test attaches to: a counter, a switch, an XOR string routine.
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 volatile int counter = 100;
 volatile int mode = 0;
@@ -12,7 +11,9 @@ __attribute__((noinline)) int classify(int x) {
     case 1: return x + 11;
     case 2: return x - 5;
     case 3: return x ^ 0x5a;
-    case 4: return (int)strlen((const char *)buf);
+    // no libc call here: glibc's AVX2 strlen is not emulated by Unicorn, and the batch-decrypt
+    // step emulates through classify whenever counter & 7 == 4
+    case 4: return buf[0] + 4;
     case 5: return x << 2;
     case 6: return x >> 1;
     default: return -1;

@@ -26,6 +26,7 @@ pub mod local_emu;
 pub mod local_emudbg;
 pub mod local_ext;
 pub mod mcp;
+pub mod monitor;
 pub mod symbols;
 
 pub const DEFAULT_PORT: u16 = 47110;
@@ -148,6 +149,8 @@ struct Inner {
     token: Mutex<Option<String>>,
     /// what MCP clients may call (set by the app)
     policy: Mutex<mcp::Policy>,
+    /// module / page monitors (monitor.rs)
+    monitors: Mutex<monitor::Monitors>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -170,6 +173,7 @@ impl Relay {
             local_backend: AtomicBool::new(local::available()),
             token: Mutex::new(None),
             policy: Mutex::new(mcp::Policy::default()),
+            monitors: Mutex::new(monitor::Monitors::default()),
         }))
     }
 
@@ -177,6 +181,10 @@ impl Relay {
     pub fn with_token(self, token: Option<String>) -> Self {
         *self.0.token.lock().unwrap_or_else(|e| e.into_inner()) = token;
         self
+    }
+
+    pub(crate) fn monitors(&self) -> &Mutex<monitor::Monitors> {
+        &self.0.monitors
     }
 
     pub fn policy(&self) -> mcp::Policy {
@@ -286,6 +294,17 @@ impl Relay {
             "mcp_log" => {
                 let entries: Vec<Value> = self.0.mcp_log.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
                 return json!({ "type": "mcp_log_result", "id": orig, "success": true, "entries": entries });
+            }
+            // Monitors built on modules/read, so they work with every backend.
+            "module_monitor" | "page_monitor" | "module_timeline" | "page_monitor_list" => {
+                let mut v = match verb.as_str() {
+                    "module_monitor" => monitor::module_monitor(self, &req).await,
+                    "page_monitor" => monitor::page_monitor(self, &req).await,
+                    "module_timeline" => monitor::module_timeline(self),
+                    _ => monitor::page_monitor_list(self),
+                };
+                v["id"] = orig;
+                return v;
             }
             // The app's MCP policy: {mode, allow, deny, audit}; any omitted field keeps its value.
             "mcp_policy" => {
@@ -915,6 +934,10 @@ fn notifications_for(frame: &Value) -> Vec<Value> {
             note("notifications/resources/updated", json!({ "uri": "echodebug://target/modules" })),
         ],
         (Some("event"), Some("progress")) => vec![],
+        (Some("event"), Some(ev @ ("module_loaded" | "module_unloaded"))) => vec![
+            note("notifications/resources/updated", json!({ "uri": "echodebug://target/modules" })),
+            note("notifications/message", json!({ "level": "info", "logger": ev, "data": frame })),
+        ],
         (Some("event"), Some(ev)) => {
             let level = match frame["level"].as_str() {
                 Some("error") => "error",
