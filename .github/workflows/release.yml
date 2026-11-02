@@ -1,8 +1,9 @@
 name: Release
 
-# Every push to main that contains a feat/fix/perf/refactor/revert (or breaking) commit
-# bumps the version, tags it, builds the signed Windows installer and publishes a GitHub
-# release with latest.json, which the in-app updater polls.
+# Every push to main (a direct commit or a merged PR) bumps the version (feat -> minor,
+# breaking -> major, anything else -> patch), tags it, builds the signed Windows and Linux
+# bundles and publishes a GitHub release with latest.json, which the in-app updater polls.
+# The bot's own "chore(release)" commit carries [skip ci] and is skipped below, so it never loops.
 on:
   push:
     branches: [main]
@@ -46,7 +47,7 @@ jobs:
         run: |
           v=$(node scripts/next-version.mjs --notes "$RUNNER_TEMP/notes.md" ${BUMP:+--bump $BUMP})
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "next version: ${v:-<none, nothing releasable>}"
+          echo "next version: ${v:-<none, no commit since the last release>}"
         env:
           BUMP: ${{ inputs.bump }}
       - name: Bump, commit and tag

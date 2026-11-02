@@ -1,11 +1,11 @@
 // Decides the next semver from conventional commits since the last v* tag.
+// Every commit releases: feat -> minor, breaking -> major, anything else -> patch.
 // Usage: node scripts/next-version.mjs [--bump patch|minor|major] [--notes FILE]
-// Prints the next version, or nothing when no releasable commit landed.
+// Prints the next version, or nothing when there is no commit since the last release.
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const RELEASE_TYPES = { feat: "minor", fix: "patch", perf: "patch", refactor: "patch", revert: "patch" };
 const RANK = { none: 0, patch: 1, minor: 2, major: 3 };
 
 /** @param {{subject: string, body: string}[]} commits */
@@ -15,7 +15,7 @@ export function bumpFor(commits) {
     const m = /^(\w+)(\([^)]*\))?(!)?:/.exec(subject);
     let b = "none";
     if ((m && m[3]) || /^BREAKING[ -]CHANGE:/m.test(body)) b = "major";
-    else if (m && RELEASE_TYPES[m[1]]) b = RELEASE_TYPES[m[1]];
+    else b = m && m[1] === "feat" ? "minor" : "patch";
     if (RANK[b] > RANK[bump]) bump = b;
   }
   return bump;
@@ -34,13 +34,15 @@ export function applyBump(version, bump) {
 export function releaseNotes(commits) {
   const groups = { "Breaking changes": [], Features: [], Fixes: [], Other: [] };
   for (const { subject, body, sha } of commits) {
+    if (subject.startsWith("Merge ")) continue;   // the merged commits are listed themselves
     const m = /^(\w+)(\([^)]*\))?(!)?:\s*(.*)$/.exec(subject);
-    if (!m) continue;
-    const line = `- ${m[2] ? `**${m[2].slice(1, -1)}:** ` : ""}${m[4]} (${sha.slice(0, 7)})`;
-    if (m[3] || /^BREAKING[ -]CHANGE:/m.test(body)) groups["Breaking changes"].push(line);
-    else if (m[1] === "feat") groups.Features.push(line);
-    else if (m[1] === "fix") groups.Fixes.push(line);
-    else if (RELEASE_TYPES[m[1]]) groups.Other.push(line);
+    const line = m
+      ? `- ${m[2] ? `**${m[2].slice(1, -1)}:** ` : ""}${m[4]} (${sha.slice(0, 7)})`
+      : `- ${subject} (${sha.slice(0, 7)})`;
+    if ((m && m[3]) || /^BREAKING[ -]CHANGE:/m.test(body)) groups["Breaking changes"].push(line);
+    else if (m && m[1] === "feat") groups.Features.push(line);
+    else if (m && m[1] === "fix") groups.Fixes.push(line);
+    else groups.Other.push(line);
   }
   return Object.entries(groups)
     .filter(([, l]) => l.length)
