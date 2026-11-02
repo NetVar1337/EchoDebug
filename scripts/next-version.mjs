@@ -1,5 +1,6 @@
 // Decides the next semver from conventional commits since the last v* tag.
-// Every commit releases: feat -> minor, breaking -> major, anything else -> patch.
+// Every commit releases as a patch (0.7.0 -> 0.7.1); only a breaking change (`feat!:` or a
+// BREAKING CHANGE footer) goes up a level, which before 1.0 is the minor number.
 // Usage: node scripts/next-version.mjs [--bump patch|minor|major] [--notes FILE]
 // Prints the next version, or nothing when there is no commit since the last release.
 import { execSync } from "node:child_process";
@@ -13,9 +14,7 @@ export function bumpFor(commits) {
   let bump = "none";
   for (const { subject, body } of commits) {
     const m = /^(\w+)(\([^)]*\))?(!)?:/.exec(subject);
-    let b = "none";
-    if ((m && m[3]) || /^BREAKING[ -]CHANGE:/m.test(body)) b = "major";
-    else b = m && m[1] === "feat" ? "minor" : "patch";
+    const b = (m && m[3]) || /^BREAKING[ -]CHANGE:/m.test(body) ? "major" : "patch";
     if (RANK[b] > RANK[bump]) bump = b;
   }
   return bump;

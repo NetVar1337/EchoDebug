@@ -1,7 +1,7 @@
 name: Release
 
-# Every push to main (a direct commit or a merged PR) bumps the version (feat -> minor,
-# breaking -> major, anything else -> patch), tags it, builds the signed Windows and Linux
+# Every push to main (a direct commit or a merged PR) bumps the patch version (only a breaking
+# change bumps minor while we are pre-1.0), tags it, builds the signed Windows and Linux
 # bundles and publishes a GitHub release with latest.json, which the in-app updater polls.
 # The bot's own "chore(release)" commit carries [skip ci] and is skipped below, so it never loops.
 on:

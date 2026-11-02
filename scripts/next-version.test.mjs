@@ -9,7 +9,7 @@ test("bump type from conventional commits", () => {
   assert.equal(bumpFor([c("docs: readme"), c("chore: deps")]), "patch");
   assert.equal(bumpFor([c("Merge pull request #1 from x/y")]), "patch");
   assert.equal(bumpFor([c("fix(ui): crash")]), "patch");
-  assert.equal(bumpFor([c("fix: a"), c("feat(scanner): b")]), "minor");
+  assert.equal(bumpFor([c("fix: a"), c("feat(scanner): b")]), "patch");
   assert.equal(bumpFor([c("feat!: new protocol")]), "major");
   assert.equal(bumpFor([c("fix: x", "BREAKING CHANGE: y")]), "major");
 });
