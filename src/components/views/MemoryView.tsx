@@ -134,7 +134,7 @@ export default function MemoryView() {
         <div className="list-col" style={{ overflow: "auto", display: showRegions ? "flex" : "none" }}>
           <Regions onPick={go} />
         </div>
-        <div className="list-col" style={{ borderRight: "none" }}>
+        <div className="list-col" style={{ borderRight: "none", gridColumn: 2 }}>
           <div className="toolbar">
             <IconButton tip="Regions" onClick={() => setShowRegions(!showRegions)}><MapIcon size={14} /></IconButton>
             <CommitInput value={ui.memoryAt ?? ""} placeholder="address · module+0x…" onCommit={go} width={260} />
