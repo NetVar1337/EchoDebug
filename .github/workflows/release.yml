@@ -159,12 +159,12 @@ jobs:
           set -e
           cd src-tauri/target/release/bundle
           ls appimage deb
+          # Tauri v2 signs the AppImage directly: updater artifact = <name>.AppImage + .AppImage.sig
           APPIMAGE=$(ls appimage/*.AppImage | head -1)
-          TARBALL=$(ls appimage/*.AppImage.tar.gz | head -1)
-          SIG="$TARBALL.sig"
+          SIG="$APPIMAGE.sig"
           DEB=$(ls deb/*.deb | head -1)
-          gh release upload "v$VERSION" "$APPIMAGE" "$TARBALL" "$SIG" "$DEB" --clobber
+          gh release upload "v$VERSION" "$APPIMAGE" "$SIG" "$DEB" --clobber
           cd "$GITHUB_WORKSPACE"
           gh release download "v$VERSION" --pattern latest.json --dir .
-          node scripts/merge-latest-json.mjs latest.json "src-tauri/target/release/bundle/$SIG" "$VERSION" "$(basename "$TARBALL")"
+          node scripts/merge-latest-json.mjs latest.json "src-tauri/target/release/bundle/$SIG" "$VERSION" "$(basename "$APPIMAGE")"
           gh release upload "v$VERSION" latest.json --clobber
