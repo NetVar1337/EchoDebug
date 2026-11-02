@@ -25,7 +25,7 @@
 //   * Freeze entries keep the bytes that were at the address before freezing; they are restored
 //     on detach, on target exit and in on_unload (Echo docs: undo target modifications on unload).
 
-const string AGENT_VERSION = "0.5.0";
+const string AGENT_VERSION = "0.6.0";
 const int RELAY_PORT = 47110;
 const string AUTO_ATTACH = "";   // optional process name to attach on load
 
