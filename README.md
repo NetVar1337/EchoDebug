@@ -6,6 +6,17 @@ A Windows reverse-engineering workbench with Reverse-Slap's interface, the featu
 Reverse-Slap and AiDA Private, and **Echo's hypervisor as its only backend**. It ships no kernel
 driver, no mapper and no injected DLL. All process access goes through Echo's Universal API.
 
+![EchoDebug workbench: modules, value scanner, disassembly and inspector](docs/screenshots/workbench.webp)
+
+<table>
+  <tr>
+    <td><a href="docs/screenshots/memory.webp"><img src="docs/screenshots/memory.webp" alt="Memory hex view" /></a></td>
+    <td><a href="docs/screenshots/strings.webp"><img src="docs/screenshots/strings.webp" alt="Strings view with regex filter" /></a></td>
+    <td><a href="docs/screenshots/settings.webp"><img src="docs/screenshots/settings.webp" alt="Settings" /></a></td>
+  </tr>
+  <tr align="center"><td>Memory</td><td>Strings</td><td>Settings</td></tr>
+</table>
+
 > [!WARNING]
 > Use EchoDebug only on software and systems you own or are authorized to test. Memory writes and
 > freezes can crash the target.
