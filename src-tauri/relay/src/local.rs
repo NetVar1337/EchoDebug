@@ -175,7 +175,13 @@ static STATE: Mutex<Option<LocalState>> = Mutex::new(None);
 
 /// The local backend exists on Linux only; on Windows the Echo agent is the backend.
 pub fn available() -> bool {
-    std::env::consts::OS == "linux"
+    // ECHODEBUG_LOCAL_BACKEND=1 forces the local backend on (tests simulate Linux on any host);
+    // =0 forces it off.
+    match std::env::var("ECHODEBUG_LOCAL_BACKEND") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        _ => std::env::consts::OS == "linux",
+    }
 }
 
 fn with_state<R>(f: impl FnOnce(&mut LocalState) -> R) -> Option<R> {

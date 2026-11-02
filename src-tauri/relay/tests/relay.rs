@@ -15,7 +15,7 @@ use tower::ServiceExt;
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start() -> (SocketAddr, Relay) {
-    let relay = Relay::new("1.2.3", Duration::from_secs(5));
+    let relay = Relay::new("1.2.3", Duration::from_secs(5)).with_local_backend(false);
     let listener = bind(0).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(run(listener, relay.clone()));
@@ -493,4 +493,41 @@ async fn mcp_prompts_resources_and_call_log() {
     assert!(r["prompts"].as_array().unwrap().len() >= 6);
     assert!(r["resources"].as_array().unwrap().len() >= 4);
     assert!(r["tools"].as_u64().unwrap() >= 30);
+}
+
+// Linux-only: with the local backend enabled and no Echo upstream, the relay serves verbs
+// from /proc itself — attach to our own pid, then list modules.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_backend_serves_verbs_without_upstream() {
+    let relay = Relay::new("1.2.3", Duration::from_secs(5)).with_local_backend(true);
+    let listener = bind(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(listener, relay.clone()));
+    let mut client = client_when(addr, false, false).await;
+
+    // native verb without attach -> local "not attached" (1001), not 2001
+    send(&mut client, json!({ "type": "ping", "id": 1 })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 1).await;
+    assert_eq!(r["code"], 1001, "{r}");
+
+    // attach to ourselves via the local backend
+    let me = std::process::id();
+    send(&mut client, json!({ "type": "attach", "id": 2, "pid": me })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 2).await;
+    assert_eq!(r["type"], "attach_result");
+    assert_eq!(r["success"], true);
+    assert_eq!(r["pid"], me);
+
+    // modules of our own process via /proc/pid/maps
+    send(&mut client, json!({ "type": "modules", "id": 3 })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 3).await;
+    assert_eq!(r["type"], "modules_result");
+    assert!(r["modules"].as_array().unwrap().len() > 0, "own process has modules: {r}");
+
+    // status reports the local backend
+    send(&mut client, json!({ "type": "status", "id": 4 })).await;
+    let r = recv_until(&mut client, |v| v["type"] == "status_result").await;
+    assert_eq!(r["backend"], "local");
+    assert_eq!(r["local"], true);
 }

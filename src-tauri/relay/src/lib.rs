@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, TcpListener};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -116,6 +116,8 @@ struct Inner {
     shared: Mutex<Shared>,
     events: broadcast::Sender<String>,
     mcp_log: Mutex<VecDeque<Value>>,
+    /// serve verbs from /proc when no Echo upstream is connected (Linux default; tests turn it off)
+    local_backend: AtomicBool,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -135,7 +137,14 @@ impl Relay {
             shared: Mutex::new(Shared::default()),
             events: broadcast::channel(1024).0,
             mcp_log: Mutex::new(VecDeque::new()),
+            local_backend: AtomicBool::new(local::available()),
         }))
+    }
+
+    /// Builder: enable/disable the local /proc backend (default: on for Linux, off elsewhere).
+    pub fn with_local_backend(self, on: bool) -> Self {
+        self.0.local_backend.store(on, Ordering::Relaxed);
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -232,7 +241,7 @@ impl Relay {
         };
         let Some((conn, up_tx)) = upstream else {
             // No Echo upstream: on Linux the relay serves the verbs itself from /proc.
-            if local::available() {
+            if self.0.local_backend.load(Ordering::Relaxed) && local::available() {
                 return match kind {
                     Kind::Agent => local::handle_native(self, req, &orig).await
                         .unwrap_or_else(|| error(orig.clone(), 2001, "echo memory server not connected")),
