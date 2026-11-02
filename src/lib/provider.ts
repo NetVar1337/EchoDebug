@@ -52,6 +52,7 @@ import { pointerClassifier } from "./ptrkind";
 import { useTypes } from "@/store/types";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
+import { useMcp } from "@/store/mcp";
 
 export type Args = Record<string, unknown>;
 export type Handler = (args: Args) => Promise<unknown>;
@@ -389,6 +390,40 @@ provide("ui_resources", async (args) => {
   const { m, img } = await moduleImage(args);
   const r = summarizeResources(img);
   return { module: m.name, version: r.version, manifest: r.manifest, strings: r.strings.slice(0, 2000), dialogs: r.dialogs, icons: r.icons.length, resources: r.leaves.length };
+});
+
+// MCP policy "ask": the relay asks before running a call that changes the target.
+provide("ui_approve", (args) => new Promise((resolve) => {
+  useMcp.getState().enqueue({
+    tool: String(args.tool ?? "?"), verb: String(args.verb ?? ""),
+    args: (args.arguments && typeof args.arguments === "object" ? args.arguments : {}) as Record<string, unknown>,
+    resolve: (approved) => resolve({ approved }),
+  });
+}));
+
+// Resource templates and completion (echodebug://names, memory/{address}/{size}, disasm/{address}, module/{name}/exports).
+provide("ui_names", async () => ({
+  names: useNames.getState().names.map((n) => ({ address: fmtAddr(toBig("0x" + n.address)), label: labelAddr(toBig("0x" + n.address), modules()), name: n.name, comment: n.comment })),
+}));
+
+provide("ui_read_text", async (args) => {
+  const a = addrArg(args);
+  const size = num(args, "size", 256, 0x10000);
+  const b = await readBytes(a, size);
+  if (!b) throw new Error(`${fmtAddr(a)}: not readable`);
+  return { address: fmtAddr(a), label: labelAddr(a, modules()), size: b.length, data: b };
+});
+
+provide("ui_disasm_text", async (args) => {
+  const a = addrArg(args);
+  const r = await request<{ results: { address: string; bytes: string; text: string }[] }>("disassemble", { address: fmtAddr(a), size: num(args, "size", 256, 0x4000) });
+  return { address: fmtAddr(a), label: labelAddr(a, modules()), results: r.results };
+});
+
+provide("ui_exports", async (args) => {
+  const { m, img, base } = await moduleImage(args);
+  const pe = parsePe(img);
+  return { module: m.name, ...limitList(pe.exports.map((e) => ({ ...e, address: fmtAddr(base + BigInt(e.rva)) })), args, 5000) };
 });
 
 provide("ui_load_symbols", async (args) => {

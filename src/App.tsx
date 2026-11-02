@@ -26,6 +26,8 @@ import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
 import { Boundary } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
+import { startMcpPolicy } from "@/store/mcp";
+import ApprovalDialog from "@/components/ApprovalDialog";
 import { redo, undo } from "@/lib/history";
 import { startProjects } from "@/lib/projects";
 import { applyLayout, startWorkspace } from "@/lib/workspace";
@@ -41,6 +43,7 @@ export default function App() {
     log("info", "app", `EchoDebug v${useConn.getState().appVersion}${isTauri() ? "" : " (browser mode)"}`);
     void useConn.getState().init();
     startProvider();
+    startMcpPolicy();
     startProjects();
     startWorkspace();
     startAutoPatches();
@@ -133,6 +136,7 @@ export default function App() {
       {ui.settingsOpen && <Boundary><SettingsModal /></Boundary>}
       {ui.gotoOpen && <GotoDialog />}
       {ui.paletteOpen && <CommandPalette />}
+      <ApprovalDialog />
     </div>
   );
 }
