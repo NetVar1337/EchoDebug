@@ -81,9 +81,41 @@ plus the Linux-only verbs below. Only `reopen_socket` and the conditional alerts
 | `dbg_continue` / `dbg_pause` | – | `state` (steps over a breakpoint under rip first) |
 | `dbg_step` | `tid?` | `tid`, `from`, `address`, `regs`. A thread blocked in a system call only finishes the step when the call returns: the step is cancelled with an explanation instead of hanging |
 | `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base) |
+| `dbg_all_regs` | – | `threads:[{tid, regs}]`, `was_running` (stops the session for the read if it was running, then resumes) |
 
 Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause", "tid", "address", "regs", "slot?", "watch?", "signal?" }`
 and `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`.
+
+### Threads, call stacks, handles (relay)
+
+Echo's script API has no thread enumeration, thread context or handle access, so these verbs are
+served by the relay: on the Linux local backend (`local_threads.rs`), and on Windows when no Echo agent
+is connected (`win_threads.rs`, `pid` argument or the attached target). **While the Echo agent is
+connected they fail with code `2006`** ("the Echo backend can't list threads, call stacks or handles").
+
+| verb | request | reply |
+|---|---|---|
+| `threads` | `stacks?` (bool, default false), `registers?` (default true; false lists without stopping anything), `max_frames?` (default 64, ≤ 512), `pid?` (Windows) | `pid`, `platform` (`linux`\|`windows`), `registers_from` (`ptrace`\|`debugger`\|`GetThreadContext`), `threads:[{tid, name?, main?, state, state_name, wait?, priority, nice? \| base_priority?, time_ms, start?, start_label?, start_source?, teb? (Windows), tls? (Linux fs_base), rip?, rsp?, registers?, registers_error?, suspend_count? (Windows), frames?}]` |
+| `stack` | `tid` (Linux default: the main thread), `max_frames?`, `pid?` (Windows) | `tid`, `registers`, `registers_from`, `frames` |
+| `handles` | `pid?` (Windows) | `handles:[…]`: Linux `{handle (fd), type (file\|socket\|pipe\|device\|eventfd\|epoll\|…), name (link target), position, flags:[O_*]}` from `/proc/<pid>/fd` + `fdinfo`; Windows `{handle, type (object type name), name?, access, object, attributes}` from `SystemExtendedHandleInformation`, `truncated` |
+
+A frame is `{index, address, sp, module, offset, symbol, symbol_offset, method, guessed}`. `method` says
+how the frame was recovered from the one below it: `context` (the thread's registers), `pdata` (PE
+`.pdata` + UNWIND_INFO, interpreted like `RtlVirtualUnwind`: all UWOP codes, chained info, machine
+frames, the prolog offset and `ret` / tail-call epilogs), `leaf` (PE function without unwind data),
+`cfi` (ELF `.eh_frame` through `PT_GNU_EH_FRAME`, DWARF CFA programs and expressions), or the
+fallbacks `frame-pointer` and `stack-scan` (a return address preceded by a `call`), which set
+`guessed: true`. Symbols are the nearest export (PE, bounded by the `.pdata` function) or ELF
+`.symtab`/`.dynsym` entry; the app shows the user's names first.
+
+How registers are read: on Linux every thread is `PTRACE_SEIZE`d, `PTRACE_INTERRUPT`ed, read with
+`GETREGS`, unwound while still stopped, then detached (signals that arrived meanwhile are re-delivered);
+while a `dbg_*` session owns the threads, the registers come from it (`dbg_all_regs`). On Windows each
+thread is `SuspendThread`ed, read with `GetThreadContext`, unwound and `ResumeThread`ed. Thread start
+addresses: Windows `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and the TEB from
+`ThreadBasicInformation`; Linux the entry point (`AT_ENTRY`) for the main thread and, for the others,
+the outermost frame below glibc's `start_thread` / `clone3` on the unwound stack. Nothing is written to
+the target.
 
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
@@ -285,6 +317,17 @@ Annotation verbs (MCP tools without the `ui_` prefix) read and change the app's 
 | `ui_revert_patch` (`revert_patch`) | `patch_id` | `patch_id`, `address`, `restored` (the app writes `before` back via `write`, then marks the patch reverted) |
 | `ui_list_signatures` (`list_signatures`) | – | `signatures:[{id,name,module,ida,address,hits,note}]` |
 
+Module tables read from the loaded image (every backend):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_tls_callbacks` (`tls_callbacks`) | `module?` | `directory` (raw data range, index, callbacks array), `callbacks:[{index,address,label,name?,section,executable,inModule}]` |
+| `ui_exception_handlers` (`exception_handlers`) | `module?`, `limit?` (default 2000) | `functions_with_unwind_info`, `chained_fragments`, `handler_routines:[{address,name,kind,functions}]`, `functions:[{function,end,flags,handler,handler_name,kind,handler_data,scopes?:[{try_begin,try_end,kind:"except"\|"finally",filter?,target?,finally?}],scopes_heuristic?}]`, `vectored_handlers` (why they are not listed) |
+
+Vectored exception handlers are not listed: ntdll keeps them in the private `LdrpVectorHandlerList`
+with pointers encoded by `RtlEncodePointer` (a per-process cookie), so they cannot be enumerated reliably
+without undocumented internals.
+
 `/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
 WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
 (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere; created with mode 0600);
@@ -359,7 +402,8 @@ The tool set covers the whole backend: process control (`status`, `list_processe
 `detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,
 `memory_regions`), analysis (`disassemble`, `enumerate_functions`, `signature_scan`,
 `signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
-`resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
+`resolve_export`, `peb_walk`), threads (`list_threads`, `thread_stack`, `list_handles`,
+`tls_callbacks`, `exception_handlers`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
 `value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
 watching (`watch_add`, `watch_remove`, `list_watched`), alerts (`alert_add`,
 `alert_remove`, `alert_list`),

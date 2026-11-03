@@ -97,6 +97,28 @@ async fn routes_native_and_ext_with_id_rewrite() {
     assert_eq!(reply["id"], 0);
 }
 
+/// Echo exposes no thread / handle APIs: with the agent connected the relay says so (2006) instead of
+/// forwarding, and the MCP tools are read-only.
+#[tokio::test]
+async fn thread_verbs_with_echo_say_unsupported() {
+    let (addr, relay) = start().await;
+    let _ext = connect(addr, "/ext").await;
+    let mut client = client_when(addr, false, true).await;
+    for (i, verb) in ["threads", "stack", "handles"].iter().enumerate() {
+        send(&mut client, json!({ "type": verb, "id": i, "tid": 1 })).await;
+        let r = recv_until(&mut client, |v| v["id"] == i).await;
+        assert_eq!(r["code"], 2006, "{r}");
+        assert!(r["message"].as_str().unwrap().contains("Echo backend can't"), "{r}");
+    }
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    for name in ["list_threads", "thread_stack", "list_handles", "tls_callbacks", "exception_handlers"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+        assert_eq!(t["annotations"]["destructiveHint"], false, "{t}");
+    }
+}
+
 #[tokio::test]
 async fn missing_upstreams_fail_immediately() {
     let (addr, _) = start().await;
