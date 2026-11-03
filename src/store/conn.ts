@@ -2,7 +2,7 @@
 import { create } from "zustand";
 import { client, request, type Frame } from "@/lib/client";
 import { hexDump, type Module } from "@/lib/hex";
-import { hostOs, relayInfo, type RelayInfo } from "@/lib/tauri";
+import { hostOs, regenerateToken, relayInfo, type RelayInfo } from "@/lib/tauri";
 import { clearImages } from "@/lib/memory";
 import { log } from "./output";
 import pkg from "../../package.json";
@@ -43,6 +43,8 @@ type ConnStore = {
   refreshModules: () => Promise<void>;
   attach: (by: { name?: string; pid?: number }) => Promise<void>;
   detach: () => Promise<void>;
+  /** desktop app: new token; MCP clients must be re-added with it */
+  regenerateToken: () => Promise<void>;
 };
 
 let started = false;
@@ -51,6 +53,12 @@ const eventListeners = new Set<(f: Frame) => void>();
 export function onAgentEvent(l: (f: Frame) => void): () => void {
   eventListeners.add(l);
   return () => eventListeners.delete(l);
+}
+
+/** `claude mcp add` command for this relay, with the bearer token header. */
+export function mcpAddCommand(port: number, token: string): string {
+  const header = token ? ` --header "Authorization: Bearer ${token}"` : "";
+  return `claude mcp add --transport http echodebug http://127.0.0.1:${port}/mcp${header}`;
 }
 
 function targetFrom(f: Frame): Target | null {
@@ -139,6 +147,13 @@ export const useConn = create<ConnStore>((set, get) => ({
   detach: async () => {
     await request("detach");
     set({ target: null, modules: [] });
+  },
+
+  regenerateToken: async () => {
+    const token = await regenerateToken();
+    client.setToken(token);
+    set({ token });
+    log("info", "mcp", "token regenerated; re-add MCP clients with the new header");
   },
 }));
 

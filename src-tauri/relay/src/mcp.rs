@@ -5,14 +5,15 @@ use std::io::Write;
 
 use serde_json::{json, Map, Value};
 
-/// Verbs that change the target process (memory, threads, execution).
-const DESTRUCTIVE: &[&str] = &["write", "freeze", "freeze_group"];
+/// Verbs that change the target process (memory, threads, execution). `ui_revert_patch` writes the
+/// journalled original bytes back through the app window.
+const DESTRUCTIVE: &[&str] = &["write", "freeze", "freeze_group", "ui_revert_patch"];
 /// Verbs that change state but not the target's memory: attach/detach, execution control, files.
 const STATEFUL: &[&str] = &[
     "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
     "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
     "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
-    "ptr_save", "cancel", "agent_config",
+    "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.
@@ -24,7 +25,7 @@ pub fn annotations(verb: &str, title: &str) -> Value {
         "readOnlyHint": !destructive && !stateful,
         "destructiveHint": destructive,
         // the same write twice leaves the same bytes; attach/detach twice too
-        "idempotentHint": destructive || matches!(verb, "attach" | "detach" | "dbg_detach" | "watch" | "unwatch"),
+        "idempotentHint": destructive || matches!(verb, "attach" | "detach" | "dbg_detach" | "watch" | "unwatch" | "ui_set_name" | "ui_set_comment"),
         "openWorldHint": verb == "ui_load_symbols",
     })
 }
@@ -208,6 +209,13 @@ mod tests {
         assert_eq!(annotations("attach", "a")["readOnlyHint"], false);
         assert_eq!(annotations("attach", "a")["destructiveHint"], false);
         assert_eq!(annotations("ui_load_symbols", "s")["openWorldHint"], true);
+        // the app window's annotation tools
+        assert_eq!(annotations("ui_list_names", "n")["readOnlyHint"], true);
+        assert_eq!(annotations("ui_list_signatures", "s")["readOnlyHint"], true);
+        let set = annotations("ui_set_name", "n");
+        assert_eq!((set["readOnlyHint"].as_bool(), set["destructiveHint"].as_bool(), set["idempotentHint"].as_bool()), (Some(false), Some(false), Some(true)));
+        assert_eq!(annotations("ui_set_comment", "c")["readOnlyHint"], false);
+        assert_eq!(annotations("ui_revert_patch", "r")["destructiveHint"], true);
     }
 
     #[test]
@@ -222,6 +230,11 @@ mod tests {
         assert_eq!(decide(&p, "disassemble", "disassemble"), Decision::Allow);
         assert_eq!(decide(&p, "emu_step", "emu_step"), Decision::Allow);
         assert!(matches!(decide(&p, "dump_module", "dump"), Decision::Deny(_)));
+        // reverting a patch writes target memory; naming only touches EchoDebug's own stores
+        assert!(matches!(decide(&p, "revert_patch", "ui_revert_patch"), Decision::Deny(_)));
+        assert_eq!(decide(&p, "set_name", "ui_set_name"), Decision::Allow);
+        p.mode = "ask".into();
+        assert_eq!(decide(&p, "revert_patch", "ui_revert_patch"), Decision::Ask);
         p.mode = "allow".into();
         p.deny = vec!["dump_module".into()];
         assert!(matches!(decide(&p, "dump_module", "dump"), Decision::Deny(_)));

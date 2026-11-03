@@ -94,7 +94,7 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back; register-change traces with a step slider, xmm/ymm registers and the regions mapped during the run |
 | Debugger (Linux) | ptrace: attach every thread, int3 and hardware (DR0-DR3) breakpoints, step, continue, pause, registers with editing, breakpoint bytes hidden from reads |
 | Script | Async JavaScript against an `ed` API (verbs, memory, journaled writes, names, disassembly, every app analysis), saved scripts |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …), 13 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …) and tools that read and set your names and comments, list and revert journalled patches and list saved signatures, 16 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script. **Module projects** keep names, comments and bookmarks per module build (by RVA) and restore them on the next attach, wherever ASLR puts the module; when a module's build changes, its saved items are **re-located** by a signature made per name and bookmark (Names panel → Sign), with matched / moved / lost counts, and project exports also carry the signature catalog; panel sizes, the last place in each view and (optionally) the last target are restored on start; a target switcher in the Targets panel |
 | MCP policy | Settings in the MCP panel: allow everything, **ask** (an Allow/Deny dialog in the window for writes, freezes and dumps) or read-only, plus allow/deny tool lists, an optional audit file (`mcp-audit.jsonl`) and JSONL export. Tools carry MCP annotations and structured output; resource templates (`echodebug://memory/{address}/{size}`, `module/{name}/exports`, …) and argument completion are supported |
@@ -124,6 +124,8 @@ The MCP Server panel shows this command with your token filled in. The relay lis
 only, requires the token on `/client` and `/mcp` (stored in `<config>/EchoDebug/relay-token`;
 `ECHODEBUG_TOKEN` overrides it, `ECHODEBUG_AUTH=0` turns the check off) and rejects browser origins
 other than the app's own, so other programs and web pages cannot reach your target's memory.
+**Regenerate token** (Settings or the MCP Server panel) replaces the stored token; the relay switches
+at once and MCP clients must be re-added with the new command.
 
 For stdio clients: `claude mcp add echodebug -- echodebug-relay --stdio`.
 
@@ -134,9 +136,13 @@ notifications answered with `202`; `GET /mcp` with `Accept: text/event-stream` s
 and agent events; a `tools/call` with a `progressToken` streams scan progress). Prompts:
 `explain_function`, `find_pattern`, `find_string`, `pointer_path`, `scan_value`, `triage_module`,
 `find_vtable`, `make_signature`, `diff_snapshots`, `unpack_module`, `decrypt_strings`,
-`deobfuscate_function`, `devirtualize`. Resources:
+`deobfuscate_function`, `devirtualize`, `find_value_references`, `rebuild_class`,
+`update_signatures_after_patch`. Resources:
 `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`, `echodebug://target/modules`. Tools
-named `ui_*` run in the app window; with only the headless relay they answer with a clear error.
+named `ui_*` and the annotation tools (`list_names`, `set_name`, `list_comments`, `set_comment`,
+`list_patches`, `revert_patch`, `list_signatures`) run in the app window; with only the headless relay
+they answer with a clear error. `revert_patch` writes target memory, so the ask / read-only policy
+applies to it.
 
 ## Development
 

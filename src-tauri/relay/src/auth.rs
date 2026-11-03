@@ -58,16 +58,23 @@ pub fn load_or_create(path: &std::path::Path) -> io::Result<String> {
         }
     }
     let t = new_token()?;
+    store(path, &t)?;
+    Ok(t)
+}
+
+/// Writes `token` to `path` (creating the directory), readable by the current user only. Used on
+/// first start and when the app regenerates the token.
+pub fn store(path: &std::path::Path, token: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(path, &t)?;
+    fs::write(path, token)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    Ok(t)
+    Ok(())
 }
 
 /// The token the app and the headless relay use: `ECHODEBUG_TOKEN`, else the stored one.

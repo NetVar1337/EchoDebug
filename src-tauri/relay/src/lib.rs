@@ -68,8 +68,14 @@ static PROMPTS: LazyLock<Vec<Value>> = LazyLock::new(|| {
         "arguments": [{ "name": "target", "description": "0x-prefixed hex address to reach", "required": true }, { "name": "max_depth", "description": "Pointer depth 1-5, default 3" }] },
       { "name": "scan_value", "description": "Walk a Cheat-Engine-style value scan: first scan, then narrow with changed/increased/decreased until few candidates remain.",
         "arguments": [{ "name": "value_type", "description": "u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bytes string wstring", "required": true }, { "name": "value", "description": "Value to search for on the first scan", "required": true }] },
-      { "name": "triage_module", "description": "Read a module's PE headers, imports and sections from live memory and flag what deserves a second look.",
+      { "name": "triage_module", "description": "Read a module's PE headers, sections (with entropy) and imports from live memory, run anti-debug and crypto-constant scans, and flag what deserves a second look.",
         "arguments": [{ "name": "module", "description": "Module name", "required": true }] },
+      { "name": "find_value_references", "description": "Locate a value in memory with the value scanner, then find what points at it: static pointer paths, absolute pointers and the code around them.",
+        "arguments": [{ "name": "value_type", "description": "u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 bytes string wstring", "required": true }, { "name": "value", "description": "Current value to search for", "required": true }] },
+      { "name": "rebuild_class", "description": "Rebuild a C++ class sketch from a live object: RTTI name and bases, vtable slots, field offsets used by the virtual functions and typed reads of the object.",
+        "arguments": [{ "name": "address", "description": "0x-prefixed address of a live object (its first qword is the vtable)", "required": true }, { "name": "size", "description": "Bytes of the object to inspect, default 0x200" }] },
+      { "name": "update_signatures_after_patch", "description": "Re-scan the user's saved signatures after a game update, report which still match, moved or broke, and propose replacements for the broken ones.",
+        "arguments": [{ "name": "module", "description": "Module to scan; default each signature's own module" }] },
       { "name": "find_vtable", "description": "Find the vtable of a C++ class by name and list its virtual functions.",
         "arguments": [{ "name": "class", "description": "Class name, e.g. CPlayer", "required": true }, { "name": "module", "description": "Module name; default main executable" }] },
       { "name": "make_signature", "description": "Build a unique, update-resistant byte signature for the function at an address and verify it.",
@@ -186,8 +192,13 @@ impl Relay {
 
     /// Builder: require this token on `/client` and `/mcp` (see `auth`). `None` disables auth.
     pub fn with_token(self, token: Option<String>) -> Self {
-        *self.0.token.lock().unwrap_or_else(|e| e.into_inner()) = token;
+        self.set_token(token);
         self
+    }
+
+    /// Replaces the token at runtime (the app's "Regenerate token"). Open sockets stay connected.
+    pub fn set_token(&self, token: Option<String>) {
+        *self.0.token.lock().unwrap_or_else(|e| e.into_inner()) = token;
     }
 
     pub(crate) fn monitors(&self) -> &Mutex<monitor::Monitors> {
@@ -957,10 +968,13 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 /// Renders a prompt's `messages` with the caller's arguments substituted.
 fn prompt_messages(prompt: &Value, args: &Value) -> Value {
-    let text = |name: &str, tmpl: &str| -> Value {
+    // Substitutes every declared argument; ones the caller left out read "(not given)".
+    let text = |_: &str, tmpl: &str| -> Value {
         let mut t = tmpl.to_owned();
-        if let Some(a) = args.get(name).and_then(|v| v.as_str()) {
-            t = t.replace(&format!("{{{{{name}}}}}"), a);
+        for a in prompt["arguments"].as_array().into_iter().flatten() {
+            let name = a["name"].as_str().unwrap_or_default();
+            let value = args.get(name).and_then(Value::as_str).unwrap_or("(not given)");
+            t = t.replace(&format!("{{{{{name}}}}}"), value);
         }
         json!({ "role": "user", "content": { "type": "text", "text": t } })
     };
@@ -976,8 +990,15 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
             "Find static pointer chains that reach {{target}}: run a pointer scan with max_depth {{max_depth}} (default 3), take the first module-rooted result, verify it with the chain resolver, and report module+offset and the offsets array.")],
         "scan_value" => vec![text("value",
             "Run a value scan of type {{value_type}} for {{value}}: first scan with compare 'exact' (or 'unknown' if the value is not known yet), then narrow with changed/increased/decreased/unchanged scans until under 50 candidates remain. Report the surviving addresses and their current values.")],
+        // Tool names are in backticks; a unit test checks each one exists in tools.json.
         "triage_module" => vec![text("module",
-            "Triage the module {{module}}: read its PE headers (sections, imports with IAT addresses, exports), compute per-section entropy from live memory, list suspicious imports (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread,NtProtectVirtualMemory, IsDebuggerPresent, …) with their call sites, and check for INT 2D / VMCALL / PEB-read anti-debug patterns. Summarize the findings.")],
+            "Triage the module {{module}}. 1) `list_modules` for its base and size. 2) `read_memory` 0x1000 bytes at the base and parse the DOS/NT headers, section table and data directories; follow the import and export directories with more `read_memory` calls. 3) For each section, `read_memory` its bytes (in chunks up to 1 MiB) and compute Shannon entropy; flag sections above 7.2 (packed/encrypted) and writable+executable sections (`query_region` on each). 4) Suspicious imports (VirtualAllocEx, WriteProcessMemory, CreateRemoteThread, NtProtectVirtualMemory, IsDebuggerPresent, CheckRemoteDebuggerPresent, NtQueryInformationProcess): find their IAT slots, then call sites with `signature_scan` for 'FF 15 ?? ?? ?? ??' and `resolve_relative` (offset 2, inst_size 6) to see which hits target those slots. 5) Anti-debug: `signature_scan` with find_all for 'CD 2D' (INT 2D), '0F 01 C1' (VMCALL), '65 48 8B 04 25 60 00 00 00' (PEB via gs:[60]), '0F 31' (RDTSC); `string_scan` for debugger names (x64dbg, ollydbg, ida, cheat engine). 6) Crypto: `signature_scan` for '63 7C 77 7B F2 6B 6F C5' (AES S-box), '98 2F 8A 42 91 44 37 71' (SHA-256 K), '67 E6 09 6A 85 AE 67 BB' (SHA-256 H), '78 A4 6A D7 56 B7 C7 E8' (MD5 T), '96 30 07 77 2C 61 0E EE' (CRC-32 table), and `string_scan` for 'expand 32-byte k' (ChaCha/Salsa). `disassemble` around interesting hits. Summarize per category with module+0xRVA addresses and label the key sites with `set_name`.")],
+        "find_value_references" => vec![text("value",
+            "Find what references the {{value_type}} value {{value}}. 1) `value_scan_first` with compare 'exact'; while more than ~20 candidates remain, ask the user to change the value in the target and narrow with `value_scan_next` (exact/changed/increased/decreased), reading the survivors with `value_scan_results`. 2) For each surviving address: `query_region` to see where it lives, then `pointer_scan` with it as target and verify the best module-rooted results with `pointer_chain`. 3) Find absolute pointers to it: `signature_scan` with find_all for its 8 little-endian address bytes, and for each hit `disassemble` 64 bytes before it if it lies in code. 4) Report the stable pointer paths as module+offset plus offsets, the code sites that touch the value, and name the confirmed address with `set_name` (check `list_names` first so existing user names are reused). Call `value_scan_clear` when done.")],
+        "rebuild_class" => vec![text("address",
+            "Rebuild the C++ class of the object at {{address}} (inspect {{size}} bytes; default 0x200). 1) `rtti_resolve` on {{address}} for the class name, base classes and vtable; if it fails, `read_memory` 8 bytes for the vtable pointer. 2) `read_memory` the vtable (8 bytes per slot) until a slot leaves the module's executable range (`query_region`); `list_names` to reuse names the user gave those functions. 3) `disassemble` 0x100 bytes of each virtual function and collect the [rcx+offset] accesses with their operand sizes and the call targets (`enumerate_functions` for function bounds). 4) `read_memory` the object and decode candidate fields with `read_typed` (pointers, floats, ints, strings); `rtti_resolve_batch` the qwords that look like pointers to identify member objects. 5) Output a C++ class sketch: inheritance from RTTI, a commented vtable listing slot index, address and inferred purpose, and fields with offset comments, type and a guessed name. Offer to store the names with `set_name` and notes with `set_comment`.")],
+        "update_signatures_after_patch" => vec![text("module",
+            "Update the user's saved signatures after a patch (module override: {{module}}). 1) `list_signatures` for the catalog (name, module, IDA pattern, original address, previous hit count). 2) `list_modules` to get each module's new base. 3) For each signature, `signature_scan` its IDA pattern with find_all in its module. Classify: OK (exactly one hit, same RVA), MOVED (one hit at a new RVA; give old and new RVA), AMBIGUOUS (several hits), BROKEN (no hit). 4) For each BROKEN or AMBIGUOUS one: `disassemble` around its old address and around candidates found by scanning a shorter prefix of the pattern, decide where the function went, then build a new signature like the sigmaker does: take the instruction bytes from `read_memory`, wildcard rel32/disp32 operands and immediates that look like addresses, and grow it one instruction at a time until `signature_scan` reports exactly one hit. 5) Report a table: name, status, old RVA, new RVA, old pattern, proposed pattern. Do not modify the catalog yourself; the user re-saves the proposals from the Signatures view.")],
         "find_vtable" => vec![text("class",
             "Find the vtable of the C++ class {{class}} (module: {{module}}): call ui_rtti_classes to list the module's classes, pick the one whose name matches, then disassemble the first instructions of each virtual function and summarize what each one does.")],
         "make_signature" => vec![text("address",
@@ -1119,7 +1140,9 @@ async fn client_ws(
 }
 
 fn upstream_ws(relay: Relay, kind: Kind, headers: &HeaderMap, ws: WebSocketUpgrade) -> Response {
-    // Echo connects without an Origin; anything with one is a browser page.
+    // Echo connects without an Origin; anything with one is a browser page. No token here: Echo's
+    // `process::open_socket(url)` and the agent's `ws::connect` dial a fixed URL baked into the agent
+    // script, and upstreams only answer requests the relay sends them (they cannot drive tools).
     if headers.contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -1410,6 +1433,19 @@ pub async fn serve(port: u16, app_version: String) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompts_reference_only_known_tools() {
+        for p in PROMPTS.iter() {
+            let msgs = prompt_messages(p, &json!({}));
+            let text = msgs["messages"][0]["content"]["text"].as_str().unwrap();
+            assert!(!text.contains("{{"), "{text}");
+            // backticked words are tool names: odd-indexed pieces of a split on '`'
+            for name in text.split('`').skip(1).step_by(2) {
+                assert!(TOOLS.iter().any(|t| t["name"] == name), "prompt {} names unknown tool `{name}`", p["name"]);
+            }
+        }
+    }
 
     #[test]
     fn origins() {

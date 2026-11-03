@@ -273,11 +273,25 @@ registers with `{ "type":"provide", "verbs":[...] }` on its `/client` socket. Th
 `{ "type":"provider_reply", "call":<n>, "verb", "result":{...} }` or `{ ..., "error":"..." }`. Without an app
 window the call fails with code `2005`. Status frames carry `"provider": bool`.
 
+Annotation verbs (MCP tools without the `ui_` prefix) read and change the app's own stores:
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_list_names` (`list_names`) | – | `names:[{address,name}]` |
+| `ui_set_name` (`set_name`) | `address` (0x hex), `name` (empty removes) | `address`, `name` |
+| `ui_list_comments` (`list_comments`) | – | `comments:[{address,comment}]` |
+| `ui_set_comment` (`set_comment`) | `address`, `comment` (empty removes) | `address`, `comment` |
+| `ui_list_patches` (`list_patches`) | – | `patches:[{id,address,written,before,note,created,reverted}]` |
+| `ui_revert_patch` (`revert_patch`) | `patch_id` | `patch_id`, `address`, `restored` (the app writes `before` back via `write`, then marks the patch reverted) |
+| `ui_list_signatures` (`list_signatures`) | – | `signatures:[{id,name,module,ida,address,hits,note}]` |
+
 `/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
 WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
 (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere; created with mode 0600);
 `ECHODEBUG_TOKEN` overrides it and `ECHODEBUG_AUTH=0` disables the check. `/agent`, `/ext` and `/health`
-stay open (Echo cannot send headers; those endpoints only receive requests).
+stay open (Echo cannot send headers; those endpoints only receive requests). The desktop app can
+regenerate the stored token (Settings or the MCP Server panel); the running relay switches to it at once
+(`Relay::set_token`), already-open sockets stay connected, and MCP clients must be re-added.
 
 ## Versioning
 
@@ -299,7 +313,7 @@ Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (wit
 **Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],
 "deny":[tool], "audit":bool }` (omitted fields keep their value; the reply echoes the policy and
 `audit_path`). Deny and allow lists apply to every tool. `ask` and `readonly` gate the calls that change
-the target (`write`, `freeze`) and `dump`: `readonly` refuses them, `ask` sends the app window a
+the target (`write`, `freeze`, `ui_revert_patch`) and `dump`: `readonly` refuses them, `ask` sends the app window a
 `ui_approve` provider call (`tool`, `verb`, `arguments` → `approved: bool`) and refuses when no window
 answers. Refusals are tool errors with code `4003`; the call log records `outcome: ok | error | denied`.
 With `audit` on, every call is appended to `<config>/EchoDebug/mcp-audit.jsonl`; `mcp_audit_export` returns
@@ -332,7 +346,10 @@ Prompts (`prompts/get` returns ready-to-use user messages with arguments substit
 `pointer_path` (target, max_depth?), `scan_value` (value_type, value), `triage_module` (module),
 `find_vtable` (class, module?), `make_signature` (address), `diff_snapshots` (address, size?),
 `unpack_module` (module), `decrypt_strings` (address), `deobfuscate_function` (address, end?),
-`devirtualize` (address, max_insns?).
+`devirtualize` (address, max_insns?), `find_value_references` (value_type, value), `rebuild_class`
+(address, size?), `update_signatures_after_patch` (module?). Arguments the caller leaves out read
+"(not given)". Prompt texts name tools in backticks; a relay unit test checks that every one of them
+exists in `src/lib/tools.json`.
 
 Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
 `echodebug://target/modules` (fails when no memory server is connected). Module monitor events also send

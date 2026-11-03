@@ -20,6 +20,11 @@ export async function relayInfo(): Promise<RelayInfo> {
   return invoke<RelayInfo>("relay_info");
 }
 
+/** New per-install MCP/relay token (desktop app only). */
+export async function regenerateToken(): Promise<string> {
+  return invoke<string>("regenerate_token");
+}
+
 /** Host OS of the desktop app ("windows" | "linux" | "macos" | …); "browser" outside Tauri. */
 export async function hostOs(): Promise<string> {
   if (!isTauri()) return "browser";

@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use echo_debug_relay::{Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
+use echo_debug_relay::{auth, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
 use serde::Serialize;
 use tauri::Manager;
 
@@ -11,7 +12,8 @@ const AGENT_PORT_LINE: &str = "const int RELAY_PORT = 47110;";
 struct RelayState {
     port: u16,
     error: Option<String>,
-    token: Option<String>,
+    relay: Relay,
+    token: Mutex<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -55,8 +57,27 @@ fn relay_info(state: tauri::State<'_, RelayState>) -> RelayInfo {
     RelayInfo {
         port: state.port,
         error: state.error.clone(),
-        token: state.token.clone(),
+        token: state.token.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     }
+}
+
+/// Replaces the stored relay token (`auth::token_path`) and the running relay's; MCP clients
+/// must be re-added with the new header. Open sockets stay up.
+#[tauri::command]
+fn regenerate_token(state: tauri::State<'_, RelayState>) -> Result<String, String> {
+    let mut cur = state.token.lock().unwrap_or_else(|e| e.into_inner());
+    if cur.is_none() {
+        return Err("relay authentication is off (ECHODEBUG_AUTH=0)".into());
+    }
+    if std::env::var("ECHODEBUG_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
+        return Err("the token comes from ECHODEBUG_TOKEN; change that variable instead".into());
+    }
+    let token = auth::new_token().map_err(|e| e.to_string())?;
+    let path = auth::token_path();
+    auth::store(&path, &token).map_err(|e| format!("write {}: {e}", path.display()))?;
+    state.relay.set_token(Some(token.clone()));
+    *cur = Some(token.clone());
+    Ok(token)
 }
 
 /// Host OS ("windows", "linux", "macos", …) so the UI can gate Windows-only Echo features.
@@ -127,23 +148,21 @@ pub fn run() {
                 .unwrap_or(DEFAULT_PORT);
             let version = app.package_info().version.to_string();
             // Every /client and /mcp request must carry this token (see relay/src/auth.rs).
-            let token = match echo_debug_relay::auth::default_token() {
+            let token = match auth::default_token() {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("relay token unavailable ({e}); using a per-run token");
-                    echo_debug_relay::auth::new_token().ok()
+                    auth::new_token().ok()
                 }
             };
-            let relay_token = token.clone();
+            let relay = Relay::new(version, DEFAULT_TIMEOUT).with_token(token.clone());
             // A busy port must not kill the app: the UI shows the error from relay_info.
             let error = match echo_debug_relay::bind(port) {
                 Ok(listener) => {
                     port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                    let relay = relay.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) =
-                            echo_debug_relay::run(listener, Relay::new(version, DEFAULT_TIMEOUT).with_token(relay_token))
-                                .await
-                        {
+                        if let Err(e) = echo_debug_relay::run(listener, relay).await {
                             eprintln!("relay stopped: {e}");
                         }
                     });
@@ -164,11 +183,12 @@ pub fn run() {
             } else {
                 eprintln!("host os '{}': skipping Echo agent install (Windows-only); local /proc backend active", std::env::consts::OS);
             }
-            app.manage(RelayState { port, error, token });
+            app.manage(RelayState { port, error, relay, token: Mutex::new(token) });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             relay_info,
+            regenerate_token,
             host_os,
             install_agent,
             scripts_dir,

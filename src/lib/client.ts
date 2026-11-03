@@ -36,6 +36,11 @@ class Client {
     this.open();
   }
 
+  /** Token for the next (re)connect after a regeneration; the open socket stays authorized. */
+  setToken(token: string | null): void {
+    this.url = this.url.split("?")[0] + (token ? `?token=${encodeURIComponent(token)}` : "");
+  }
+
   private open(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;

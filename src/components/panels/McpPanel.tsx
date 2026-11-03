@@ -4,7 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, Download, Play, RefreshCw } from "lucide-react";
 import tools from "@/lib/tools.json";
 import { request } from "@/lib/client";
-import { useConn } from "@/store/conn";
+import { isTauri } from "@/lib/tauri";
+import { mcpAddCommand, useConn } from "@/store/conn";
 import { attempt, log as outLog } from "@/store/output";
 import { parseList, useMcp, type PolicyMode } from "@/store/mcp";
 import { saveText } from "@/lib/save";
@@ -43,7 +44,7 @@ export default function McpPanel() {
   };
   const endpoint = `http://127.0.0.1:${c.port}/mcp`;
   const authHeader = c.token ? `Authorization: Bearer ${c.token}` : "";
-  const addCmd = `claude mcp add --transport http echodebug ${endpoint}${c.token ? ` --header "${authHeader}"` : ""}`;
+  const addCmd = mcpAddCommand(c.port, c.token);
 
   const loadMeta = async () => {
     const m = await attempt("mcp_meta", request<Meta>("mcp_meta"));
@@ -107,6 +108,12 @@ export default function McpPanel() {
             <div className="label" style={{ marginTop: 6 }}>Auth header (other clients)</div>
             <CopyChip text={authHeader} copied={copied} onCopy={copy} />
             <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>The relay rejects <span className="mono">/client</span> and <span className="mono">/mcp</span> requests without this token, so other programs on this machine cannot reach the target's memory. Keep it private.</div>
+            {isTauri() && (
+              <div className="row" style={{ marginTop: 4 }}>
+                <span className="faint grow" style={{ fontSize: 12 }}>Regenerating locks out MCP clients until they are re-added with the new command.</span>
+                <button className="btn" onClick={() => void attempt("token", c.regenerateToken())}>Regenerate token</button>
+              </div>
+            )}
           </>
         ) : (
           <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>Relay authentication is off (<span className="mono">ECHODEBUG_AUTH=0</span>): any local program can use the relay.</div>
