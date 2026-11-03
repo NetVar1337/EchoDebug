@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { RefreshCw, Search, Unplug } from "lucide-react";
 import { request } from "@/lib/client";
 import { useConn } from "@/store/conn";
-import { attempt } from "@/store/output";
+import { attempt, log } from "@/store/output";
+import { useUi } from "@/store/ui";
 import { IconButton, Panel } from "../ui";
 
 type Proc = { pid: number; name: string; path: string; memory: number };
@@ -12,6 +13,7 @@ export default function TargetsPanel() {
   const [procs, setProcs] = useState<Proc[]>([]);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState<number | null>(null);
+  const recentLower = useUi((s) => s.recentTargets).map((n) => n.toLowerCase());
 
   const load = async () => {
     const r = await attempt("processes", request<{ processes: Proc[] }>("processes"));
@@ -23,18 +25,31 @@ export default function TargetsPanel() {
 
   const shown = useMemo(() => {
     const f = filter.toLowerCase();
-    return f ? procs.filter((p) => p.name.toLowerCase().includes(f) || String(p.pid).includes(f)) : procs;
-  }, [procs, filter]);
+    // without a filter, hide processes with no user memory (kernel threads): they cannot be attached
+    const list = f ? procs.filter((p) => p.name.toLowerCase().includes(f) || String(p.pid).includes(f)) : procs.filter((p) => p.memory > 0 || !procs.some((q) => q.memory > 0));
+    // processes you attached to before come first
+    const rank = (p: Proc) => { const i = recentLower.indexOf(p.name.toLowerCase()); return i < 0 ? 99 : i; };
+    return [...list].sort((a, b) => rank(a) - rank(b));
+  }, [procs, filter, recentLower.join("|")]);
 
   const attach = async (p: Proc) => {
     setBusy(p.pid);
     await attempt("attach", c.attach({ pid: p.pid, name: p.name }));
     setBusy(null);
   };
+  const recent = useUi((s) => s.recentTargets);
+  /** One target is attached at a time (Echo and the local backend hold a single process): switching detaches first. */
+  const switchTo = async (name: string) => {
+    const list = procs.length ? procs : ((await request<{ processes: Proc[] }>("processes").catch(() => null))?.processes ?? []);
+    const p = list.find((x) => x.name.toLowerCase() === name.toLowerCase());
+    if (!p) return log("warn", "targets", `${name} is not running`);
+    if (c.target) await attempt("detach", c.detach());
+    await attach(p);
+  };
 
   return (
     <Panel
-      title={<>Targets <span className="faint">{procs.length} processes</span></>}
+      title={<>Targets <span className="faint">{shown.length === procs.length ? `${procs.length} processes` : `${shown.length} of ${procs.length}`}</span></>}
       actions={
         <>
           {c.target && <IconButton tip="Detach" onClick={() => void attempt("detach", c.detach())}><Unplug size={14} /></IconButton>}
@@ -42,23 +57,46 @@ export default function TargetsPanel() {
         </>
       }
     >
+      {recent.length > 0 && (
+        <div className="panel-section">
+          <div className="label">Switch target</div>
+          <div className="row wrap">
+            {recent.map((n) => (
+              <button key={n} className="pill" data-active={c.target?.name?.toLowerCase() === n.toLowerCase()} disabled={busy !== null || c.target?.name?.toLowerCase() === n.toLowerCase()} onClick={() => void switchTo(n)} title={`detach and attach ${n}; names and places come back from its module projects`}>{n}</button>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="panel-section">
         <div className="row"><span className="dot" data-state={c.relay ? "ok" : "bad"} /> Relay {c.relay ? "running" : "offline"}{c.relayError && <span className="danger"> · {c.relayError}</span>}</div>
-        <div className="row"><span className="dot" data-state={c.ext ? "ok" : "bad"} /> Agent {c.ext ? `v${c.extVersion}` : "not loaded"}</div>
-        <div className="row"><span className="dot" data-state={c.agent ? "ok" : "bad"} /> Memory server {c.agent ? "connected" : "waiting for attach"}</div>
-        {!c.ext && <div className="faint" style={{ fontSize: 12 }}>Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>.</div>}
-        <label className="search"><Search size={13} /><input placeholder="Filter processes…" value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
+        {c.os === "windows" ? (
+          <>
+            <div className="row"><span className="dot" data-state={c.ext ? "ok" : "bad"} /> Agent {c.ext ? `v${c.extVersion}` : "not loaded"}</div>
+            <div className="row"><span className="dot" data-state={c.agent ? "ok" : "bad"} /> Memory server {c.agent ? "connected" : "waiting for attach"}</div>
+            {!c.ext && <div className="faint" style={{ fontSize: 12 }}>Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>.</div>}
+          </>
+        ) : (
+          <>
+            <div className="row"><span className="dot" data-state={c.backend === "local" ? "ok" : "warn"} /> Backend {c.backend === "local" ? "local /proc (Linux)" : "none — attach below"}</div>
+            <details className="faint" style={{ fontSize: 12 }}>
+              <summary>How the Linux backend works</summary>
+              The Echo agent is Windows-only. On Linux the relay reads the attached process via <span className="mono">/proc/&lt;pid&gt;/mem</span> (same user, or <span className="mono">ptrace_scope=0</span>); freeze, watch, pointer scan, Unicorn emulation, exports, the loader's module list, Itanium RTTI and a ptrace debugger all run locally.
+            </details>
+          </>
+        )}
+        <label className="search"><Search size={13} /><input placeholder="Filter processes…" value={filter} onChange={(e) => setFilter(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && shown.length === 1) void attach(shown[0]); }} title="Enter attaches when one process matches" /></label>
       </div>
       <div className="panel-body">
         <table className="table">
-          <colgroup><col style={{ width: 62 }} /><col /><col style={{ width: 64 }} /></colgroup>
-          <thead><tr><th>PID</th><th>Name</th><th /></tr></thead>
+          <colgroup><col style={{ width: 62 }} /><col /><col style={{ width: 58 }} /><col style={{ width: 64 }} /></colgroup>
+          <thead><tr><th>PID</th><th>Name</th><th title="resident memory">Mem</th><th /></tr></thead>
           <tbody>
             {shown.map((p) => (
               <tr key={p.pid} data-selected={c.target?.pid === p.pid} onDoubleClick={() => void attach(p)} title={p.path}>
                 <td className="mono dim">{p.pid}</td>
-                <td>{p.name}</td>
-                <td><button className="row-action" disabled={!c.ext || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
+                <td className="ellipsis">{recentLower.includes(p.name.toLowerCase()) && <span className="accent" title="attached before">★ </span>}{p.name}</td>
+                <td className="mono dim">{p.memory ? (p.memory >= 1 << 30 ? `${(p.memory / (1 << 30)).toFixed(1)}G` : `${Math.round(p.memory / (1 << 20))}M`) : ""}</td>
+                <td><button className="row-action" disabled={(!c.ext && !c.localAvailable) || busy !== null} onClick={() => void attach(p)}>{busy === p.pid ? "…" : "Attach"}</button></td>
               </tr>
             ))}
           </tbody>

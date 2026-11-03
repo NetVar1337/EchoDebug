@@ -1,8 +1,9 @@
 name: Release
 
-# Every push to main that contains a feat/fix/perf/refactor/revert (or breaking) commit
-# bumps the version, tags it, builds the signed Windows installer and publishes a GitHub
-# release with latest.json, which the in-app updater polls.
+# Every push to main (a direct commit or a merged PR) bumps the patch version (only a breaking
+# change bumps minor while we are pre-1.0), tags it, builds the signed Windows and Linux
+# bundles and publishes a GitHub release with latest.json, which the in-app updater polls.
+# The bot's own "chore(release)" commit carries [skip ci] and is skipped below, so it never loops.
 on:
   push:
     branches: [main]
@@ -34,6 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Latest main, not the triggering sha: runs are serialised, so a newer push may
+          # already be on main and the bump commit must fast-forward onto it
+          ref: main
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -43,7 +47,7 @@ jobs:
         run: |
           v=$(node scripts/next-version.mjs --notes "$RUNNER_TEMP/notes.md" ${BUMP:+--bump $BUMP})
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "next version: ${v:-<none, nothing releasable>}"
+          echo "next version: ${v:-<none, no commit since the last release>}"
         env:
           BUMP: ${{ inputs.bump }}
       - name: Bump, commit and tag
@@ -91,7 +95,9 @@ jobs:
           {
             echo "body<<__NOTES__"
             cat notes/notes.md
-            printf '\n\n**Echo agent:** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
+            printf '\n\n**Install (Windows):** run `EchoDebug_%s_x64-setup.exe` (per-user, no admin) or `EchoDebug_%s_x64_en-US.msi` (per-machine). Both update themselves.' "$VERSION" "$VERSION"
+            printf '\n\n**Install (Ubuntu/Linux):** `EchoDebug_%s_amd64.deb` installs with `sudo dpkg -i` / the Software app; `EchoDebug_%s_amd64.AppImage` runs as is. Both update themselves (the .deb asks for your password to install). On Linux the app previews the full UI and talks MCP; process memory comes from a local `/proc` backend (the Echo agent is Windows-only).\n' "$VERSION" "$VERSION"
+            printf '\n\n**Echo agent (Windows):** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
             echo "__NOTES__"
           } >> "$GITHUB_OUTPUT"
       - uses: tauri-apps/tauri-action@v0
@@ -106,8 +112,63 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # NSIS installs update through NSIS, MSI installs through MSI (latest.json carries both)
+          updaterJsonPreferNsis: true
       - name: Attach Echo agent script
         shell: bash
         run: gh release upload "v$VERSION" agent/echo_debug.as --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Ubuntu/.deb + AppImage, both signed. The updater only installs the format the app was
+  # installed as, so latest.json gets linux-x86_64-deb and linux-x86_64-appimage entries.
+  build-linux:
+    needs: [version, build]
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.version.outputs.version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - run: npm ci
+      - run: npm run build
+      - name: Build .deb and AppImage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          npx tauri build --bundles appimage,deb
+          # createUpdaterArtifacts signs the AppImage; sign the .deb too if the bundler did not
+          for deb in target/release/bundle/deb/*.deb; do [ -f "$deb.sig" ] || npx tauri signer sign "$deb"; done
+        working-directory: src-tauri
+      - name: Upload Linux artifacts and extend latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd src-tauri/target/release/bundle
+          ls appimage deb
+          # updater artifacts are the bundles themselves, each with a .sig next to it
+          APPIMAGE=$(ls appimage/*.AppImage | head -1)
+          DEB=$(ls deb/*.deb | head -1)
+          gh release upload "v$VERSION" "$APPIMAGE" "$APPIMAGE.sig" "$DEB" "$DEB.sig" --clobber
+          cd "$GITHUB_WORKSPACE"
+          gh release download "v$VERSION" --pattern latest.json --dir .
+          B=src-tauri/target/release/bundle
+          node scripts/merge-latest-json.mjs latest.json "$VERSION" "$B/$APPIMAGE" "$B/$DEB"
+          gh release upload "v$VERSION" latest.json --clobber
