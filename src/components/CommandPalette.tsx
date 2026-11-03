@@ -89,6 +89,7 @@ export default function CommandPalette() {
       { id: "watch", label: "Open watchlist", group: "Target", run: () => ui.setRail("watch") },
       { id: "names", label: "Open names & comments", group: "Target", run: () => ui.setRail("names") },
       { id: "mcp", label: "Open MCP server panel", group: "Target", run: () => ui.setRail("mcp") },
+      { id: "sync", label: "Open disassembler sync (IDA / Ghidra / Binary Ninja)", group: "Target", run: () => ui.setRail("sync") },
       { id: "export", label: "Export session to file", group: "Session", run: () => ui.set({ sessionExportOpen: true }) },
       { id: "undo", label: "Undo last name / comment / type edit", group: "Session", hint: "Ctrl+Z", run: () => log("info", "edit", `undo: ${undo() ?? "nothing"}`) },
       { id: "redo", label: "Redo", group: "Session", hint: "Ctrl+Y", run: () => log("info", "edit", `redo: ${redo() ?? "nothing"}`) },

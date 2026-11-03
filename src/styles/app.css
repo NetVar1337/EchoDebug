@@ -408,3 +408,7 @@ html[data-motion="off"] *::after {
 .vtrace { display: flex; flex-wrap: wrap; gap: 3px; max-height: 160px; overflow: auto; }
 .vtrace .pill { padding: 0 5px; font-size: 11px; }
 .toolbar.wrap { flex-wrap: wrap; height: auto; padding-top: 6px; padding-bottom: 6px; }
+
+/* Sync panel */
+.sync-peer { display: flex; flex-direction: column; gap: 3px; padding: 4px 0; border-bottom: 1px solid var(--border-soft); }
+.sync-peer:last-of-type { border-bottom: none; }

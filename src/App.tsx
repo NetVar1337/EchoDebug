@@ -22,6 +22,7 @@ import { Boundary, Lazy } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
 import { startMcpPolicy } from "@/store/mcp";
 import { startMonitors } from "@/store/monitors";
+import { startSync } from "@/store/sync";
 import ApprovalDialog from "@/components/ApprovalDialog";
 import { redo, undo } from "@/lib/history";
 import { startProjects } from "@/lib/projects";
@@ -40,6 +41,7 @@ const kLeft = {
   watch: lazy(() => import("@/components/panels/WatchPanel")),
   names: lazy(() => import("@/components/panels/NamesPanel")),
   mcp: lazy(() => import("@/components/panels/McpPanel")),
+  sync: lazy(() => import("@/components/panels/SyncPanel")),
 };
 const SettingsModal = lazy(() => import("@/components/SettingsModal"));
 
@@ -59,6 +61,7 @@ export default function App() {
     startProvider();
     startMcpPolicy();
     startMonitors();
+    startSync();
     startProjects();
     startWorkspace();
     startAutoPatches();
