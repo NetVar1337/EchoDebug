@@ -1048,7 +1048,8 @@ fn rpc_error(id: Value, code: i32, message: String) -> Value {
 
 fn processes() -> Vec<Value> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
+    // sysinfo 0.40: creating the System can fail (no /proc access, …)
+    let Ok(mut sys) = System::new() else { return Vec::new() };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
