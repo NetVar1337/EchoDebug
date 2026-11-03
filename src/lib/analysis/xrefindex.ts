@@ -5,7 +5,7 @@
 // this builds the whole graph in one pass so the UI can list both directions
 // and draw the callers of a function.
 import { isElf } from "./elf";
-import { parsePe, type PeInfo } from "./pe";
+import { parsePe, scanBudget, type PeInfo } from "./pe";
 
 export type XrefKind = "call" | "jmp" | "jcc" | "rip";
 
@@ -46,9 +46,11 @@ export function buildXrefIndex(img: Uint8Array, ranges: readonly { rva: number; 
     else from.set(x.fromRva, [x]);
   };
 
+  const take = scanBudget(img.length);
   for (const r of ranges) {
     const start = r.rva;
     const end = Math.min(img.length, r.rva + r.size);
+    if (!take(start, end)) continue;
     for (let i = start; i + 5 <= end; i++) {
       const b = img[i];
       // call rel32 / jmp rel32

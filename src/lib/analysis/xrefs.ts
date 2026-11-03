@@ -1,4 +1,5 @@
 // byte-level reference finder: rel32 call/jmp/jcc and RIP-relative disp32 operands
+import { scanBudget } from "./pe";
 
 export type Xref = { rva: number; kind: "call" | "jmp" | "jcc" | "rip" };
 export type Range = { rva: number; size: number };
@@ -13,9 +14,11 @@ export function findXrefs(img: Uint8Array, ranges: readonly Range[], target: num
       out.push({ rva, kind });
     }
   };
+  const take = scanBudget(img.length);
   for (const r of ranges) {
     const end = Math.min(img.length - 4, r.rva + r.size);
-    for (let i = r.rva; i < end && out.length < limit; i++) {
+    if (!take(r.rva, end)) continue;
+    for (let i = Math.max(0, r.rva); i < end && out.length < limit; i++) {
       const b = img[i];
       if ((b === 0xe8 || b === 0xe9) && i + 5 <= img.length && i + 5 + dv.getInt32(i + 1, true) === target) {
         push(i, b === 0xe8 ? "call" : "jmp");

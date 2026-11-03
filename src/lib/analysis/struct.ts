@@ -21,7 +21,7 @@ export function layout(fields: readonly Field[]): { offset: number; size: number
 export function fieldValue(buf: Uint8Array, off: number, t: FieldType): string {
   if (t.startsWith("hex")) {
     const n = kFieldSizes[t];
-    if (off + n > buf.length) return "??";
+    if (off < 0 || off + n > buf.length) return "??";
     let s = "";
     for (let i = n - 1; i >= 0; i--) s += buf[off + i].toString(16).padStart(2, "0").toUpperCase();
     return s;

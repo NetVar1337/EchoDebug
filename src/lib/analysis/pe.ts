@@ -26,6 +26,28 @@ const kDirNames = [
   "GlobalPtr", "TLS", "LoadConfig", "BoundImport", "IAT", "DelayImport", "CLR", "Reserved",
 ];
 const kMaxNames = 100_000;
+/** Cap on imported functions across all descriptors (descriptors may share one thunk array). */
+const kMaxImports = 100_000;
+/** mapPeFile refuses a SizeOfImage above this, and above kImageRatio x the file size (min. kImageFloor). */
+const kMaxImage = 1 << 30;
+const kImageRatio = 16;
+const kImageFloor = 16 << 20;
+
+/**
+ * Budget for scans that walk every section (or every range derived from them) of a `len`-byte
+ * buffer. Section headers can overlap, and a hostile table repeats one image-sized section
+ * thousands of times; `take(start, end)` is false once the ranges handed out would cover more
+ * than twice the buffer, so such scans stay linear. Valid images never overlap and never hit it.
+ */
+export function scanBudget(len: number): (start: number, end: number) => boolean {
+  let left = 2 * len + 0x10000;
+  return (start, end) => {
+    const n = Math.max(0, end - start);
+    if (n > left) return false;
+    left -= n;
+    return true;
+  };
+}
 
 function cstr(b: Uint8Array, off: number, max = 512): string {
   let s = "";
@@ -49,9 +71,11 @@ export function parsePe(img: Uint8Array): PeInfo {
   const optSize = u16(fh + 16);
   const characteristics = u16(fh + 18);
   const oh = fh + 20;
+  if (!inRange(oh, 2)) throw new Error("truncated optional header");
   const magic = u16(oh);
   const is64 = magic === 0x20b;
   if (!is64 && magic !== 0x10b) throw new Error(`bad optional header magic 0x${magic.toString(16)}`);
+  if (!inRange(oh, is64 ? 112 : 96)) throw new Error("truncated optional header");
   const entryRva = u32(oh + 16);
   const imageBase = is64 ? dv.getBigUint64(oh + 24, true) : BigInt(u32(oh + 28));
   const sizeOfImage = u32(oh + 56);
@@ -60,7 +84,7 @@ export function parsePe(img: Uint8Array): PeInfo {
   const ddOff = oh + (is64 ? 112 : 96);
   const nDirs = Math.min(16, u32(oh + (is64 ? 108 : 92)));
   const dirs: DataDir[] = [];
-  for (let i = 0; i < nDirs; i++) dirs.push({ name: kDirNames[i], rva: u32(ddOff + i * 8), size: u32(ddOff + i * 8 + 4) });
+  for (let i = 0; i < nDirs && inRange(ddOff + i * 8, 8); i++) dirs.push({ name: kDirNames[i], rva: u32(ddOff + i * 8), size: u32(ddOff + i * 8 + 4) });
 
   const sections: Section[] = [];
   const st = oh + optSize;
@@ -103,8 +127,9 @@ export function parsePe(img: Uint8Array): PeInfo {
 
   const imports: ImportDll[] = [];
   const id = dirs[1];
+  let budget = kMaxImports;
   if (id && id.rva) {
-    for (let d = id.rva; inRange(d, 20) && imports.length < 4096; d += 20) {
+    for (let d = id.rva; inRange(d, 20) && imports.length < 4096 && budget > 0; d += 20) {
       const oft = u32(d);
       const nameRva = u32(d + 12);
       const ft = u32(d + 16);
@@ -112,7 +137,7 @@ export function parsePe(img: Uint8Array): PeInfo {
       const dll: ImportDll = { dll: cstr(img, nameRva), funcs: [] };
       const thunks = oft || ft;
       const step = is64 ? 8 : 4;
-      for (let i = 0; i < kMaxNames; i++) {
+      for (let i = 0; i < kMaxNames && budget > 0; i++, budget--) {
         const t = thunks + i * step;
         if (!inRange(t, step)) break;
         const v = is64 ? dv.getBigUint64(t, true) : BigInt(u32(t));
@@ -158,14 +183,17 @@ export function mapPeFile(file: Uint8Array): Uint8Array {
   const dv = new DataView(file.buffer, file.byteOffset, file.byteLength);
   if (file.length < 0x40 || dv.getUint16(0, true) !== 0x5a4d) throw new Error("no MZ header");
   const nt = dv.getUint32(0x3c, true);
-  if (dv.getUint32(nt, true) !== 0x4550) throw new Error("no PE signature");
+  if (nt + 24 > file.length || dv.getUint32(nt, true) !== 0x4550) throw new Error("no PE signature");
   const fh = nt + 4;
   const nsec = dv.getUint16(fh + 2, true);
   const optSize = dv.getUint16(fh + 16, true);
   const oh = fh + 20;
+  if (oh + 64 > file.length) throw new Error("truncated optional header");
   const sizeOfImage = dv.getUint32(oh + 56, true);
   const sizeOfHeaders = dv.getUint32(oh + 60, true);
-  if (sizeOfImage > 1 << 30) throw new Error("SizeOfImage is implausibly large");
+  if (sizeOfImage > kMaxImage || sizeOfImage > Math.max(kImageFloor, file.length * kImageRatio)) {
+    throw new Error(`SizeOfImage 0x${sizeOfImage.toString(16)} is implausibly large for a ${file.length} byte file`);
+  }
   const img = new Uint8Array(sizeOfImage);
   img.set(file.subarray(0, Math.min(sizeOfHeaders, file.length, sizeOfImage)));
   const st = oh + optSize;

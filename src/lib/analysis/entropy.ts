@@ -1,7 +1,7 @@
 // Section entropy and packer heuristics.
 // High-entropy executable sections usually mean packed or encrypted code;
 // this is the same signal Reverse-Slap's packer analysis looks at.
-import { parsePe, type PeInfo } from "./pe";
+import { parsePe, scanBudget, type PeInfo } from "./pe";
 
 export type SectionEntropy = {
   name: string;
@@ -41,10 +41,11 @@ export function sectionEntropies(img: Uint8Array, pe?: PeInfo): SectionEntropy[]
     }
   }
   const out: SectionEntropy[] = [];
+  const take = scanBudget(img.length);
   for (const s of info.sections) {
     const start = s.rva;
     const end = Math.min(img.length, s.rva + Math.max(s.vsize, s.rawSize));
-    if (end <= start) continue;
+    if (end <= start || !take(start, end)) continue;
     out.push({
       name: s.name.trim(),
       rva: s.rva,

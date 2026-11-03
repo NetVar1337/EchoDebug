@@ -7,7 +7,7 @@
 //     being debugged
 //
 // Both halves are heuristics: a hit is a place worth looking at, not proof.
-import { parsePe, type PeInfo } from "./pe";
+import { parsePe, scanBudget, type PeInfo } from "./pe";
 
 export type AntiKind =
   | "int2d"
@@ -124,10 +124,12 @@ export function scanAntiDebug(img: Uint8Array, base?: bigint, pe?: PeInfo): Anti
     }
   }
   const hits: AntiHit[] = [];
+  const take = scanBudget(img.length);
   for (const s of info.sections) {
     if (!s.x) continue;
     const start = s.rva;
     const end = Math.min(img.length, s.rva + s.vsize);
+    if (!take(start, end)) continue;
     for (let i = start; i < end; i++) {
       for (const p of kPatterns) {
         if (i + p.bytes.length > end) continue;
