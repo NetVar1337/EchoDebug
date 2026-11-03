@@ -80,7 +80,7 @@ type UiStore = {
   paletteOpen: boolean;
   /** Ctrl+Shift+F search-everything dialog */
   searchOpen: boolean;
-  /** struct type the Structs view should open (set by search, cleared by the view) */
+  /** struct type the Structs view should open (set by search and the Heap view, cleared by the view) */
   structType: string | null;
   sessionExportOpen: boolean;
   sessionImportOpen: boolean;
@@ -92,8 +92,6 @@ type UiStore = {
   disasmAt: string | null;
   memoryAt: string | null;
   structAt: string | null;
-  /** catalog type the Structs view should select on its next render (set by "open as struct") */
-  structType: string | null;
   sigAt: string | null;
   chainAt: { base: string; offsets: number[] } | null;
   module: string | null; // module focused for PE / strings
@@ -156,7 +154,6 @@ export const useUi = create<UiStore>()(
       disasmAt: null,
       memoryAt: null,
       structAt: null,
-      structType: null,
       sigAt: null,
       chainAt: null,
       module: null,

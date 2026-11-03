@@ -144,14 +144,6 @@ export default function StructsView() {
     setCpp(null);
   };
 
-  // "open as struct" from another view (Heap): select the type it just added
-  useEffect(() => {
-    const t = ui.structType ? catalog.types.find((x) => x.id === ui.structType) : undefined;
-    if (!ui.structType) return;
-    ui.set({ structType: null });
-    if (t) select(t);
-  }, [ui.structType]);
-
   const create = () => {
     const id = catalog.add("Class");
     const t = catalog.types.find((x) => x.id === id)!;
