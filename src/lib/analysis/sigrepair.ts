@@ -26,3 +26,24 @@ export async function locate(p: Pattern, find: (ida: string) => Promise<string[]
   }
   return { status: "lost", candidates: [], prefix: 0 };
 }
+
+/** A unique match is "moved" when it is not at the RVA the signature (or a relocated item) was saved at. */
+export type Located = { status: Health | "moved"; rva?: bigint };
+
+/** Where a pattern that used to match at `savedRva` matches now (`savedRva` unknown: a unique match is "ok"). */
+export function classify(savedRva: bigint | null | undefined, hitRvas: readonly bigint[]): Located {
+  if (hitRvas.length === 0) return { status: "missing" };
+  if (hitRvas.length > 1) return { status: "ambiguous" };
+  return { status: savedRva != null && hitRvas[0] !== savedRva ? "moved" : "ok", rva: hitRvas[0] };
+}
+
+/** Relocation summary: matched = same RVA, moved = unique new RVA, lost = no signature, no match or ambiguous. */
+export function countRelocation(statuses: readonly (Located["status"] | "nosig")[]): { matched: number; moved: number; lost: number } {
+  const c = { matched: 0, moved: 0, lost: 0 };
+  for (const s of statuses) {
+    if (s === "ok") c.matched++;
+    else if (s === "moved") c.moved++;
+    else c.lost++;
+  }
+  return c;
+}

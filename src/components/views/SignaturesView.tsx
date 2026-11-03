@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Copy, Save, Search, Trash2, Upload } from "lucide-react";
 import { request } from "@/lib/client";
-import { fmtAddr, hexToBytes, labelAddr, moduleOf, parseAddress } from "@/lib/hex";
+import { fmtAddr, hexToBytes, labelAddr, moduleOf, parseAddress, toBig } from "@/lib/hex";
 import { loadImage, readBytes } from "@/lib/memory";
 import { makeSignature, toByteArray, toCode, toIda, trim, type Insn, type Pattern } from "@/lib/analysis/sigmaker";
 import { flirtArchName, matchFlirt, parseFlirtFile } from "@/lib/analysis/flirt";
@@ -72,6 +72,7 @@ export default function SignaturesView() {
       name: name.trim() || `sig_${pattern.length}`,
       address: ui.sigAt ?? "",
       module: mod?.name ?? "",
+      rva: mod && addr !== null ? fmtAddr(addr - toBig(mod.base)) : undefined,
       pattern: trim(pattern),
       note: note.trim(),
       hits: found?.length ?? 0,
