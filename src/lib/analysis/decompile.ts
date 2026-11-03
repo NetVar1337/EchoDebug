@@ -86,7 +86,8 @@ export function decompile(cfg: Cfg, opts: DecompileOptions = {}): Decompiled {
 }
 
 function decl(type: string, name: string): string {
-  return type.endsWith("*") ? `${type}${name}` : `${type} ${name}`;
+  // `void *p`, but PDB spellings like `Entity*` keep their own style: `Entity* e`
+  return /\s\*+$/.test(type) ? `${type}${name}` : `${type} ${name}`;
 }
 
 function locLabel(loc: string): string {

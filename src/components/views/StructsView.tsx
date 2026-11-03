@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, ArrowLeft, Code2, Columns3, ListChecks, Plus, Trash2, Wand2 } from "lucide-react";
+import { Activity, ArrowLeft, Code2, Columns3, FileType2, ListChecks, Plus, Trash2, Wand2 } from "lucide-react";
 import { pointerClassifier } from "@/lib/ptrkind";
 import { saveBinary, saveText } from "@/lib/save";
 import { changedFields, guessFields } from "@/lib/analysis/structguess";
@@ -17,6 +17,7 @@ import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
 import AutoDetect from "./structs/AutoDetect";
 import StructDiff from "./structs/StructDiff";
+import PdbImport from "./structs/PdbImport";
 
 const kTypes = Object.keys(kFieldSizes) as FieldType[];
 const hexRows = (n: number): Field[] => Array.from({ length: n }, () => ({ type: "hex64", name: "" }));
@@ -32,7 +33,7 @@ export default function StructsView() {
   const [history, setHistory] = useState<string[]>([]);
   const [cpp, setCpp] = useState<string | null>(null);
   const [showCatalog, setShowCatalog] = useState(true);
-  const [tool, setTool] = useState<"none" | "detect" | "diff">("none");
+  const [tool, setTool] = useState<"none" | "detect" | "diff" | "pdb">("none");
   const [presetNote, setPresetNote] = useState("");
   const [exportFmt, setExportFmt] = useState<"cpp" | "c" | "ida" | "ghidra" | "binja">("cpp");
   const [track, setTrack] = useState(false);
@@ -41,6 +42,14 @@ export default function StructsView() {
   const lay = useMemo(() => layout(cls.fields), [cls.fields]);
   const size = lay.length ? lay[lay.length - 1].offset + lay[lay.length - 1].size : 0;
   const base = ui.structAt;
+
+  // The PDB type importer asks for the type it just added.
+  useEffect(() => {
+    if (!ui.structTypeId) return;
+    const t = catalog.types.find((x) => x.id === ui.structTypeId);
+    ui.set({ structTypeId: null });
+    if (t) select(t);
+  }, [ui.structTypeId]);
 
   // the assistant reads what is shown here and hands accepted fields back
   useEffect(() => {
@@ -202,6 +211,7 @@ export default function StructsView() {
             </select>
             <IconButton tip="Auto-detect: review a proposed type per slot" onClick={() => setTool(tool === "detect" ? "none" : "detect")} disabled={!base}><ListChecks size={14} /></IconButton>
             <IconButton tip="Compare instances" onClick={() => setTool(tool === "diff" ? "none" : "diff")}><Columns3 size={14} /></IconButton>
+            <IconButton tip="Import a type from a loaded PDB" onClick={() => setTool(tool === "pdb" ? "none" : "pdb")}><FileType2 size={14} /></IconButton>
             <button className="btn small" onClick={() => ui.setTab("engines")} title="Unreal GNames / GObjects reader (Engines tab)">UE</button>
             <span className="grow mono faint">size 0x{size.toString(16)}</span>
             <button className="btn small" onClick={() => setCls({ ...cls, fields: [...cls.fields, ...hexRows(1)] })}><Plus size={12} />8</button>
@@ -224,6 +234,7 @@ export default function StructsView() {
           {presetNote && (
             <div className="toolbar"><span className="faint grow ellipsis" title={presetNote}>{presetNote}</span><button className="row-action" onClick={() => setPresetNote("")}>×</button></div>
           )}
+          {tool === "pdb" && <PdbImport onImported={(id) => { const t = useTypes.getState().types.find((x) => x.id === id); if (t) select(t); }} onClose={() => setTool("none")} />}
           {tool === "detect" && base && <AutoDetect base={base} modules={modules} fields={cls.fields} onApply={(fields) => setCls({ ...cls, fields })} onClose={() => setTool("none")} />}
           {tool === "diff" ? (
             <StructDiff base={base} modules={modules} fields={cls.fields} onClose={() => setTool("none")} />

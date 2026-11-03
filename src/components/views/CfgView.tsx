@@ -16,6 +16,9 @@ import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
 import { useTypes } from "@/store/types";
 import { useDecomp, varTypesOf } from "@/store/decomp";
+import { useSymbols } from "@/store/symbols";
+// importing it also registers the PDB prototype provider the decompiler asks first
+import { protoAt, symAddr } from "@/lib/pdb";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { IconButton, NeedsAgent, Progress } from "../ui";
@@ -73,6 +76,8 @@ export default function CfgView() {
   const names = useNames();
   const types = useTypes((s) => s.types);
   const decomp = useDecomp();
+  // bumps when a PDB loads: its names and prototypes change the decompiled output
+  const symVersion = useSymbols((s) => s.version);
   const [mode, setMode] = useState<"graph" | "pseudo">("graph");
   const root = ui.disasmAt;
   const [fn, setFn] = useState<LiveFunction | null>(null);
@@ -115,7 +120,7 @@ export default function CfgView() {
     } catch (e) {
       return { d: null, error: e instanceof Error ? e.message : String(e) };
     }
-  }, [fn, needDecompile, abi, names, types, varTypes, decomp.unflatten, calleeTick]);
+  }, [fn, needDecompile, abi, names, types, varTypes, decomp.unflatten, calleeTick, symVersion]);
 
   // argument counts of the direct callees, from their own entry code; redraws once known
   useEffect(() => {
@@ -126,7 +131,7 @@ export default function CfgView() {
   }, [dec.d?.ir]);
 
   const showRaw = mode === "pseudo" && (decomp.raw || !dec.d);
-  const rawLines = useMemo(() => (fn && showRaw ? pseudocode(fn.structure, { abi, nameOf: names.nameOf }) : []), [fn, showRaw, abi, names]);
+  const rawLines = useMemo(() => (fn && showRaw ? pseudocode(fn.structure, { abi, nameOf: names.nameOf, protoOf: protoAt }) : []), [fn, showRaw, abi, names, symVersion]);
   const report = decomp.unflatten ? dec.d?.report ?? null : null;
   const cfg = useMemo(() => (fn && report?.flattened && dec.d ? recoveredCfg(dec.d, fn.cfg) : fn?.cfg ?? null), [fn, report, dec.d]);
   const pos = useMemo(() => (cfg ? layoutCfg(cfg, blockH, kWidth) : new Map()), [cfg]);
@@ -162,7 +167,7 @@ export default function CfgView() {
               <input type="checkbox" checked={decomp.raw} onChange={(e) => decomp.setRaw(e.target.checked)} />raw
             </label>
           )}
-          <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || labelAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges · ${loopCount} loops` : ""}</span>
+          <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || symAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges · ${loopCount} loops` : ""}</span>
           {mode === "graph" && (
             <>
               <span className="faint" style={{ fontSize: 12 }}><span style={{ color: "var(--success)" }}>taken</span> · <span style={{ color: "var(--danger)" }}>fall-through</span> · <span style={{ color: "var(--accent)" }}>jump / case</span> · <span style={{ color: "var(--warning)" }}>loop</span></span>
@@ -186,7 +191,7 @@ export default function CfgView() {
                 </div>
               )}
               <Pseudo lines={rawLines} onGo={ui.goDisasm}
-                note={`${dec.error ? `decompiler failed (${dec.error}); showing the raw output · ` : ""}raw pseudocode · registers stay registers, no types; calls show the ${abi === "win64" ? "rcx/rdx/r8/r9" : "rdi/rsi/rdx/rcx/r8/r9"} arguments written before them`} />
+                note={`${dec.error ? `decompiler failed (${dec.error}); showing the raw output · ` : ""}raw pseudocode · registers stay registers, types come only from a loaded PDB (signature and callee arguments); calls show the ${abi === "win64" ? "rcx/rdx/r8/r9" : "rdi/rsi/rdx/rcx/r8/r9"} arguments written before them`} />
               </>
             ) : (
               <>

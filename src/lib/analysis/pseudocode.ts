@@ -6,7 +6,9 @@
 import { branchOf, mnemonicOf, postDominators, type Cfg, type Insn } from "./structure";
 
 export type Abi = "win64" | "sysv";
-export type Options = { abi?: Abi; nameOf?: (address: string) => string };
+/** A function prototype from debug info (PDB): names the arguments and says whether it returns. */
+export type Proto = { name: string; ret: string; params: { name: string; type: string }[] };
+export type Options = { abi?: Abi; nameOf?: (address: string) => string; protoOf?: (address: string) => Proto | undefined };
 
 // ---------------------------------------------------------------------------
 // operands
@@ -119,7 +121,7 @@ function addressOf(op: string, rip: bigint | null): string | null {
   return (m[2] ? m[2] + ":" : "") + spaced(m[3]);
 }
 
-type Ctx = { rip: bigint | null; nameOf?: (a: string) => string };
+type Ctx = { rip: bigint | null; nameOf?: (a: string) => string; protoOf?: (a: string) => Proto | undefined };
 
 /** C expression for an operand; `width` sizes an untyped memory access. */
 function expr(op: string, ctx: Ctx, width = 64): string {
@@ -210,6 +212,32 @@ export function conditionOf(insns: readonly Insn[], ctxBase: Omit<Ctx, "rip"> = 
 const kArgs: Record<Abi, string[]> = { win64: ["rcx", "rdx", "r8", "r9"], sysv: ["rdi", "rsi", "rdx", "rcx", "r8", "r9"] };
 const kCompound: Record<string, string> = { add: "+=", sub: "-=", and: "&=", or: "|=", xor: "^=", shl: "<<=", sal: "<<=", shr: ">>=", sar: ">>=", imul: "*=" };
 
+const isFloat = (t: string) => /^(const )?(float|double|long double)$/.test(t.trim());
+
+/** Registers carrying each parameter of `p` (win64: by position; sysv: integer and xmm counters). */
+export function argRegs(p: Proto, abi: Abi): string[] {
+  let gi = 0;
+  let fi = 0;
+  return p.params.map((a, i) => {
+    if (a.type === "...") return "...";
+    if (abi === "win64") return i >= 4 ? `arg_${i + 1}` : isFloat(a.type) ? `xmm${i}` : kArgs.win64[i];
+    if (isFloat(a.type)) return fi < 8 ? `xmm${fi++}` : `arg_${i + 1}`;
+    return gi < 6 ? kArgs.sysv[gi++] : `arg_${i + 1}`;
+  });
+}
+
+/** Header lines for a function with a known prototype: the C signature and where each argument lives. */
+export function protoHeader(p: Proto, abi: Abi = "win64"): string[] {
+  const regs = argRegs(p, abi);
+  const sig = `${p.ret} ${p.name}(${p.params.map((a) => (a.type === "..." ? "..." : `${a.type} ${a.name}`)).join(", ") || "void"})`;
+  const map = p.params.map((a, i) => (a.type === "..." ? "" : `${a.name} = ${regs[i]}`)).filter(Boolean);
+  return [sig, ...(map.length ? [`// ${map.join(", ")}`] : [])];
+}
+
+function protoOfTarget(target: string, ctx: Ctx): Proto | undefined {
+  return /^0x[0-9a-f]+$/i.test(target) ? ctx.protoOf?.("0x" + BigInt(target).toString(16)) : undefined;
+}
+
 function calleeName(target: string, ctx: Ctx): string {
   if (/^0x[0-9a-f]+$/i.test(target)) {
     const hex = BigInt(target).toString(16); // the local backend pads: 0x0000000000401050
@@ -223,16 +251,21 @@ function calleeName(target: string, ctx: Ctx): string {
  * the last call (64-bit names) so a call can show its likely arguments.
  * Returns null for instructions that carry nothing (nop, endbr64).
  */
-export function translate(insn: Insn, abi: Abi = "win64", written: Set<string> = new Set(), nameOf?: (a: string) => string): string | null {
+export function translate(insn: Insn, abi: Abi = "win64", written: Set<string> = new Set(), nameOf?: (a: string) => string, protoOf?: (a: string) => Proto | undefined): string | null {
   const n = normalize(insn.text);
-  const ctx: Ctx = { rip: ripOf(insn, n), nameOf };
+  const ctx: Ctx = { rip: ripOf(insn, n), nameOf, protoOf };
   const [d, s, t] = n.ops;
   const raw = `// ${insn.text.trim()}`;
   const w = regWidth(d ?? "") || regWidth(s ?? "") || 64;
   const dst = d !== undefined ? expr(d, ctx, w) : "";
   const src = s !== undefined ? expr(s, ctx, w) : "";
   const lval = dst.startsWith("*") ? `(${dst})` : dst;
-  const callArgs = () => {
+  const callArgs = (proto?: Proto) => {
+    if (proto) {
+      // the prototype says how many arguments there are and where they live
+      written.clear();
+      return argRegs(proto, abi).filter((r) => r !== "...").join(", ");
+    }
     const regs = kArgs[abi];
     let k = 0;
     regs.forEach((r, i) => written.has(r) && (k = i + 1));
@@ -289,7 +322,11 @@ export function translate(insn: Insn, abi: Abi = "win64", written: Set<string> =
       if (n.ops.length === 1) out = `${dst} = ~${dst};`;
       break;
     case "call":
-      if (n.ops.length === 1) out = `rax = ${calleeName(dst, ctx)}(${callArgs()});`;
+      if (n.ops.length === 1) {
+        const p = protoOfTarget(d, ctx);
+        const call = `${calleeName(dst, ctx)}(${callArgs(p)})`;
+        out = p?.ret === "void" ? `${call};` : `rax = ${call};`;
+      }
       break;
     case "ret":
     case "retq":
@@ -298,7 +335,7 @@ export function translate(insn: Insn, abi: Abi = "win64", written: Set<string> =
       break;
     case "jmp":
       // only reached for jumps that leave the function: a tail call
-      if (n.ops.length === 1 && /^0x[0-9a-f]+$/i.test(d)) out = `return ${calleeName(d, ctx)}(${callArgs()}); // tail call`;
+      if (n.ops.length === 1 && /^0x[0-9a-f]+$/i.test(d)) out = `return ${calleeName(d, ctx)}(${callArgs(protoOfTarget(d, ctx))}); // tail call`;
       else out = `${raw}  (indirect jump, targets unknown)`;
       break;
   }
@@ -351,7 +388,7 @@ export function structure(cfg: Cfg, opts: Options = {}): Structured {
       const br = branchOf(insn.text);
       if (i === blk.insns.length - 1 && br && ((br.kind === "jcc" && isCond(b)) || (br.kind === "jmp" && blk.succ.some((e) => e.kind === "jump")))) return;
       // a jcc whose target is outside the listing has no edge: keep it visible
-      const text = br?.kind === "jcc" ? `// ${insn.text.trim()}  (conditional branch out of the function)` : translate(insn, abi, written, opts.nameOf);
+      const text = br?.kind === "jcc" ? `// ${insn.text.trim()}  (conditional branch out of the function)` : translate(insn, abi, written, opts.nameOf, opts.protoOf);
       if (text !== null) out.push({ k: "s", text, addr: insn.address });
     });
     return out;
@@ -527,7 +564,11 @@ export function render(cfg: Cfg, s: Structured): PseudoLine[] {
   return out;
 }
 
-/** CFG -> pseudocode lines, the whole pipeline. */
+/** CFG -> pseudocode lines, the whole pipeline; a known prototype of the entry heads the body. */
 export function pseudocode(cfg: Cfg, opts: Options = {}): PseudoLine[] {
-  return render(cfg, structure(cfg, opts));
+  const body = render(cfg, structure(cfg, opts));
+  const entry = cfg.blocks[0]?.insns[0]?.address;
+  const p = entry ? opts.protoOf?.("0x" + BigInt(entry).toString(16)) : undefined;
+  if (!p) return body;
+  return [...protoHeader(p, opts.abi ?? "win64").map((text) => ({ indent: 0, text, addr: entry })), ...body];
 }

@@ -81,9 +81,41 @@ plus the Linux-only verbs below. Only `reopen_socket` and the conditional alerts
 | `dbg_continue` / `dbg_pause` | – | `state` (steps over a breakpoint under rip first) |
 | `dbg_step` | `tid?` | `tid`, `from`, `address`, `regs`. A thread blocked in a system call only finishes the step when the call returns: the step is cancelled with an explanation instead of hanging |
 | `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base) |
+| `dbg_all_regs` | – | `threads:[{tid, regs}]`, `was_running` (stops the session for the read if it was running, then resumes) |
 
 Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause", "tid", "address", "regs", "slot?", "watch?", "signal?" }`
 and `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`.
+
+### Threads, call stacks, handles (relay)
+
+Echo's script API has no thread enumeration, thread context or handle access, so these verbs are
+served by the relay: on the Linux local backend (`local_threads.rs`), and on Windows when no Echo agent
+is connected (`win_threads.rs`, `pid` argument or the attached target). **While the Echo agent is
+connected they fail with code `2006`** ("the Echo backend can't list threads, call stacks or handles").
+
+| verb | request | reply |
+|---|---|---|
+| `threads` | `stacks?` (bool, default false), `registers?` (default true; false lists without stopping anything), `max_frames?` (default 64, ≤ 512), `pid?` (Windows) | `pid`, `platform` (`linux`\|`windows`), `registers_from` (`ptrace`\|`debugger`\|`GetThreadContext`), `threads:[{tid, name?, main?, state, state_name, wait?, priority, nice? \| base_priority?, time_ms, start?, start_label?, start_source?, teb? (Windows), tls? (Linux fs_base), rip?, rsp?, registers?, registers_error?, suspend_count? (Windows), frames?}]` |
+| `stack` | `tid` (Linux default: the main thread), `max_frames?`, `pid?` (Windows) | `tid`, `registers`, `registers_from`, `frames` |
+| `handles` | `pid?` (Windows) | `handles:[…]`: Linux `{handle (fd), type (file\|socket\|pipe\|device\|eventfd\|epoll\|…), name (link target), position, flags:[O_*]}` from `/proc/<pid>/fd` + `fdinfo`; Windows `{handle, type (object type name), name?, access, object, attributes}` from `SystemExtendedHandleInformation`, `truncated` |
+
+A frame is `{index, address, sp, module, offset, symbol, symbol_offset, method, guessed}`. `method` says
+how the frame was recovered from the one below it: `context` (the thread's registers), `pdata` (PE
+`.pdata` + UNWIND_INFO, interpreted like `RtlVirtualUnwind`: all UWOP codes, chained info, machine
+frames, the prolog offset and `ret` / tail-call epilogs), `leaf` (PE function without unwind data),
+`cfi` (ELF `.eh_frame` through `PT_GNU_EH_FRAME`, DWARF CFA programs and expressions), or the
+fallbacks `frame-pointer` and `stack-scan` (a return address preceded by a `call`), which set
+`guessed: true`. Symbols are the nearest export (PE, bounded by the `.pdata` function) or ELF
+`.symtab`/`.dynsym` entry; the app shows the user's names first.
+
+How registers are read: on Linux every thread is `PTRACE_SEIZE`d, `PTRACE_INTERRUPT`ed, read with
+`GETREGS`, unwound while still stopped, then detached (signals that arrived meanwhile are re-delivered);
+while a `dbg_*` session owns the threads, the registers come from it (`dbg_all_regs`). On Windows each
+thread is `SuspendThread`ed, read with `GetThreadContext`, unwound and `ResumeThread`ed. Thread start
+addresses: Windows `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and the TEB from
+`ThreadBasicInformation`; Linux the entry point (`AT_ENTRY`) for the main thread and, for the others,
+the outermost frame below glibc's `start_thread` / `clone3` on the unwound stack. Nothing is written to
+the target.
 
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
@@ -264,6 +296,28 @@ Built on `modules` / `read`, so they work with every backend:
 | `page_monitor` | `address`, `size?`, `label?`, `interval_ms?`, `enabled?` | `page_changed` events (`address`, `size`, `label`, `count`, `pages`), FNV-1a per 4 KiB page; 64 MiB total |
 | `page_monitor_list` | — | `entries:[{address,size,label,interval_ms,changes,last_change}]` |
 
+### PDB symbols (relay)
+
+Relay-local, any backend; blocking work runs on a worker thread. `key` is the symbol-store key of the
+image's CodeView (RSDS) record: GUID (32 hex digits, no dashes) followed by the age in hex.
+
+| verb | request | reply |
+|---|---|---|
+| `pdb_symbols` | `pdb` (file name) + `key`, or `path`; `symbol_path?` (`_NT_SYMBOL_PATH` syntax), `use_env?` (default true: also `_NT_SYMBOL_PATH` / `_NT_ALT_SYMBOL_PATH`), `image_path?` (its folder is searched), `servers?`, `download?` (default **false**), `allow_mismatch?`, `max?` | `path`, `source` (`symbol path` / `cache` / `server` / `path` / `mismatch`), `guid`, `age`, `key`, `expected_key`, `matched`, `machine`, counts (`count`, `functions`, `types`, `lines`, `files`), `tried`, `symbols:[{rva,name,kind,size,type?,ret?,cc?,params?:[{name,type,size}],mangled?}]`. Not found locally: `success:false, found:false, code:3004`, `tried`, `mismatches:[{path,key}]` |
+| `pdb_fetch` | as `pdb_symbols` (name + key) | a matching local copy: `state:"done", path`; else starts a background download: `state:"downloading", job` |
+| `pdb_progress` | — | `jobs:[{job,pdb,key,state:"downloading" \| "done" \| "error",done,total,url,path,error,seconds}]` |
+| `pdb_image` | `image_path` (a PE on disk) | `pdb`, `pdb_path`, `guid`, `age`, `key` |
+| `pdb_types` | `path`, `filter?`, `max?` | `total`, `types:[{index,name,kind,size,fields or target}]` (struct/class/union/interface/enum/typedef) |
+| `pdb_type` | `path`, `name` or `index`, `depth?` | `index`, `name`, `kind`, `size`, `fields:[{name,offset,size,type,type_index,kind:"member" \| "base" \| "vtable",category,scalar?,udt?,points_to?,count?,elem?,bit_pos?,bit_len?}]`, enum `values`/`underlying`, `nested:[…same…]` (types embedded by value), `text` |
+| `pdb_lines` | `path`, `rva`, `size?` | `lines:[{rva,size,file,line}]`, `function` (the symbol containing `rva`) |
+
+Lookup order: the image's folder, the symbol path's folders (`<dir>/<pdb>` and `<dir>/<pdb>/<key>/<pdb>`),
+its stores and the app cache (`<config>/EchoDebug/symbols`) in store layout, each also as a compressed
+`<pdb minus last char>_` cabinet (expanded into the download store). Every candidate's GUID/age is checked.
+Downloads try `<server>/<pdb>/<key>/<pdb>`, then the `.pd_` name, and go to the first `srv*`/`cache*` store of
+the symbol path, else the app cache. Servers: `servers`, then the symbol path's `srv*` URLs, then
+`ECHODEBUG_SYMBOL_SERVERS` (`;`-separated), else `https://msdl.microsoft.com/download/symbols`.
+
 ## Provider verbs (`ui_*`) and authentication
 
 Verbs that start with `ui_` are answered by the desktop app window, because the analyses behind them
@@ -295,8 +349,19 @@ read from the module image):
 
 Prototypes: `src/lib/analysis/prototypes.ts` exposes `registerPrototypeProvider(id, (address, name) => Prototype | null,
 { fallback? })`; a `Prototype` is `{ name?, returns?, args?: [{ name?, type? }], variadic?, noreturn? }`. Providers are asked
-in order, then a built-in table of common C runtime / Win32 functions, then fallback providers (the app registers one with the
+in order (the app registers `pdb` first: the prototypes of a loaded PDB's function symbols), then a built-in table of common C runtime / Win32 functions, then fallback providers (the app registers one with the
 argument counts it reads from the callees' own code).
+
+Module tables read from the loaded image (every backend):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_tls_callbacks` (`tls_callbacks`) | `module?` | `directory` (raw data range, index, callbacks array), `callbacks:[{index,address,label,name?,section,executable,inModule}]` |
+| `ui_exception_handlers` (`exception_handlers`) | `module?`, `limit?` (default 2000) | `functions_with_unwind_info`, `chained_fragments`, `handler_routines:[{address,name,kind,functions}]`, `functions:[{function,end,flags,handler,handler_name,kind,handler_data,scopes?:[{try_begin,try_end,kind:"except"\|"finally",filter?,target?,finally?}],scopes_heuristic?}]`, `vectored_handlers` (why they are not listed) |
+
+Vectored exception handlers are not listed: ntdll keeps them in the private `LdrpVectorHandlerList`
+with pointers encoded by `RtlEncodePointer` (a per-process cookie), so they cannot be enumerated reliably
+without undocumented internals.
 
 `/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
 WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
@@ -339,7 +404,9 @@ Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (wit
 `resources/subscribe`/`unsubscribe`, `completion/complete`, `logging/setLevel`.
 
 **Tools** carry `title`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
-`openWorldHint`, derived from the verb) and an object `outputSchema`; results add `structuredContent`
+`openWorldHint`, derived from the verb; `ui_load_symbols` is the one open-world tool: it may download from
+the symbol servers, while `ui_pdb_symbols`, `ui_pdb_types`, `ui_pdb_type` and `ui_pdb_lookup` only read local
+copies and `ui_import_pdb_type` changes the Structs catalog) and an object `outputSchema`; results add `structuredContent`
 (the reply object) next to the text block.
 
 **Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],
@@ -391,7 +458,8 @@ The tool set covers the whole backend: process control (`status`, `list_processe
 `detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,
 `memory_regions`), analysis (`disassemble`, `enumerate_functions`, `signature_scan`,
 `signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
-`resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
+`resolve_export`, `peb_walk`), threads (`list_threads`, `thread_stack`, `list_handles`,
+`tls_callbacks`, `exception_handlers`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
 `value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
 watching (`watch_add`, `watch_remove`, `list_watched`), alerts (`alert_add`,
 `alert_remove`, `alert_list`),

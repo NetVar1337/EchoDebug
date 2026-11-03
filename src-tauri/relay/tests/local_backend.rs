@@ -146,6 +146,19 @@ async fn local_backend_against_a_live_process() {
     assert_eq!(back["data"], before["data"], "unfreeze restores the original bytes");
 
     // loader list: r_debug/link_map when the program is dynamically linked
+    // threads + call stack (ptrace: interrupt, read, resume) and open fds
+    let th = call(json!({ "type": "threads", "stacks": true })).await;
+    assert_eq!(th["success"], true, "{th}");
+    let t0 = &th["threads"][0];
+    assert_eq!(t0["tid"], pid, "{th}");
+    if t0.get("registers_error").is_none() {
+        assert!(t0["frames"].as_array().unwrap().iter().any(|f| f["module"].as_str().is_some_and(|m| m.starts_with("libc")) || f["module"] == "sh" || f["module"] == "dash"), "{th}");
+        let st = call(json!({ "type": "stack", "tid": pid, "max_frames": 4 })).await;
+        assert!(st["frames"].as_array().unwrap().len() <= 4, "{st}");
+    }
+    let fds = call(json!({ "type": "handles" })).await;
+    assert!(fds["count"].as_u64().unwrap() >= 1, "{fds}");
+
     let peb = call(json!({ "type": "peb_walk" })).await;
     assert!(peb["count"].as_u64().unwrap() >= 2, "{peb}");
     assert!(peb["modules"].as_array().unwrap().iter().any(|m| m["name"].as_str().unwrap().contains("libc")), "{peb}");
