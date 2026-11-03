@@ -108,7 +108,7 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …) and tools that read and set your names and comments, list and revert journalled patches and list saved signatures, 16 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Value graphs | **Value Graphs** tab: watched addresses plotted over time (i8..u64, f32, f64), several series at once, fed by a batched poll (20 ms–10 s) and the agent's `watch_event` stream into per-series ring buffers (configurable length); wheel zooms, drag pans, double-click returns to live; hover cursor with value and time; pause; min / max / avg over the visible window; CSV export; **Graph this** from the watchlist (button or right-click) |
 | Search everything | **Ctrl+Shift+F** (also in the command palette): one box over names, comments, bookmarks and labelled watches, saved signatures, struct types and fields, modules, exports of every loaded module (read from the export directory only) and the strings of modules already opened in Strings; **Search strings in all modules** extracts the rest on request. Fuzzy ranking (word starts, camelCase, addresses), grouped results, arrow keys + Enter jump to the right view |
-| Assistant | **Assistant** panel (rail, ✦): chat with Claude using your own Anthropic API key (Settings → Assistant; DPAPI-encrypted on Windows, a 0600 file elsewhere; kept by the desktop app and sent only to api.anthropic.com). **Explain function** (disassembly + pseudocode of the function at the cursor with your names and comments), **Suggest names** (function, callees, globals, locals → a review list you accept one by one), **Suggest struct fields** (from the Structs view's live sample → review list), **Summarise module** (imports, strings, triage). The assistant can call EchoDebug's read-only MCP tools (never writes, freezes, dumps, patch reverts, renames, emulation or debugger control) and every call is shown in the transcript. Model and effort pickers (default Claude Opus 5.5). What you send there goes to Anthropic |
+| Assistant | **Assistant** panel (rail, ✦): chat about the target with the provider and model you choose: **Anthropic**, **OpenAI**, **Google Gemini** (API keys), **OpenRouter** (API key or **Sign in with OpenRouter**, its OAuth PKCE flow, on your own credits), or any **OpenAI-compatible** / **Anthropic-compatible** endpoint (Ollama, LM Studio, vLLM, llama.cpp, LiteLLM, Azure OpenAI, gateways; local ones need no key). Live, searchable model lists per provider (context window, tools / vision / reasoning, price where known; cached, with refresh and an offline fallback) and per-model max output, effort and temperature. **Explain function**, **Suggest names**, **Suggest struct fields**, **Summarise module**; slash commands (`/explain`, `/names`, `/struct`, `/summary`, `/model`, `/provider`, `/new`, `/clear`, `/compact`, `/retry`, `/export`, `/tools`, `/context`, `/cost`, `/system`, `/help`) and @-mentions that attach context (`@function`, `@0x…`, `@module+0x…`, `@struct:Name`, `@module:Name`, `@selection`). Saved conversations (rename, delete, export to Markdown), token usage and cost per reply and per conversation, streamed Markdown with copyable code and clickable addresses, collapsible thinking and tool-call cards, stop / retry / edit-and-resend. Only EchoDebug's read-only tools, for every provider (never writes, freezes, dumps, patch reverts, renames, emulation or debugger control). Keys stay in the desktop app (DPAPI on Windows, 0600 files elsewhere). See [Assistant](#assistant) |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script. **Module projects** keep names, comments and bookmarks per module build (by RVA) and restore them on the next attach, wherever ASLR puts the module; when a module's build changes, its saved items are **re-located** by a signature made per name and bookmark (Names panel → Sign), with matched / moved / lost counts, and project exports also carry the signature catalog; panel sizes, the last place in each view and (optionally) the last target are restored on start; a target switcher in the Targets panel |
 | MCP policy | Settings in the MCP panel: allow everything, **ask** (an Allow/Deny dialog in the window for writes, freezes and dumps) or read-only, plus allow/deny tool lists, an optional audit file (`mcp-audit.jsonl`) and JSONL export. Tools carry MCP annotations and structured output; resource templates (`echodebug://memory/{address}/{size}`, `module/{name}/exports`, …) and argument completion are supported |
@@ -127,6 +127,31 @@ Echo exposes no API for these, and EchoDebug deliberately ships no driver to rep
 debugger exists on the Linux local backend, through ptrace). One target is attached at a time; the
 Targets panel switches between recent targets. FLIRT files in IDA 9.5's version 11 format are not
 read yet: that layout is not publicly documented.
+
+### Assistant
+
+Settings → Assistant holds one credential per provider. Built-in providers always talk to their own
+host (`api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`, `openrouter.ai`); a
+custom endpoint's key and headers only go to the base URL saved with it. Keys are encrypted with DPAPI
+on Windows and kept in files readable only by your user (mode 0600) elsewhere, in the config
+directory; the web view never sees them (Settings shows `sk-…wxyz` at most). **Test** lists the
+provider's models to check the credential. **Sign in with OpenRouter** opens your browser on
+OpenRouter's OAuth PKCE page, receives the code on a one-off `http://127.0.0.1:<port>/callback`
+listener and exchanges it for a key on your OpenRouter account; **Sign out** deletes it.
+
+Subscription sign-in (Claude Pro/Max, ChatGPT Plus) isn't offered because those providers don't
+allow third-party apps to use it; use an API key, OpenRouter sign-in, or a compatible endpoint. To use
+a Claude subscription, run Claude Code yourself (signed in with your own account) and connect it to
+EchoDebug's MCP server (the `claude mcp add` command below; the panel shows it with your token).
+
+Custom endpoints: pick a preset or enter a name, the kind (OpenAI-compatible: `<base>/chat/completions`
+and `<base>/models`, Ollama's `/api/tags` as a fallback; Anthropic-compatible: `<base>/v1/messages`),
+the base URL, an optional key (`Authorization: Bearer` / `x-api-key`) and extra headers (e.g. Azure's
+`api-key`). Every provider's stream is turned into one event shape by the desktop app, so text,
+reasoning, tool calls, stop reasons and usage behave the same everywhere. Conversations are saved in
+`<config>/EchoDebug/assistant-conversations/` (one 0600 JSON file each; turn **Save conversations**
+off to keep them in memory only). Whatever you send (code, memory, names, tool results) goes to the
+provider named in the panel.
 
 ### Connecting an MCP client
 

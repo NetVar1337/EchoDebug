@@ -295,17 +295,26 @@ regenerate the stored token (Settings or the MCP Server panel); the running rela
 
 ## In-app assistant (desktop app, not the relay)
 
-The Assistant panel talks to the Anthropic Messages API (`POST https://api.anthropic.com/v1/messages`,
-`anthropic-version: 2026-10-21`, streamed). It is **not** a relay verb and is not reachable over
-`/client` or `/mcp`: the web view calls Tauri commands of the desktop app (`src-tauri/src/lib.rs`),
-which own the user's API key.
+The Assistant panel talks to a model provider from the desktop app: Anthropic (Messages API,
+`anthropic-version: 2026-10-21`), OpenAI (Chat Completions), Google Gemini (Generative Language API,
+`streamGenerateContent?alt=sse`), OpenRouter (Chat Completions; key or OAuth PKCE sign-in), and custom
+OpenAI-compatible / Anthropic-compatible endpoints. It is **not** a relay verb and is not reachable over
+`/client` or `/mcp`: the web view calls Tauri commands of the desktop app (`src-tauri/src/lib.rs`), which
+own every credential (`relay/src/assistant/`).
 
 | Command | Does |
 |---|---|
-| `assistant_key_status` | `{present, storage, path, note}`; never the key |
-| `assistant_set_key` / `assistant_clear_key` | store or remove the key: DPAPI-encrypted (`anthropic-key.dpapi`) on Windows, a mode-0600 file (`anthropic-key`) elsewhere, in the config directory above |
-| `assistant_send` | `id`, `body`, a channel that receives every SSE event; `relay/src/assistant.rs::prepare_body` refuses unknown top-level fields (e.g. `mcp_servers`), server tools, and any tool that does not map through `tools.json` to a verb that is read-only (`mcp::is_read_only`) and not on `ASSISTANT_DENY` (emulation, alerts, symbol downloads, …); `dbg_*`/`emu_*` are refused by prefix |
+| `assistant_providers` | `{storage, note, conversations, providers: [{id, kind, name, base_url, has_key, key_hint, method, headers (names only), saved, path}]}`; never a key or header value |
+| `assistant_save_provider` / `assistant_remove_provider` | store `{id, kind?, name?, base_url?, api_key?, headers?}` (an empty key keeps the stored one) or delete it (sign out). Ids: `anthropic`, `openai`, `gemini`, `openrouter` (fixed hosts) and `custom-<slug>` (`openai_compat` / `anthropic_compat` with a base URL). One file per provider, `assistant-provider-<id>.dpapi` (DPAPI) on Windows, `.cred` (mode 0600) elsewhere; the old `anthropic-key` file is still read |
+| `assistant_models` / `assistant_test` | the provider's live model list, normalised to `{id, name, provider, context, max_output, tools, vision, reasoning, effort, temperature, price}` (Anthropic `GET /v1/models`, OpenAI `/v1/models`, Gemini `models.list`, OpenRouter `/api/v1/models` with pricing, compatible `/models`, Ollama `/api/tags`); test also returns the time it took |
+| `assistant_signin_begin` / `assistant_signin_finish` / `assistant_signin_cancel` | OpenRouter OAuth PKCE: begin binds `127.0.0.1:<port>`, returns `https://openrouter.ai/auth?callback_url=http://127.0.0.1:<port>/callback&code_challenge=<S256>&code_challenge_method=S256&state=…`; finish waits for `/callback?code&state`, exchanges at `https://openrouter.ai/api/v1/auth/keys` and stores the key (`method: "oauth"`) |
+| `assistant_send` | `id`, `provider`, a provider-neutral `body` (`model, system, messages, tools, max_tokens, effort, temperature, thinking, fallbacks`; Messages-API-shaped blocks) and a channel. `provider::parse_request` refuses unknown fields, other block types, server tools and any tool that does not map through `tools.json` to a verb that is read-only (`mcp::is_read_only`) and not on `ASSISTANT_DENY`, the same for every provider; `provider::build` writes the provider's own body; `decode` turns its stream into Messages-API events (`message_start`, `content_block_*` with `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta` / `details_delta`, `message_delta` with `stop_reason` in `end_turn` / `tool_use` / `max_tokens` / `refusal` and usage incl. `cost` when reported, `message_stop`, `error`) |
 | `assistant_cancel` | `id`: stops reading that stream |
+| `assistant_conv_list` / `_load` / `_save` / `_delete` | saved conversations in `<config>/assistant-conversations/<id>.json` (mode 0600) |
+
+Thinking blocks and Gemini's signed parts carry `origin` (the provider id) and are only replayed to that
+provider. Errors carry hints the panel turns into buttons (Settings, Retry with `retry-after`, `/compact`
+for context overflows, refresh models).
 
 The assistant's tool calls run in the app window with the same verbs MCP uses (`ui_*` through the
 provider, everything else through `/client`), after the app checks the tool is allowed and the input
