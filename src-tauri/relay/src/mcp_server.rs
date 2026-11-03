@@ -78,6 +78,10 @@ impl Ver {
 pub const LATEST: Ver = Ver::V20260728;
 /// What an `initialize` gets when it asks for a version this server does not speak.
 pub const LATEST_LEGACY: Ver = Ver::V20251125;
+/// Result shapes for requests with no session, no `_meta` version and no `MCP-Protocol-Version`
+/// header (scripts, curl). The spec allows reading them as 2025-03-26; the newest initialize-based
+/// shapes only add fields older clients ignore, and keep `structuredContent` for such scripts.
+pub const SESSIONLESS: Ver = LATEST_LEGACY;
 
 pub fn supported_versions() -> Vec<&'static str> {
     Ver::ALL.iter().map(|v| v.as_str()).collect()
@@ -1574,8 +1578,8 @@ pub(crate) async fn post(State(relay): State<Relay>, headers: HeaderMap, RawQuer
                 Some(c) => c,
                 None => return json_status(StatusCode::NOT_FOUND, rpc_error(id, SESSION_NOT_FOUND, "session not found (it ended or was disconnected in EchoDebug); initialize again")),
             },
-            // sessionless: the header's version, else 2025-03-26 (the spec's default for no header)
-            None => Ctx::new(hdr_ver.and_then(Ver::parse).filter(|v| !v.modern()).unwrap_or(Ver::V20250326), transport),
+            // sessionless: the header's version, else SESSIONLESS
+            None => Ctx::new(hdr_ver.and_then(Ver::parse).filter(|v| !v.modern()).unwrap_or(SESSIONLESS), transport),
         }
     };
     let sse = wants_sse(&headers);
@@ -1648,7 +1652,7 @@ async fn post_batch(relay: Relay, headers: &HeaderMap, batch: Vec<Value>, sessio
             Some(c) => c,
             None => return json_status(StatusCode::NOT_FOUND, rpc_error(Value::Null, SESSION_NOT_FOUND, "session not found; initialize again")),
         },
-        None => Ctx::new(hget(headers, "mcp-protocol-version").and_then(Ver::parse).filter(|v| !v.modern()).unwrap_or(Ver::V20250326), transport),
+        None => Ctx::new(hget(headers, "mcp-protocol-version").and_then(Ver::parse).filter(|v| !v.modern()).unwrap_or(SESSIONLESS), transport),
     };
     let mut replies = Vec::new();
     let mut calls = Vec::new();
@@ -1709,6 +1713,36 @@ pub(crate) async fn delete(State(relay): State<Relay>, headers: HeaderMap, RawQu
         Some(_) => StatusCode::NOT_FOUND.into_response(),
         None => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
+}
+
+/// CORS for `/mcp` from the pages `origin_allowed` accepts (the app's web view, local dev
+/// servers): they answer preflights and may read responses. Other origins still get 403 from the
+/// handlers; requests without an Origin (native clients) are untouched.
+pub(crate) async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req.headers().get(header::ORIGIN).cloned();
+    let allowed = origin.is_some() && crate::origin_allowed(req.headers());
+    let add = |h: &mut HeaderMap, o: &HeaderValue| {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, o.clone());
+        h.insert(header::VARY, HeaderValue::from_static("Origin"));
+        h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("mcp-session-id, www-authenticate"));
+    };
+    if req.method() == axum::http::Method::OPTIONS {
+        let Some(o) = origin.filter(|_| allowed) else { return StatusCode::FORBIDDEN.into_response() };
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        add(r.headers_mut(), &o);
+        r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, DELETE"));
+        r.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("authorization, content-type, accept, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, last-event-id"),
+        );
+        r.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+        return r;
+    }
+    let mut r = next.run(req).await;
+    if let (true, Some(o)) = (allowed, origin) {
+        add(r.headers_mut(), &o);
+    }
+    r
 }
 
 /// `GET /mcp/health`: for clients and scripts that probe before connecting. No token needed; it
@@ -1823,7 +1857,7 @@ impl StdioConn {
             let sid = lock(&self.session).clone();
             match sid.and_then(|s| self.relay.session_ctx(&s, "stdio")) {
                 Some(c) => c,
-                None => Ctx::new(Ver::V20250326, "stdio"),
+                None => Ctx::new(SESSIONLESS, "stdio"),
             }
         };
         if method == "subscriptions/listen" && ctx.ver.modern() {

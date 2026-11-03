@@ -1101,8 +1101,12 @@ pub fn router(relay: Relay) -> Router {
         .route("/client", get(client_ws))
         .route("/sync", get(sync_ws))
         .route("/health", get(health))
-        .route("/mcp", post(mcp_server::post).get(mcp_server::get).delete(mcp_server::delete))
-        .route("/mcp/health", get(mcp_server::health))
+        .merge(
+            Router::new()
+                .route("/mcp", post(mcp_server::post).get(mcp_server::get).delete(mcp_server::delete))
+                .route("/mcp/health", get(mcp_server::health))
+                .layer(axum::middleware::from_fn(mcp_server::cors)),
+        )
         .with_state(relay)
 }
 

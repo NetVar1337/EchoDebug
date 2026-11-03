@@ -663,6 +663,27 @@ async fn health_endpoint_and_auth_errors() {
 }
 
 #[tokio::test]
+async fn cors_for_the_app_window_only() {
+    let (_, relay) = start().await;
+    let pre = |origin: &'static str| {
+        router(relay.clone()).oneshot(
+            Request::options("/mcp").header("origin", origin).header("access-control-request-method", "POST").header("access-control-request-headers", "authorization, mcp-protocol-version").body(Body::empty()).unwrap(),
+        )
+    };
+    let ok = pre("tauri://localhost").await.unwrap();
+    assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+    assert_eq!(ok.headers()["access-control-allow-origin"], "tauri://localhost");
+    assert!(ok.headers()["access-control-allow-headers"].to_str().unwrap().contains("mcp-protocol-version"));
+    assert_eq!(pre("https://evil.example").await.unwrap().status(), StatusCode::FORBIDDEN);
+    let r = post(&relay, &[("origin", "http://127.0.0.1:1430".into())], legacy(1, "ping", json!({}))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.headers["access-control-allow-origin"], "http://127.0.0.1:1430");
+    assert!(r.headers["access-control-expose-headers"].to_str().unwrap().contains("mcp-session-id"));
+    let r = post(&relay, &[], legacy(1, "ping", json!({}))).await;
+    assert!(r.headers.get("access-control-allow-origin").is_none(), "native clients send no Origin");
+}
+
+#[tokio::test]
 async fn panel_test_call_uses_the_mcp_path() {
     let (addr, relay) = start().await;
     let mut c = ws(addr, "/client").await;
