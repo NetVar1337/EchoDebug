@@ -115,25 +115,37 @@ export const useAssistant = create<AssistantStore>()(
         try {
           for (let i = 0; i < kMaxTurns; i++) {
             const acc = await turn();
-            if (!acc || cancelled) return;
+            if (!acc) return;
+            // a tool_use left without a result would make the next request invalid
+            const closeTools = (why: string) => {
+              const open = acc.toolUses();
+              if (open.length) set((s) => ({ messages: [...s.messages, { role: "user", content: open.map((t) => ({ type: "tool_result", tool_use_id: t.id, content: why, is_error: true })) }] }));
+            };
+            if (cancelled) return closeTools("not run: the user stopped the assistant");
             if (acc.stopReason === "refusal") {
+              // a declined reply is discarded, not replayed
+              set((s) => ({ messages: s.messages.slice(0, -1) }));
               const d = acc.stopDetails as { category?: string; explanation?: string } | null;
               note(`The model declined this request${d?.category ? ` (${d.category})` : ""}.${d?.explanation ? ` ${d.explanation}` : ""}`, "warn");
               return;
             }
             if (acc.stopReason === "max_tokens") {
+              closeTools("not run: the reply hit the output limit before this call was complete");
               note("The reply hit the output limit; tool calls in it were not run. Ask to continue.", "warn");
               return;
             }
             if (!toolsMayRun(acc.stopReason)) return;
             const results: unknown[] = [];
             for (const t of acc.toolUses()) {
+              if (cancelled) {
+                results.push({ type: "tool_result", tool_use_id: t.id, content: "not run: the user stopped the assistant", is_error: true });
+                continue;
+              }
               const eid = uid();
               push({ kind: "tool", id: eid, name: t.name, input: t.input, running: true });
               const r = await runTool(t.name, t.input, (t as { invalid?: string }).invalid, local);
               patch(eid, { running: false, result: r.content, isError: r.isError });
               results.push({ type: "tool_result", tool_use_id: t.id, content: r.content, ...(r.isError ? { is_error: true } : {}) });
-              if (cancelled) break;
             }
             // every tool_use gets its result, even after Stop, so the conversation stays valid
             set((s) => ({ messages: [...s.messages, { role: "user", content: results }] }));
