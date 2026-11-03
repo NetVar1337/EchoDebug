@@ -21,6 +21,7 @@ import { parseMetadata } from "../engines/il2cpp";
 import { findNamePools } from "../engines/unreal";
 import { resolveSwitch } from "../jumptables";
 import { a64Refs } from "../a64";
+import { listExceptionHandlers } from "../seh";
 
 /** A mapped PE32+ of `size` bytes with no sections, for tests that write their own tables. */
 function blankPe(size: number, dirs: Record<number, { rva: number; size: number }> = {}): { img: Uint8Array; dv: DataView } {
@@ -151,6 +152,18 @@ describe("PE regressions", () => {
     dv.setUint16(0x84 + 2, 0, true);
     expect(() => clean(() => buildDumpPe(img.slice(0, 0x200), 0x140000000n, 0x1000, []))).not.toThrow();
     expect(() => buildDumpPe(img.slice(0, 0x200), 0x140000000n, 0x1000, [])).toThrow(/cut short/);
+  });
+
+  it("an indirect RUNTIME_FUNCTION in the last 12 bytes of the image is skipped, not a RangeError", () => {
+    // fuzz counterexample shape: .pdata entry whose UnwindData (bit 0: points at another entry)
+    // is image length - 9, so the u32 at +8 runs 3 bytes past the end
+    const pdata = new Uint8Array(12);
+    const dv = new DataView(pdata.buffer);
+    dv.setUint32(0, 0x1000, true);
+    dv.setUint32(4, 0x1010, true);
+    const img = buildTestPe([{ name: ".text", rva: 0x1000, bytes: new Uint8Array(0x10) }, { name: ".pdata", rva: 0x2000, bytes: pdata, chars: 0x40000040 }], { 3: { rva: 0x2000, size: 12 } });
+    new DataView(img.buffer).setUint32(0x2008, (img.length - 9) | 1, true);
+    expect(clean(() => listExceptionHandlers(img))?.handlers).toEqual([]);
   });
 
   it("ARM64 reference scan of a section at RVA >= 2^31 (32-bit alignment went negative)", () => {
