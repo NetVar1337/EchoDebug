@@ -8,7 +8,7 @@ vi.mock("./client", () => ({
   },
 }));
 
-const { callsToCsv, filterCalls, formatArgs, importSpecs, parseFunctionList, sortHits, startTrace, watchSize } = await import("./debugger");
+const { bpFields, bpSummary, callsToCsv, debuggerKey, filterCalls, formatArgs, importSpecs, parseFunctionList, sortHits, stackOffset, startTrace, watchSize } = await import("./debugger");
 type Call = Parameters<typeof callsToCsv>[0][number];
 
 const call = (over: Partial<Call>): Call => ({
@@ -58,5 +58,41 @@ describe("debugger helpers", () => {
     expect(parseFunctionList("kernel32.dll!CreateFileW\n libc.so.6!open, kernel32.dll!createfilew,\n\n")).toEqual(["kernel32.dll!CreateFileW", "libc.so.6!open"]);
     expect(importSpecs([{ dll: "KERNEL32.dll", name: "CreateFileW" }, { dll: "KERNEL32.dll", name: "CreateFileW" }, { dll: "WS2_32.dll", name: "#23" }, { dll: "ADVAPI32.dll", name: "RegOpenKeyExW" }]))
       .toEqual(["advapi32.dll!RegOpenKeyExW", "kernel32.dll!CreateFileW"]);
+  });
+
+  it("maps x64dbg's debugging keys", () => {
+    expect(debuggerKey({ key: "F9" })).toBe("run");
+    expect(debuggerKey({ key: "F9", ctrlKey: true })).toBe("stepOut");
+    expect(debuggerKey({ key: "F9", metaKey: true })).toBe("stepOut");
+    expect(debuggerKey({ key: "F7" })).toBe("stepInto");
+    expect(debuggerKey({ key: "F8" })).toBe("stepOver");
+    expect(debuggerKey({ key: "F4" })).toBe("runToCursor");
+    expect(debuggerKey({ key: "F2" })).toBe("toggleBreakpoint");
+    expect(debuggerKey({ key: "F12" })).toBe("pause");
+    expect(debuggerKey({ key: "*", ctrlKey: true })).toBe("setOrigin");
+    expect(debuggerKey({ key: "*" })).toBeNull();
+    expect(debuggerKey({ key: "F8", shiftKey: true })).toBeNull();
+    expect(debuggerKey({ key: "F7", ctrlKey: true })).toBeNull();
+    expect(debuggerKey({ key: "F9", altKey: true })).toBeNull();
+    expect(debuggerKey({ key: "a" })).toBeNull();
+  });
+
+  it("summarises a breakpoint's options", () => {
+    expect(bpSummary(undefined)).toBe("");
+    expect(bpSummary({ address: "0x1", condition: "", log: "", log_condition: "", once: false, hits: 0 })).toBe("");
+    expect(bpSummary({ address: "0x1", condition: "rcx==0", log: "x={rax}", log_condition: "$hits%2", once: true, hits: 3 }))
+      .toBe('break if rcx==0 · log "x={rax}" if $hits%2 · once · 3 hits');
+    expect(bpSummary({ address: "0x1", condition: "", log: "", log_condition: "", once: false, hits: 1 })).toBe("1 hit");
+  });
+
+  it("labels stack slots relative to rsp in hex", () => {
+    expect(stackOffset(0)).toBe("rsp");
+    expect(stackOffset(0x28)).toBe("rsp+28");
+    expect(stackOffset(-16)).toBe("rsp-10");
+  });
+
+  it("builds the dbg_break fields for saved options", () => {
+    expect(bpFields("0x10", { condition: " rax==1 ", log: "a {rax} ", log_condition: "", once: true }))
+      .toEqual({ address: "0x10", enabled: true, condition: "rax==1", log: "a {rax} ", log_condition: "", once: true });
   });
 });

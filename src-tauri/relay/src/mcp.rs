@@ -19,12 +19,14 @@ const STATEFUL: &[&str] = &[
     // the native debuggers (ptrace / Win32): execution control, the access finder, the API monitor
     "dbg_attach", "dbg_detach", "dbg_break", "dbg_hwbreak", "dbg_continue", "dbg_step", "dbg_pause", "dbg_set_regs",
     "dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear",
+    "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_bp_log_clear",
 ];
 /// Stateful verbs the ask / read-only policies gate like `write`: they plant int3s in the target
 /// (`dbg_break`, `dbg_api_start`) or change how it executes (attaching a debugger, debug
 /// registers, registers, stepping).
 const GATED: &[&str] = &[
     "dbg_attach", "dbg_break", "dbg_hwbreak", "dbg_set_regs", "dbg_step", "dbg_continue", "dbg_trace_start", "dbg_api_start",
+    "dbg_step_over", "dbg_step_out", "dbg_run_to",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.
@@ -36,7 +38,7 @@ pub fn annotations(verb: &str, title: &str) -> Value {
         "readOnlyHint": !destructive && !stateful,
         "destructiveHint": destructive,
         // the same write twice leaves the same bytes; attach/detach twice too
-        "idempotentHint": destructive || matches!(verb, "attach" | "detach" | "dbg_detach" | "dbg_trace_stop" | "dbg_api_stop" | "dbg_api_clear" | "watch" | "unwatch" | "ui_set_name" | "ui_set_comment"),
+        "idempotentHint": destructive || matches!(verb, "attach" | "detach" | "dbg_detach" | "dbg_trace_stop" | "dbg_api_stop" | "dbg_api_clear" | "dbg_bp_log_clear" | "watch" | "unwatch" | "ui_set_name" | "ui_set_comment"),
         "openWorldHint": verb == "ui_load_symbols",
     })
 }

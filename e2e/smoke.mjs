@@ -166,10 +166,43 @@ await step("debugger stops at a breakpoint and detaches", async () => {
   await page.locator("button", { hasText: "Attach debugger" }).click();
   await page.locator('input[placeholder="add: address · module+0x…"]').fill(`e2e-target+${sym("classify")}`);
   await page.keyboard.press("Enter");
-  await page.locator("[aria-label=Continue]").click();
+  await page.locator("[aria-label='Run (F9)']").click();
   await until(async () => (await page.locator(".vlist.mono div", { hasText: "breakpoint" }).count()) > 0);
   await page.locator("[aria-label='Detach debugger']").click();
   await until(async () => (await page.locator("button", { hasText: "Attach debugger" }).count()) > 0);
+});
+
+await step("x64dbg-style debugging: logging breakpoint, execute till return, eval, stack", async () => {
+  await tab("Debugger");
+  await page.locator("button", { hasText: "Attach debugger" }).click();
+  try {
+    await page.locator('input[placeholder="add: address · module+0x…"]').fill(`e2e-target+${sym("classify")}`);
+    await page.keyboard.press("Enter");
+    await page.locator(".row-action", { hasText: "edit" }).first().click();
+    await page.locator('input[placeholder^="e.g. rcx == 0"]').fill("$hits == 3");
+    await page.locator('input[placeholder^="e.g. CreateFileW"]').fill("classify({d:edi}) hit {d:$hits}");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await until(async () => (await page.locator("text=break if $hits == 3").count()) > 0);
+    await page.locator("[aria-label='Run (F9)']").click();
+    // two log lines, then the third hit breaks
+    await until(async () => (await page.locator(".vlist.mono div", { hasText: "hit 2" }).count()) > 0);
+    await until(async () => (await page.locator(".vlist.mono div", { hasText: "(hit 3)" }).count()) > 0);
+    // at the entry the stack's top slot is the return address into main
+    await until(async () => (await page.locator(".vlist.mono .row", { hasText: "return to" }).count()) > 0);
+    await page.locator('input[placeholder^="evaluate"]').fill("rip - classify_missing");
+    await page.keyboard.press("Enter");
+    await until(async () => (await page.locator(".vlist.mono div", { hasText: "unknown symbol" }).count()) > 0);
+    await page.locator('input[placeholder^="evaluate"]').fill(`rip - mod.base("e2e-target") == ${sym("classify")}`);
+    await page.keyboard.press("Enter");
+    await until(async () => (await page.locator(".vlist.mono div", { hasText: "= 0x1 (1)" }).count()) > 0);
+    await page.locator(".row-action", { hasText: "remove" }).first().click();
+    await page.locator("[aria-label='Execute till return (Ctrl+F9)']").click();
+    await until(async () => (await page.locator(".vlist.mono div", { hasText: "step out in thread" }).count()) > 0);
+  } finally {
+    // never leave the target stopped under the debugger for the steps after this one
+    await page.locator("[aria-label='Detach debugger']").click().catch(() => undefined);
+    await until(async () => (await page.locator("button", { hasText: "Attach debugger" }).count()) > 0);
+  }
 });
 
 await step("access finder lists the instruction that writes the counter", async () => {
