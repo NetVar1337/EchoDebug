@@ -9,7 +9,8 @@ export type CfgLine = { address: string; length: number; bytes: string; text: st
 export type EdgeKind = "taken" | "fallthrough" | "jump" | "case";
 export type Block = { start: bigint; end: bigint; lines: CfgLine[]; terminator: "ret" | "jmp" | "jcc" | "fall" | "indirect" | "stop" };
 export type CfgEdge = { from: bigint; to: bigint; kind: EdgeKind; label?: string };
-export type Cfg = { entry: bigint; blocks: Block[]; edges: CfgEdge[]; truncated: boolean };
+/** `switches`: the case targets of each resolved indirect jmp (by its address), in table order. */
+export type Cfg = { entry: bigint; blocks: Block[]; edges: CfgEdge[]; truncated: boolean; switches?: Map<bigint, bigint[]> };
 
 export type Flow = { kind: "ret" | "jmp" | "jcc" | "call" | "indirect-jmp" | "stop" | "none"; target: bigint | null };
 
@@ -155,7 +156,7 @@ export async function buildCfg(
     seen.add(k);
     return true;
   });
-  return { entry, blocks, edges: unique, truncated };
+  return { entry, blocks, edges: unique, truncated, switches: caseEdges };
 }
 
 /**

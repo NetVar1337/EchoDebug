@@ -11,9 +11,8 @@
 // two constants from a cmov) is run through the dispatcher by constant
 // evaluation, which gives the real successor. The edges are rewired, the
 // dispatcher becomes unreachable and the state assignments die.
-import { analyze, baseLoc, type Flow } from "./dataflow";
-import { evalConst, simp, stmtDefs, succOf, walk, type Expr, type IrFunc, type Term } from "./ir";
-import { defId } from "./dataflow";
+import { analyze, baseLoc, rdAt, type Flow } from "./dataflow";
+import { evalConst, simp, succOf, walk, type Expr, type IrFunc, type Term } from "./ir";
 
 export type UnflattenReport = {
   flattened: boolean;
@@ -141,14 +140,7 @@ export function unflatten(f: IrFunc): UnflattenReport {
 
   // 4. the state each real block leaves behind
   const flow: Flow = analyze(f);
-  const rdEnd = (block: number, loc: string): number[] => {
-    const stmts = f.blocks[block].stmts;
-    for (let i = stmts.length - 1; i >= 0; i--) {
-      const k = stmtDefs(stmts[i]).indexOf(loc);
-      if (k >= 0) return [defId(stmts[i], k)];
-    }
-    return flow.inSets[block].get(loc) ?? [];
-  };
+  const rdEnd = (block: number, loc: string): number[] => rdAt(f, flow, block, -1, loc);
   const recovered: UnflattenReport["recovered"] = [];
   const unresolved: UnflattenReport["unresolved"] = [];
   const values = new Set<bigint>();

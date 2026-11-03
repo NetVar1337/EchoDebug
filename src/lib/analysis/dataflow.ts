@@ -20,6 +20,8 @@ export type Flow = {
   inSets: Map<string, number[]>[];
   uses: Map<number, Use[]>;
   preds: number[][];
+  /** definitions of a location reaching a block's start */
+  rdIn: (block: number, loc: string) => number[];
 };
 
 const kMaxDefsPerStmt = 64;
@@ -44,7 +46,14 @@ function union(a: number[], b: number[]): number[] {
   }
   return out;
 }
-const sameSet = (a: readonly number[] | undefined, b: readonly number[] | undefined) => (a ?? []).join() === (b ?? []).join();
+function sameSet(a: readonly number[] | undefined, b: readonly number[] | undefined): boolean {
+  const x = a ?? [];
+  const y = b ?? [];
+  if (x === y) return true;
+  if (x.length !== y.length) return false;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
+}
 
 export function livePreds(f: IrFunc): number[][] {
   const preds: number[][] = f.blocks.map(() => []);
@@ -52,22 +61,36 @@ export function livePreds(f: IrFunc): number[][] {
   return preds;
 }
 
-/** Reaching definitions and the def-use chains of every read. Annotates each read's `rd`. */
+/**
+ * Reaching definitions and the def-use chains of every read. Annotates each read's `rd`.
+ * The per-block sets only hold live locations (liveness first), which keeps them small; the
+ * definitions of a location that is not live at a block start are found on demand (`rdIn`).
+ */
 export function analyze(f: IrFunc): Flow {
   const defs = new Map<number, DefInfo>();
   const entryDef = new Map<string, number>();
   const locs = new Set<string>();
-  const noteLocs = (e: Expr) => walk(e, (x) => x.k === "l" && locs.add(x.loc));
+  const nb = f.blocks.length;
+  const ue: Set<string>[] = f.blocks.map(() => new Set());
+  const dfs: Set<string>[] = f.blocks.map(() => new Set());
+  const gen = f.blocks.map(() => new Map<string, number>());
   for (const b of f.blocks) {
     if (b.dead) continue;
+    const used = (e: Expr) => walk(e, (x) => {
+      if (x.k !== "l") return;
+      locs.add(x.loc);
+      if (!dfs[b.id].has(x.loc)) ue[b.id].add(x.loc);
+    });
     b.stmts.forEach((s, i) => {
-      stmtUses(s).forEach(noteLocs);
+      stmtUses(s).forEach(used);
       stmtDefs(s).forEach((l, k) => {
         locs.add(l);
+        dfs[b.id].add(l);
+        gen[b.id].set(l, defId(s, k));
         defs.set(defId(s, k), { id: defId(s, k), loc: l, block: b.id, index: i, stmt: s, w: s.k === "set" ? s.w : s.k === "call" ? s.call.w : 64 });
       });
     });
-    termUses(b.term).forEach(noteLocs);
+    termUses(b.term).forEach(used);
   }
   let n = -1;
   for (const l of [...locs].sort()) {
@@ -76,46 +99,103 @@ export function analyze(f: IrFunc): Flow {
     n--;
   }
   const preds = livePreds(f);
-  const gen = f.blocks.map((b) => {
-    const g = new Map<string, number>();
-    if (!b.dead) b.stmts.forEach((s) => stmtDefs(s).forEach((l, k) => g.set(l, defId(s, k))));
-    return g;
-  });
-  const inSets: Map<string, number[]>[] = f.blocks.map(() => new Map());
-  const outSets: Map<string, number[]>[] = f.blocks.map(() => new Map());
-  const entryMap = new Map<string, number[]>([...entryDef].map(([l, d]) => [l, [d]]));
-  // reverse postorder
+  const succs = f.blocks.map((b) => (b.dead ? [] : succOf(b.term).filter((x) => !f.blocks[x].dead)));
+  // reverse postorder from the entry; unreachable blocks after it (they start from entry values)
   const order: number[] = [];
   const seen = new Set<number>();
-  const visit = (b: number) => {
-    seen.add(b);
-    for (const s of succOf(f.blocks[b].term)) if (!seen.has(s) && !f.blocks[s].dead) visit(s);
-    order.push(b);
-  };
-  if (f.blocks.length) visit(0);
+  if (nb && !f.blocks[0].dead) {
+    const stack: { n: number; i: number }[] = [{ n: 0, i: 0 }];
+    seen.add(0);
+    while (stack.length) {
+      const top = stack[stack.length - 1];
+      if (top.i < succs[top.n].length) {
+        const x = succs[top.n][top.i++];
+        if (!seen.has(x)) {
+          seen.add(x);
+          stack.push({ n: x, i: 0 });
+        }
+      } else {
+        order.push(top.n);
+        stack.pop();
+      }
+    }
+  }
   order.reverse();
-  for (const b of f.blocks) if (!seen.has(b.id) && !b.dead) order.push(b.id); // unreachable blocks: entry values
-  for (let changed = true, iter = 0; changed && iter < 200; iter++) {
+  for (const b of f.blocks) if (!seen.has(b.id) && !b.dead) order.push(b.id);
+  // liveness
+  const liveIn: Set<string>[] = f.blocks.map((b) => new Set(ue[b.id]));
+  const liveOut: Set<string>[] = f.blocks.map(() => new Set());
+  for (let changed = true, iter = 0; changed && iter < 500; iter++) {
+    changed = false;
+    for (let k = order.length - 1; k >= 0; k--) {
+      const b = order[k];
+      const out = liveOut[b];
+      for (const s of succs[b]) for (const l of liveIn[s]) if (!out.has(l)) out.add(l);
+      const inn = liveIn[b];
+      for (const l of out) if (!dfs[b].has(l) && !inn.has(l)) {
+        inn.add(l);
+        changed = true;
+      }
+    }
+  }
+  // reaching definitions of the live locations
+  const inSets: Map<string, number[]>[] = f.blocks.map(() => new Map());
+  const outSets: Map<string, number[]>[] = f.blocks.map(() => new Map());
+  for (let changed = true, iter = 0; changed && iter < 500; iter++) {
     changed = false;
     for (const b of order) {
-      let inn: Map<string, number[]>;
-      if (b === 0 || !seen.has(b)) inn = new Map(entryMap);
-      else inn = new Map();
-      for (const p of preds[b]) {
-        for (const [l, ds] of outSets[p]) inn.set(l, union(inn.get(l) ?? [], ds));
+      const inn = new Map<string, number[]>();
+      const root = b === 0 || !seen.has(b);
+      for (const l of liveIn[b]) {
+        let ds: number[] = root ? [entryDef.get(l)!] : [];
+        for (const p of preds[b]) {
+          const o = outSets[p].get(l);
+          if (o) ds = union(ds, o);
+        }
+        inn.set(l, ds);
       }
-      const out = new Map(inn);
-      for (const [l, d] of gen[b]) out.set(l, [d]);
-      const prev = outSets[b];
-      let diff = prev.size !== out.size;
-      if (!diff) for (const [l, ds] of out) if (!sameSet(prev.get(l), ds)) { diff = true; break; }
       inSets[b] = inn;
-      if (diff) {
+      const prev = outSets[b];
+      let diff = false;
+      const out = new Map<string, number[]>();
+      for (const l of liveOut[b]) {
+        const g = gen[b].get(l);
+        const ds = g !== undefined ? [g] : inn.get(l) ?? [];
+        out.set(l, ds);
+        if (!diff && !sameSet(prev.get(l), ds)) diff = true;
+      }
+      if (diff || prev.size !== out.size) {
         outSets[b] = out;
         changed = true;
       }
     }
   }
+  // definitions of any location at a block start, live or not
+  const memo = new Map<string, number[]>();
+  const rdIn = (block: number, loc: string): number[] => {
+    const known = inSets[block].get(loc);
+    if (known) return known;
+    const key = `${block}|${loc}`;
+    const m = memo.get(key);
+    if (m) return m;
+    const found = new Set<number>();
+    const visited = new Set<number>();
+    const stack = [block];
+    while (stack.length) {
+      const x = stack.pop()!;
+      if (visited.has(x)) continue;
+      visited.add(x);
+      if (x === 0 || !seen.has(x)) found.add(entryDef.get(loc) ?? entryDef.size * -1 - 1);
+      for (const p of preds[x]) {
+        const g = gen[p].get(loc);
+        if (g !== undefined) found.add(g);
+        else stack.push(p);
+      }
+    }
+    const r = [...found].sort((a, b) => a - b);
+    memo.set(key, r);
+    return r;
+  };
   // annotate reads
   const uses = new Map<number, Use[]>();
   const addUse = (u: Use) => {
@@ -130,7 +210,7 @@ export function analyze(f: IrFunc): Flow {
     const cur = new Map(inSets[b.id]);
     const ann = (e: Expr, index: number, host: Stmt | null) => walk(e, (x) => {
       if (x.k !== "l") return;
-      x.rd = cur.get(x.loc) ?? [];
+      x.rd = cur.get(x.loc) ?? rdIn(b.id, x.loc);
       addUse({ node: x, block: b.id, index, host });
     });
     b.stmts.forEach((s, i) => {
@@ -139,18 +219,18 @@ export function analyze(f: IrFunc): Flow {
     });
     termUses(b.term).forEach((e) => ann(e, -1, null));
   }
-  return { defs, entryDef, inSets, uses, preds };
+  return { defs, entryDef, inSets, uses, preds, rdIn };
 }
 
 /** Definitions of `loc` reaching the point before statement `index` (-1: before the terminator). */
-function rdAt(f: IrFunc, flow: Flow, block: number, index: number, loc: string): number[] {
+export function rdAt(f: IrFunc, flow: Flow, block: number, index: number, loc: string): number[] {
   const stmts = f.blocks[block].stmts;
   for (let i = (index < 0 ? stmts.length : index) - 1; i >= 0; i--) {
     const ds = stmtDefs(stmts[i]);
     const k = ds.indexOf(loc);
     if (k >= 0) return [defId(stmts[i], k)];
   }
-  return flow.inSets[block].get(loc) ?? [];
+  return flow.rdIn(block, loc);
 }
 
 const isBarrier = (s: Stmt) => s.k === "st" || s.k === "call" || s.k === "asm";
@@ -495,12 +575,20 @@ export function webs(flow: Flow): Map<number, number> {
   const find = (x: number): number => {
     let r = x;
     while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
-    parent.set(x, r);
+    // path compression
+    for (let y = x; y !== r; ) {
+      const nx = parent.get(y)!;
+      parent.set(y, r);
+      y = nx;
+    }
     return r;
   };
   for (const d of flow.defs.keys()) parent.set(d, d);
+  const done = new Set<L>();
   for (const list of flow.uses.values()) {
     for (const u of list) {
+      if (done.has(u.node)) continue; // a read is listed under each of its definitions
+      done.add(u.node);
       const rd = u.node.rd ?? [];
       for (let i = 1; i < rd.length; i++) {
         const a = find(rd[0]);

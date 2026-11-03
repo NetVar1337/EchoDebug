@@ -17,13 +17,18 @@ export type Prototype = {
 /** Looks up a prototype by the callee's address (0x hex) and, when known, its name. */
 export type PrototypeProvider = (address: string | null, name: string | null) => Prototype | null | undefined;
 
-const providers: { id: string; p: PrototypeProvider }[] = [];
+const providers: { id: string; p: PrototypeProvider; fallback: boolean }[] = [];
 
-/** Adds (or replaces, by id) a provider. Returns a function that removes it. */
-export function registerPrototypeProvider(id: string, p: PrototypeProvider): () => void {
+/**
+ * Adds (or replaces, by id) a provider. A `fallback` provider (a guess, like the argument count
+ * of an analysed callee) is asked only after the others and the built-in table. Returns a function
+ * that removes it.
+ */
+export function registerPrototypeProvider(id: string, p: PrototypeProvider, opts: { fallback?: boolean } = {}): () => void {
+  const entry = { id, p, fallback: !!opts.fallback };
   const i = providers.findIndex((x) => x.id === id);
-  if (i >= 0) providers[i] = { id, p };
-  else providers.push({ id, p });
+  if (i >= 0) providers[i] = entry;
+  else providers.push(entry);
   return () => {
     const j = providers.findIndex((x) => x.id === id && x.p === p);
     if (j >= 0) providers.splice(j, 1);
@@ -100,15 +105,21 @@ export function bareName(name: string): string {
   return name.replace(/^.*!/, "").replace(/^__imp_/, "").replace(/@plt$|@@.*$|@\d+$/, "").replace(/^_(?=[a-z])/, "");
 }
 
-/** The first provider's answer, else the built-in table by name. */
+/** The first provider's answer, else the built-in table by name, else a fallback provider's. */
 export function lookupPrototype(address: string | null, name: string | null): Prototype | null {
-  for (const { p } of providers) {
+  for (const { p, fallback } of providers) {
+    if (fallback) continue;
     const r = p(address, name);
     if (r) return r;
   }
   if (name) {
     const k = kKnownPrototypes[name] ?? kKnownPrototypes[bareName(name)];
     if (k) return k;
+  }
+  for (const { p, fallback } of providers) {
+    if (!fallback) continue;
+    const r = p(address, name);
+    if (r) return r;
   }
   return null;
 }
