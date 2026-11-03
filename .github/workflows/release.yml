@@ -100,7 +100,7 @@ jobs:
             printf '\n\n**Echo agent (Windows):** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
             echo "__NOTES__"
           } >> "$GITHUB_OUTPUT"
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
