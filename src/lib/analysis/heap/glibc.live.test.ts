@@ -144,7 +144,9 @@ describe.runIf(hasCc)("glibc heap explorer against a live process", () => {
 
   it("finds main_arena and walks the main heap without errors", () => {
     expect(report.platform).toBe("glibc");
-    expect(report.heaps.find((h) => h.label === "main_arena")).toBeTruthy();
+    // the source and notes say how the arena was (not) found, which is what a failure needs
+    const why = JSON.stringify({ source: report.source, version: report.version, notes: report.notes, errors: report.errors.slice(0, 5), heaps: report.heaps.map((h) => h.label) });
+    expect(report.heaps.find((h) => h.label === "main_arena"), why).toBeTruthy();
     expect(report.errors).toEqual([]);
     expect(report.version).toMatch(/^2\.\d+$/);
   });
