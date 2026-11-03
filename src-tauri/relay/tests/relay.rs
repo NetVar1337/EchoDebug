@@ -450,7 +450,7 @@ async fn mcp_prompts_resources_and_call_log() {
     // prompts/list + prompts/get with argument substitution
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/list" }), None).await;
     let names: Vec<&str> = r["result"]["prompts"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-    for want in ["explain_function", "find_pattern", "find_string", "pointer_path", "scan_value", "triage_module", "find_vtable", "make_signature", "diff_snapshots", "unpack_module", "decrypt_strings"] {
+    for want in ["explain_function", "find_pattern", "find_string", "pointer_path", "scan_value", "triage_module", "find_vtable", "make_signature", "diff_snapshots", "unpack_module", "decrypt_strings", "find_value_references", "rebuild_class", "update_signatures_after_patch"] {
         assert!(names.contains(&want), "missing prompt {want}");
     }
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": { "name": "explain_function", "arguments": { "address": "0x140001000" } } }), None).await;
@@ -565,7 +565,7 @@ async fn token_guards_client_and_mcp() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = router(relay)
+    let resp = router(relay.clone())
         .oneshot(
             Request::post("/mcp")
                 .header(header::AUTHORIZATION, "Bearer wrong")
@@ -575,6 +575,22 @@ async fn token_guards_client_and_mcp() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // regeneration (the app's set_token) takes effect immediately; open sockets stay up
+    relay.set_token(Some("rotated-token-0123456789abcdef01234".into()));
+    let post = |auth: &'static str| {
+        router(relay.clone()).oneshot(
+            Request::post("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::from(ping.to_string()))
+                .unwrap(),
+        )
+    };
+    assert_eq!(post("Bearer s3cret-token-0123456789abcdef0123").await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(post("Bearer rotated-token-0123456789abcdef01234").await.unwrap().status(), StatusCode::OK);
+    send(&mut ok, json!({ "type": "status", "id": 2 })).await;
+    assert_eq!(recv_until(&mut ok, |v| v["id"] == 2).await["type"], "status_result");
 }
 
 #[tokio::test]
@@ -745,4 +761,59 @@ async fn mcp_policy_annotations_templates_completion() {
     send(&mut c, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_names", "result": { "names": [{ "name": "decrypt_string" }, { "name": "main" }] } })).await;
     let (_, r) = comp.await.unwrap();
     assert_eq!(r["result"]["completion"]["values"], json!(["decrypt_string"]), "{r}");
+}
+
+#[tokio::test]
+async fn annotation_tools_go_through_provider_and_policy() {
+    let (addr, relay) = start().await;
+    let call = |id: u64, name: &str, args: Value| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
+    let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap().to_owned();
+
+    // annotations: listing is read-only, naming changes EchoDebug state, revert writes the target
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("missing tool {n}")).clone();
+    for n in ["list_names", "list_comments", "list_patches", "list_signatures"] {
+        assert_eq!(tool(n)["annotations"]["readOnlyHint"], true, "{n}");
+    }
+    assert_eq!(tool("set_name")["annotations"]["readOnlyHint"], false);
+    assert_eq!(tool("set_name")["annotations"]["destructiveHint"], false);
+    assert_eq!(tool("set_comment")["annotations"]["readOnlyHint"], false);
+    assert_eq!(tool("revert_patch")["annotations"]["destructiveHint"], true);
+
+    // no app window: the provider error, not a hang
+    let (_, r) = mcp(&relay, call(2, "list_names", json!({})), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("app window"), "{r}");
+
+    // the window serves them as ui_* provider verbs
+    let mut app = connect(addr, "/client").await;
+    send(&mut app, json!({ "type": "provide", "id": 9, "verbs": ["ui_set_name", "ui_revert_patch", "ui_approve"] })).await;
+    recv_until(&mut app, |v| v["type"] == "provide_result" && v["id"] == 9).await;
+    let relay2 = relay.clone();
+    let pending = tokio::spawn(async move { mcp(&relay2, call(3, "set_name", json!({ "address": "0x140001000", "name": "main" })), None).await });
+    let req = recv_until(&mut app, |v| v["type"] == "provider_call").await;
+    assert_eq!(req["verb"], "ui_set_name");
+    assert_eq!((req["args"]["address"].as_str(), req["args"]["name"].as_str()), (Some("0x140001000"), Some("main")));
+    send(&mut app, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_set_name", "result": { "address": "0x140001000", "name": "main" } })).await;
+    let (_, r) = pending.await.unwrap();
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(r["result"]["structuredContent"]["name"], "main");
+
+    // read-only policy: revert_patch is refused before reaching the window; naming still works
+    send(&mut app, json!({ "type": "mcp_policy", "id": 10, "mode": "readonly" })).await;
+    recv_until(&mut app, |v| v["id"] == 10).await;
+    let (_, r) = mcp(&relay, call(4, "revert_patch", json!({ "patch_id": "p1" })), None).await;
+    assert!(text(&r).contains("read-only"), "{r}");
+
+    // ask policy: the window is asked first, and a refusal stops the revert
+    send(&mut app, json!({ "type": "mcp_policy", "id": 11, "mode": "ask" })).await;
+    recv_until(&mut app, |v| v["id"] == 11).await;
+    let relay3 = relay.clone();
+    let pending = tokio::spawn(async move { mcp(&relay3, call(5, "revert_patch", json!({ "patch_id": "p1" })), None).await });
+    let ask = recv_until(&mut app, |v| v["type"] == "provider_call").await;
+    assert_eq!((ask["verb"].as_str(), ask["args"]["tool"].as_str()), (Some("ui_approve"), Some("revert_patch")));
+    send(&mut app, json!({ "type": "provider_reply", "call": ask["call"], "verb": "ui_approve", "result": { "approved": false } })).await;
+    let (_, r) = pending.await.unwrap();
+    assert!(text(&r).contains("denied"), "{r}");
 }

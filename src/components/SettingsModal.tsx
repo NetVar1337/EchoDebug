@@ -1,7 +1,7 @@
 import { useProjects } from "@/lib/projects";
 import type { ReactNode } from "react";
 import { Check, X } from "lucide-react";
-import { useConn } from "@/store/conn";
+import { mcpAddCommand, useConn } from "@/store/conn";
 import { kMotionPrefs, useMotion } from "@/store/motion";
 import { attempt, log } from "@/store/output";
 import { useUi, type Theme } from "@/store/ui";
@@ -69,9 +69,14 @@ export default function SettingsModal() {
             <Row label="MCP endpoint" hint="Tool catalog and live call log live in the MCP Server panel.">
               <CopyChip text={endpoint} copied={copied} onCopy={copy} />
             </Row>
-            <Row label="Add to Claude Code">
-              <CopyChip text={`claude mcp add --transport http echodebug ${endpoint}`} copied={copied} onCopy={copy} />
+            <Row label="Add to Claude Code" hint="Includes this install's bearer token; /mcp rejects requests without it.">
+              <CopyChip text={mcpAddCommand(conn.port, conn.token)} copied={copied} onCopy={copy} />
             </Row>
+            {isTauri() && conn.token && (
+              <Row label="MCP token" hint="Regenerating locks out MCP clients until they are re-added with the new command.">
+                <button className="btn" onClick={() => void attempt("token", conn.regenerateToken())}>Regenerate token</button>
+              </Row>
+            )}
             {windowsOnly ? (
               <Row label="Agent script" hint={<>Load <span className="mono">echo_debug.as</span> in Echo, installed to <span className="mono">%APPDATA%\scripts</span>.</>}>
                 <div className="row">

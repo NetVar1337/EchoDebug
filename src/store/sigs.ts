@@ -20,6 +20,8 @@ export type Signature = {
   created: number;
   /** how many hits the last scan found */
   hits: number;
+  /** address - module base when it was saved or last checked ("0x…"); lets the health check tell a moved match from an ASLR rebase */
+  rva?: string;
 };
 
 type SigStore = {

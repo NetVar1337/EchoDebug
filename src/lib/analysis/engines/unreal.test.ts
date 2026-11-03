@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { dumpObjects, findNamePools, findObjectArrays, fullName, kDefaultOffsets as O, NamePool, ObjectArray, readStruct, sdkText, type Mem } from "./unreal";
+import {
+  decodeLegacyEntry, decodeNameHeader, decodePoolEntry, dumpObjects, findNamePools, findObjectArrays, fnameString, fullName, kDefaultOffsets as O,
+  LegacyNames, listObjects, NamePool, ObjectArray, readStruct, ripTarget, sdkText, type Mem,
+} from "./unreal";
 
 /** Sparse fake process memory. */
 class Fake implements Mem {
@@ -107,5 +110,112 @@ describe("unreal dumper", () => {
     expect(text).toContain("class APawn : public AActor {");
     expect(text).toContain("int32 Health; // 0x0028(0x0004)");
     expect(text).toContain("bool bAlive : 1; // mask 0x01 0x002F(0x0001)");
+  });
+});
+
+const poolEntry = (s: string, wide = false) => {
+  const b = new Uint8Array(2 + s.length * (wide ? 2 : 1));
+  const dv = new DataView(b.buffer);
+  dv.setUint16(0, (s.length << 6) | (wide ? 1 : 0), true);
+  for (let i = 0; i < s.length; i++) wide ? dv.setUint16(2 + i * 2, s.charCodeAt(i), true) : (b[2 + i] = s.charCodeAt(i));
+  return b;
+};
+
+describe("unreal names and object pages", () => {
+  it("decodes FNameEntry headers, entries and display names", () => {
+    expect(decodeNameHeader((4 << 6) | 1)).toEqual({ wide: true, len: 4 });
+    expect(decodePoolEntry(poolEntry("None"))).toBe("None");
+    expect(decodePoolEntry(poolEntry("Ünïcode", true))).toBe("Ünïcode");
+    expect(decodePoolEntry(poolEntry("Truncated").subarray(0, 5))).toBeNull();
+    expect(fnameString("Actor", 0)).toBe("Actor");
+    expect(fnameString("Actor", 3)).toBe("Actor_2");
+  });
+
+  it("decodes legacy entries", () => {
+    const b = new Uint8Array(0x20);
+    new DataView(b.buffer).setInt32(0, 5 << 1, true);
+    b.set(new TextEncoder().encode("ByteProperty"), 0x10);
+    expect(decodeLegacyEntry(b)).toBe("ByteProperty");
+  });
+
+  it("resolves RIP-relative operands", () => {
+    const d = new Uint8Array(4);
+    new DataView(d.buffer).setInt32(0, -0x10, true);
+    expect(ripTarget(0x140001000n, d, 7)).toBe(0x140000ff7n);
+  });
+
+  it("reads wide names out of a later FNamePool block", async () => {
+    const mem = new Fake();
+    const pool = 0x140100000n, block0 = 0x20000000n, block1 = 0x20100000n;
+    mem.i32(pool + 8n, 1); // CurrentBlock
+    mem.i32(pool + 12n, 0x10);
+    mem.u64(pool + 16n, block0);
+    mem.u64(pool + 24n, block1);
+    mem.put(block0, poolEntry("None"));
+    mem.put(block1 + 4n, poolEntry("Wïde", true));
+    const np = new NamePool(mem, pool);
+    expect(await np.init()).toBe(true);
+    expect(await np.name((1 << 16) | 2)).toBe("Wïde");
+    expect(await np.name(5 << 16)).toBe("name#327680"); // no such block
+  });
+
+  it("reads names out of legacy GNames", async () => {
+    const mem = new Fake();
+    const g = 0x20000000n, chunk = 0x20010000n;
+    mem.u64(g, chunk);
+    const entry = (i: number, s: string) => {
+      const at = 0x20020000n + BigInt(i) * 0x200n;
+      mem.u64(chunk + BigInt(i) * 8n, at);
+      mem.put(at, new Uint8Array(0x10 + 0x100));
+      mem.i32(at, i << 1);
+      mem.put(at + 0x10n, new TextEncoder().encode(s + "\0"));
+    };
+    entry(0, "None");
+    entry(7, "Object");
+    const n = new LegacyNames(mem, g);
+    expect(await n.init()).toBe(true);
+    expect(await n.name(7)).toBe("Object");
+    expect(await n.name(7, 2)).toBe("Object_1");
+  });
+
+  it("lists GUObjectArray pages with names and classes, skipping free slots", async () => {
+    const mem = new Fake();
+    const pool = 0x140100000n, block = 0x20000000n;
+    mem.i32(pool + 8n, 0);
+    mem.i32(pool + 12n, 0x40);
+    mem.u64(pool + 16n, block);
+    mem.put(block, poolEntry("None")); // 0
+    mem.put(block + 0x10n, poolEntry("Class")); // 8
+    mem.put(block + 0x20n, poolEntry("Package")); // 0x10
+    mem.put(block + 0x30n, poolEntry("PlayerPawn")); // 0x18
+
+    const gobj = 0x140200000n, chunks = 0x21000000n, items = 0x22000000n;
+    mem.put(gobj, new Uint8Array(0x30));
+    mem.u64(gobj + 0x10n, chunks);
+    mem.i32(gobj + 0x24n, 3); // Num
+    mem.i32(gobj + 0x2cn, 1); // NumChunks
+    mem.u64(chunks, items);
+    mem.put(items, new Uint8Array(3 * O.itemSize));
+    const obj = (addr: bigint, cls: bigint, name: number, num = 0) => {
+      mem.put(addr, new Uint8Array(0x28));
+      mem.u64(addr + BigInt(O.objClass), cls); mem.i32(addr + BigInt(O.objName), name); mem.i32(addr + BigInt(O.objName + 4), num);
+    };
+    const classClass = 0x23000000n, pkgClass = 0x23000100n, pawn = 0x23000200n;
+    obj(classClass, classClass, 8);
+    obj(pkgClass, classClass, 0x10);
+    obj(pawn, pkgClass, 0x18, 4);
+    mem.u64(items, classClass);
+    mem.u64(items + BigInt(2 * O.itemSize), pawn); // slot 1 is free
+
+    const oa = new ObjectArray(mem, gobj);
+    expect(await oa.init()).toBe(true);
+    const np = new NamePool(mem, pool);
+    expect(await np.init()).toBe(true);
+    const rows = await listObjects(np, oa, 0, 10);
+    expect(rows.map((x) => [x.index, x.name, x.className])).toEqual([
+      [0, "Class", "Class"],
+      [2, "PlayerPawn_3", "Package"],
+    ]);
+    expect(await listObjects(np, oa, 1, 1)).toEqual([]);
   });
 });

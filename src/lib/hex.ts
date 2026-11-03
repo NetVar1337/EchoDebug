@@ -75,3 +75,17 @@ export function moduleOf(a: bigint, modules: readonly Module[]): Module | undefi
     return a >= b && a < b + BigInt(m.size);
   });
 }
+
+/** Classic 16-bytes-per-line dump of a hex string starting at `base`: address, bytes, ASCII. */
+export function hexDump(base: string, hex: string): string {
+  const b = hexToBytes(hex);
+  const start = toBig(base);
+  const lines: string[] = [];
+  for (let o = 0; o < b.length; o += 16) {
+    const row = b.subarray(o, o + 16);
+    const bytes = Array.from(row, (x) => x.toString(16).padStart(2, "0")).join(" ").padEnd(47);
+    const ascii = Array.from(row, (x) => (x >= 0x20 && x < 0x7f ? String.fromCharCode(x) : ".")).join("");
+    lines.push(`${fmtAddr(start + BigInt(o))}  ${bytes}  ${ascii}`);
+  }
+  return lines.join("\n");
+}

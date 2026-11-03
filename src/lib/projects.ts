@@ -3,17 +3,27 @@
 // as you work and re-applied when the same build is loaded again, wherever ASLR puts it.
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { toBig, type Module } from "./hex";
+//
+// When a module's build changes (a new key for a module that has a project under an older key),
+// saved items can be re-located: every name and bookmark that was given a relocation signature
+// (`sig`, made by signProjects) is searched for in the new build and moved to where it matches now.
+import { toBig, fmtAddr, type Module } from "./hex";
 import { readBytes } from "./memory";
+import { request } from "./client";
+import { makeSignature, toIda, type Insn } from "./analysis/sigmaker";
+import { classify, countRelocation, type Located } from "./analysis/sigrepair";
 import { useConn } from "@/store/conn";
 import { useNames, type NameEntry } from "@/store/names";
 import { log } from "@/store/output";
+import { useSigs, type Signature } from "@/store/sigs";
 import { useWatch, type Bookmark } from "@/store/watch";
 
-export type ProjectEntry = { rva: number; name: string; comment: string };
-export type ProjectBookmark = { rva: number; label: string };
+/** `sig`: optional IDA pattern unique at the entry, used to re-locate it in a different build. */
+export type ProjectEntry = { rva: number; name: string; comment: string; sig?: string };
+export type ProjectBookmark = { rva: number; label: string; sig?: string };
 export type Project = { key: string; module: string; updated: number; names: ProjectEntry[]; bookmarks: ProjectBookmark[] };
-export type ProjectFile = { format: "echodebug.project"; version: 1; projects: Project[] };
+/** `signatures` (optional) carries the signature catalog along with the module projects. */
+export type ProjectFile = { format: "echodebug.project"; version: 1; projects: Project[]; signatures?: Signature[] };
 
 type ProjectStore = {
   projects: Record<string, Project>;
@@ -96,16 +106,66 @@ export async function moduleKey(m: Module): Promise<string> {
 
 const norm = (a: bigint) => a.toString(16).padStart(16, "0");
 
-/** Names/bookmarks of one module as a project (relative to its base). */
-export function collect(m: Module, key: string, names: readonly NameEntry[], bookmarks: readonly Bookmark[]): Project {
+/**
+ * Names/bookmarks of one module as a project (relative to its base). Relocation signatures of
+ * `prev` (the stored project) are kept for entries still at the same RVA.
+ */
+export function collect(m: Module, key: string, names: readonly NameEntry[], bookmarks: readonly Bookmark[], prev?: Project): Project {
   const base = toBig(m.base);
   const end = base + BigInt(m.size);
   const inMod = (a: bigint) => a >= base && a < end;
+  const nameSig = new Map(prev?.names.filter((e) => e.sig).map((e) => [e.rva, e.sig!]));
+  const markSig = new Map(prev?.bookmarks.filter((e) => e.sig).map((e) => [e.rva, e.sig!]));
+  const withSig = <T extends { rva: number }>(e: T, sigs: Map<number, string>): T => {
+    const sig = sigs.get(e.rva);
+    return sig ? { ...e, sig } : e;
+  };
   return {
     key, module: m.name, updated: Date.now(),
-    names: names.map((n) => ({ a: toBig("0x" + n.address), n })).filter((x) => inMod(x.a)).map((x) => ({ rva: Number(x.a - base), name: x.n.name, comment: x.n.comment })),
-    bookmarks: bookmarks.map((b) => ({ a: toBig(b.address), b })).filter((x) => inMod(x.a)).map((x) => ({ rva: Number(x.a - base), label: x.b.label })),
+    names: names.map((n) => ({ a: toBig("0x" + n.address), n })).filter((x) => inMod(x.a)).map((x) => withSig({ rva: Number(x.a - base), name: x.n.name, comment: x.n.comment }, nameSig)),
+    bookmarks: bookmarks.map((b) => ({ a: toBig(b.address), b })).filter((x) => inMod(x.a)).map((x) => withSig({ rva: Number(x.a - base), label: x.b.label }, markSig)),
   };
+}
+
+/** The most recently updated project of the same module under a different build key, if it has entries. */
+export function previousBuild(projects: Record<string, Project>, module: string, key: string): Project | null {
+  const lower = module.toLowerCase();
+  let best: Project | null = null;
+  for (const p of Object.values(projects)) {
+    if (p.key === key || p.module.toLowerCase() !== lower || !(p.names.length || p.bookmarks.length)) continue;
+    if (!best || p.updated > best.updated) best = p;
+  }
+  return best;
+}
+
+export type Relocation = { kind: "name" | "bookmark"; label: string; oldRva: number; newRva?: number; status: Located["status"] | "nosig" };
+
+/**
+ * A project moved to another build of its module: every entry with a relocation signature is
+ * searched for (`find` returns absolute hit addresses) and moved when it matches once at a new
+ * RVA. Entries without a signature, or whose signature is missing or ambiguous, keep their RVA.
+ */
+export async function relocateProject(p: Project, key: string, m: Module, find: (ida: string) => Promise<string[]>): Promise<{ project: Project; rows: Relocation[] }> {
+  const base = toBig(m.base);
+  const rows: Relocation[] = [];
+  const move = async <T extends { rva: number; sig?: string }>(kind: Relocation["kind"], e: T, label: string): Promise<T> => {
+    if (!e.sig) {
+      rows.push({ kind, label, oldRva: e.rva, status: "nosig" });
+      return e;
+    }
+    const hits = await find(e.sig).catch(() => [] as string[]);
+    const c = classify(BigInt(e.rva), hits.map((h) => toBig(h) - base));
+    const row: Relocation = { kind, label, oldRva: e.rva, status: c.status };
+    rows.push(row);
+    if (c.status !== "moved" || c.rva === undefined) return e;
+    row.newRva = Number(c.rva);
+    return { ...e, rva: row.newRva };
+  };
+  const names: ProjectEntry[] = [];
+  for (const e of p.names) names.push(await move("name", e, e.name || e.comment));
+  const bookmarks: ProjectBookmark[] = [];
+  for (const b of p.bookmarks) bookmarks.push(await move("bookmark", b, b.label));
+  return { project: { key, module: m.name, updated: Date.now(), names, bookmarks }, rows };
 }
 
 /** Merges a project into the live stores at the module's current base (existing entries win). */
@@ -150,6 +210,12 @@ export function startProjects(): void {
       if (p && (p.names.length || p.bookmarks.length)) {
         const r = apply(p, m);
         if (r.names || r.bookmarks) log("info", "project", `${m.name}: restored ${r.names} names and ${r.bookmarks} bookmarks`);
+      } else {
+        const old = previousBuild(useProjects.getState().projects, m.name, k);
+        if (old && !useRelocation.getState().changed.some((c) => c.toKey === k)) {
+          useRelocation.setState((s) => ({ changed: [...s.changed, { module: m.name, base: m.base, fromKey: old.key, toKey: k }] }));
+          log("warn", "project", `${m.name} is a different build than its saved project; re-locate the saved items from the Names panel`);
+        }
       }
     }
   };
@@ -162,8 +228,8 @@ export function startProjects(): void {
       for (const m of useConn.getState().modules) {
         const k = await moduleKey(m).catch(() => null);
         if (!k) continue;
-        const p = collect(m, k, names, bookmarks);
         const old = useProjects.getState().projects[k];
+        const p = collect(m, k, names, bookmarks, old);
         if (p.names.length || p.bookmarks.length || old) useProjects.getState().put(p);
       }
     }, 1500);
@@ -180,12 +246,102 @@ export function startProjects(): void {
 }
 
 export function exportProjects(): ProjectFile {
-  return { format: "echodebug.project", version: 1, projects: Object.values(useProjects.getState().projects) };
+  return { format: "echodebug.project", version: 1, projects: Object.values(useProjects.getState().projects), signatures: useSigs.getState().sigs };
 }
 
 export function importProjects(f: ProjectFile): number {
   if (f?.format !== "echodebug.project" || !Array.isArray(f.projects)) throw new Error("not an EchoDebug project file");
   for (const p of f.projects) useProjects.getState().put(p);
+  if (Array.isArray(f.signatures) && f.signatures.length) {
+    // saved signatures with the same id are replaced, the rest are added
+    const ids = new Set(f.signatures.map((s) => s.id));
+    useSigs.setState((s) => ({ sigs: [...f.signatures!, ...s.sigs.filter((x) => !ids.has(x.id))] }));
+  }
   applied.clear();
   return f.projects.length;
+}
+
+// ---- re-location across builds ----
+
+export type BuildChange = { module: string; base: string; fromKey: string; toKey: string };
+
+type RelocationStore = {
+  /** loaded modules whose build has no project yet, but an older build of the same module does */
+  changed: BuildChange[];
+  busy: string;
+  last: { module: string; rows: Relocation[] } | null;
+};
+
+export const useRelocation = create<RelocationStore>()(() => ({ changed: [], busy: "", last: null }));
+
+/** Every match of an IDA pattern in a module. */
+export async function sigHits(pattern: string, module: string): Promise<string[]> {
+  const r = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern, module, find_all: true }, true);
+  return r.success ? r.results ?? [] : [];
+}
+
+const loaded = (c: BuildChange) => useConn.getState().modules.find((m) => m.base === c.base && m.name.toLowerCase() === c.module.toLowerCase());
+const dismiss = (c: BuildChange) => useRelocation.setState((s) => ({ changed: s.changed.filter((x) => x.toKey !== c.toKey) }));
+
+/** Searches the new build for every signed item of the old project, stores the result as the new build's project and applies it. */
+export async function relocate(c: BuildChange): Promise<void> {
+  const m = loaded(c);
+  const old = useProjects.getState().projects[c.fromKey];
+  if (!m || !old) return dismiss(c);
+  useRelocation.setState({ busy: `re-locating ${m.name}` });
+  try {
+    const { project, rows } = await relocateProject(old, c.toKey, m, (ida) => sigHits(ida, m.name));
+    useProjects.getState().put(project);
+    apply(project, m);
+    useRelocation.setState({ last: { module: m.name, rows } });
+    const n = countRelocation(rows.map((r) => r.status));
+    log("info", "project", `${m.name}: ${n.matched} matched, ${n.moved} moved, ${n.lost} lost`);
+  } finally {
+    useRelocation.setState({ busy: "" });
+    dismiss(c);
+  }
+}
+
+/** Uses the old project's RVAs unchanged in the new build. */
+export function keepRvas(c: BuildChange): void {
+  const m = loaded(c);
+  const old = useProjects.getState().projects[c.fromKey];
+  dismiss(c);
+  if (!m || !old) return;
+  const p = { ...old, key: c.toKey, module: m.name, updated: Date.now() };
+  useProjects.getState().put(p);
+  apply(p, m);
+}
+
+/**
+ * Makes a relocation signature for every name, comment and bookmark of the loaded modules that
+ * lacks one, so their projects can follow the module into a new build.
+ */
+export async function signProjects(): Promise<{ made: number; failed: number }> {
+  let made = 0;
+  let failed = 0;
+  try {
+    for (const m of useConn.getState().modules) {
+      const k = await moduleKey(m).catch(() => null);
+      if (!k) continue;
+      const p = collect(m, k, useNames.getState().names, useWatch.getState().bookmarks, useProjects.getState().projects[k]);
+      const todo = [...p.names, ...p.bookmarks].filter((e) => !e.sig);
+      if (!todo.length) continue;
+      const base = toBig(m.base);
+      for (const [i, e] of todo.entries()) {
+        useRelocation.setState({ busy: `signing ${m.name} ${i + 1}/${todo.length}` });
+        const insns = await request<{ results: Insn[] }>("disassemble", { address: fmtAddr(base + BigInt(e.rva)), size: 0x200 }, true).then((r) => r.results ?? []).catch(() => [] as Insn[]);
+        const r = insns.length ? await makeSignature(insns, async (pat) => (await sigHits(pat, m.name)).length).catch(() => null) : null;
+        if (r) {
+          e.sig = toIda(r.pattern);
+          made++;
+        } else failed++;
+      }
+      useProjects.getState().put({ ...p, updated: Date.now() });
+    }
+  } finally {
+    useRelocation.setState({ busy: "" });
+  }
+  log("info", "project", `signed: ${made} signature${made === 1 ? "" : "s"} made${failed ? `, ${failed} addresses without a unique signature` : ""}`);
+  return { made, failed };
 }
