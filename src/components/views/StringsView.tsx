@@ -4,6 +4,7 @@ import { fmtAddr, labelAddr, toBig } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
 import { xrefsTo, type LiveXref } from "@/lib/live";
 import { extractStrings, type FoundString } from "@/lib/analysis/strings";
+import { rememberStrings } from "@/lib/searchsources";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
@@ -40,6 +41,7 @@ export default function StringsView() {
       setProgress(1);
       const s = extractStrings(img, minLen);
       setStrings(s);
+      rememberStrings(m, s);
       log("info", "strings", `${s.length} strings in ${m.name}`);
     });
     return () => { live = false; };

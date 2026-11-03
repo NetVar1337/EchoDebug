@@ -154,3 +154,42 @@ export function imphash(pe: PeInfo): string {
   }
   return parts.length ? md5(parts.join(",")) : "";
 }
+
+export type CodeView = NonNullable<DebugEntry["codeview"]>;
+
+/** The RSDS record of an image read piecemeal (`read(rva, size)`): headers, the debug directory and
+ *  the CodeView blob only, so a live module's PDB identity costs three small reads. */
+export async function readCodeView(read: (rva: number, size: number) => Promise<Uint8Array | null>): Promise<CodeView | null> {
+  const hdr = await read(0, 0x400);
+  if (!hdr || hdr.length < 0x40 || hdr[0] !== 0x4d || hdr[1] !== 0x5a) return null;
+  const dv = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength);
+  const nt = dv.getUint32(0x3c, true);
+  if (nt + 24 + 2 > hdr.length || dv.getUint32(nt, true) !== 0x4550) return null;
+  const opt = nt + 24;
+  const magic = dv.getUint16(opt, true);
+  const dirs = opt + (magic === 0x20b ? 112 : 96);
+  const count = dv.getUint32(opt + (magic === 0x20b ? 108 : 92), true);
+  if (count <= 6 || dirs + 7 * 8 > hdr.length) return null;
+  const dirRva = dv.getUint32(dirs + 6 * 8, true);
+  const dirSize = Math.min(dv.getUint32(dirs + 6 * 8 + 4, true), 28 * 32);
+  if (!dirRva || dirSize < 28) return null;
+  const dir = await read(dirRva, dirSize);
+  if (!dir) return null;
+  const dd = new DataView(dir.buffer, dir.byteOffset, dir.byteLength);
+  for (let o = 0; o + 28 <= dir.length; o += 28) {
+    if (dd.getUint32(o + 12, true) !== 2) continue;
+    const rva = dd.getUint32(o + 20, true);
+    const size = Math.min(dd.getUint32(o + 16, true), 0x1000);
+    if (!rva || size < 24) continue;
+    const blob = await read(rva, size);
+    if (!blob || blob.length < 24) continue;
+    const bv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    if (bv.getUint32(0, true) !== 0x53445352) continue; // RSDS
+    const g = guidString(blob, 4);
+    const age = bv.getUint32(20, true);
+    let path = "";
+    for (let i = 24; i < blob.length && blob[i]; i++) path += String.fromCharCode(blob[i]);
+    return { format: "RSDS", guid: g.text, age, path, symbolKey: `${g.key}${age.toString(16).toUpperCase()}` };
+  }
+  return null;
+}

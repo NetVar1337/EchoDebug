@@ -17,6 +17,7 @@ yaxpeax-arch = { version = "0.3", default-features = false, features = ["std", "
 object = { version = "0.40", features = ["read", "elf", "std"] }
 getrandom = "0.4"
 pdb = "0.8"
+cab = "0.6"
 ureq = "3"
 
 [dev-dependencies]
@@ -31,3 +32,7 @@ path = "src/main.rs"
 [target.'cfg(target_os = "linux")'.dependencies]
 unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86", "arch_aarch64"] }
 nix = { version = "0.31", features = ["ptrace", "process", "signal"] }
+
+# Windows: DPAPI keeps the assistant's API key encrypted for the user account.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

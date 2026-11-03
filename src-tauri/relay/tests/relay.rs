@@ -97,6 +97,28 @@ async fn routes_native_and_ext_with_id_rewrite() {
     assert_eq!(reply["id"], 0);
 }
 
+/// Echo exposes no thread / handle APIs: with the agent connected the relay says so (2006) instead of
+/// forwarding, and the MCP tools are read-only.
+#[tokio::test]
+async fn thread_verbs_with_echo_say_unsupported() {
+    let (addr, relay) = start().await;
+    let _ext = connect(addr, "/ext").await;
+    let mut client = client_when(addr, false, true).await;
+    for (i, verb) in ["threads", "stack", "handles"].iter().enumerate() {
+        send(&mut client, json!({ "type": verb, "id": i, "tid": 1 })).await;
+        let r = recv_until(&mut client, |v| v["id"] == i).await;
+        assert_eq!(r["code"], 2006, "{r}");
+        assert!(r["message"].as_str().unwrap().contains("Echo backend can't"), "{r}");
+    }
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    for name in ["list_threads", "thread_stack", "list_handles", "tls_callbacks", "exception_handlers"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+        assert_eq!(t["annotations"]["destructiveHint"], false, "{t}");
+    }
+}
+
 #[tokio::test]
 async fn missing_upstreams_fail_immediately() {
     let (addr, _) = start().await;
@@ -849,4 +871,21 @@ async fn arm64_disassembly_goes_through_read_on_the_echo_backend() {
     send(&mut client, json!({ "type": "disasm_bytes", "id": 9, "data": "c0035fd6", "address": "0x0", "arch": "aarch64" })).await;
     let reply = recv_until(&mut client, |v| v["type"] == "disasm_bytes_result").await;
     assert_eq!(reply["results"][0]["text"], "ret");
+}
+
+#[tokio::test]
+async fn pdb_verbs_are_relay_local() {
+    // no upstream at all: the relay answers PDB queries itself
+    let (addr, _) = start().await;
+    let mut client = connect(addr, "/client").await;
+    let pdb = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdbtypes/types.pdb").display().to_string();
+    send(&mut client, json!({ "type": "pdb_symbols", "id": "s", "path": pdb })).await;
+    let r = recv_until(&mut client, |v| v["id"] == "s").await;
+    assert_eq!((r["type"].as_str(), r["key"].as_str()), (Some("pdb_symbols_result"), Some("3204B8A9E64144054C4C44205044422E1")), "{r}");
+    send(&mut client, json!({ "type": "pdb_type", "id": 7, "path": pdb, "name": "Vec3" })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 7).await;
+    assert_eq!((r["type"].as_str(), r["size"].as_u64()), (Some("pdb_type_result"), Some(12)), "{r}");
+    send(&mut client, json!({ "type": "pdb_progress", "id": 8 })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 8).await;
+    assert!(r["jobs"].is_array());
 }

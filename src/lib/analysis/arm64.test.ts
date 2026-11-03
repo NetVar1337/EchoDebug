@@ -5,6 +5,7 @@ import { archLabel, detectArch, parseArch, registerNames } from "./arch";
 import { flowOf } from "./cfg";
 import { elfFunctions, parseElf, relocTypeName } from "./elf";
 import { mapPeFile, parsePe, parseRuntimeFunctions } from "./pe";
+import { listExceptionHandlers } from "./seh";
 import { insnPattern, toIda } from "./sigmaker";
 import { buildTestPe } from "./testpe";
 import { findXrefs } from "./xrefs";
@@ -176,6 +177,8 @@ describe("ARM64 function discovery", () => {
       [0x1030, 60, "packed", false], // entry: packed unwind data
       [0x106c, 20, "xdata", false], // with_handler: names a handler, so .xdata
     ]);
+    // the x64 SEH lister does not read ARM64 unwind data as UNWIND_INFO
+    expect(listExceptionHandlers(pe)).toMatchObject({ functions: 2, handlers: [] });
   });
 
   it("decodes synthetic entries (Flag 1, 2, 0 and reserved 3)", () => {

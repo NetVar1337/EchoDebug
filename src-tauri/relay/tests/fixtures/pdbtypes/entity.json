@@ -1,0 +1,305 @@
+{
+  "fields": [
+    {
+      "category": "pointer",
+      "kind": "member",
+      "name": "next",
+      "offset": 0,
+      "points_to": 4113,
+      "scalar": "ptr",
+      "size": 8,
+      "type": "Entity*",
+      "type_index": 4097
+    },
+    {
+      "category": "udt",
+      "kind": "member",
+      "name": "pos",
+      "offset": 8,
+      "size": 12,
+      "type": "Vec3",
+      "type_index": 4100,
+      "udt": 4115
+    },
+    {
+      "category": "array",
+      "count": 4,
+      "elem": {
+        "category": "udt",
+        "size": 12,
+        "type": "Vec3",
+        "type_index": 4100,
+        "udt": 4115
+      },
+      "kind": "member",
+      "name": "path",
+      "offset": 20,
+      "size": 48,
+      "type": "Vec3[4]",
+      "type_index": 4101
+    },
+    {
+      "category": "udt",
+      "kind": "member",
+      "name": "flags",
+      "offset": 68,
+      "size": 4,
+      "type": "Flags",
+      "type_index": 4102,
+      "udt": 4121
+    },
+    {
+      "category": "udt",
+      "kind": "member",
+      "name": "value",
+      "offset": 72,
+      "size": 4,
+      "type": "Value",
+      "type_index": 4103,
+      "udt": 4124
+    },
+    {
+      "category": "enum",
+      "kind": "member",
+      "name": "color",
+      "offset": 76,
+      "scalar": "i32",
+      "size": 4,
+      "type": "Color",
+      "type_index": 4105,
+      "udt": 4105
+    },
+    {
+      "category": "primitive",
+      "kind": "member",
+      "name": "pad",
+      "offset": 80,
+      "scalar": "u8",
+      "size": 1,
+      "type": "unsigned char",
+      "type_index": 32
+    },
+    {
+      "category": "primitive",
+      "kind": "member",
+      "name": "id",
+      "offset": 88,
+      "scalar": "u64",
+      "size": 8,
+      "type": "unsigned __int64",
+      "type_index": 35
+    },
+    {
+      "category": "array",
+      "count": 16,
+      "elem": {
+        "category": "primitive",
+        "scalar": "i8",
+        "size": 1,
+        "type": "char",
+        "type_index": 112
+      },
+      "kind": "member",
+      "name": "name",
+      "offset": 96,
+      "size": 16,
+      "type": "char[16]",
+      "type_index": 4106
+    },
+    {
+      "category": "pointer",
+      "function": true,
+      "kind": "member",
+      "name": "on_hit",
+      "offset": 112,
+      "scalar": "ptr",
+      "size": 8,
+      "type": "int (*)(int, void*)",
+      "type_index": 4109
+    },
+    {
+      "category": "pointer",
+      "kind": "member",
+      "name": "label",
+      "offset": 120,
+      "scalar": "ptr",
+      "size": 8,
+      "type": "const char*",
+      "type_index": 4111
+    }
+  ],
+  "forward": false,
+  "index": 4113,
+  "kind": "struct",
+  "name": "Entity",
+  "nested": [
+    {
+      "fields": [
+        {
+          "category": "primitive",
+          "kind": "member",
+          "name": "x",
+          "offset": 0,
+          "scalar": "f32",
+          "size": 4,
+          "type": "float",
+          "type_index": 64
+        },
+        {
+          "category": "primitive",
+          "kind": "member",
+          "name": "y",
+          "offset": 4,
+          "scalar": "f32",
+          "size": 4,
+          "type": "float",
+          "type_index": 64
+        },
+        {
+          "category": "primitive",
+          "kind": "member",
+          "name": "z",
+          "offset": 8,
+          "scalar": "f32",
+          "size": 4,
+          "type": "float",
+          "type_index": 64
+        }
+      ],
+      "forward": false,
+      "index": 4115,
+      "kind": "struct",
+      "name": "Vec3",
+      "size": 12
+    },
+    {
+      "fields": [
+        {
+          "bit_len": 1,
+          "bit_pos": 0,
+          "category": "bitfield",
+          "kind": "member",
+          "name": "visible",
+          "offset": 0,
+          "scalar": "u32",
+          "size": 4,
+          "type": "unsigned int : 1",
+          "type_index": 4116
+        },
+        {
+          "bit_len": 3,
+          "bit_pos": 1,
+          "category": "bitfield",
+          "kind": "member",
+          "name": "kind",
+          "offset": 0,
+          "scalar": "u32",
+          "size": 4,
+          "type": "unsigned int : 3",
+          "type_index": 4117
+        },
+        {
+          "bit_len": 4,
+          "bit_pos": 4,
+          "category": "bitfield",
+          "kind": "member",
+          "name": "team",
+          "offset": 0,
+          "scalar": "u32",
+          "size": 4,
+          "type": "unsigned int : 4",
+          "type_index": 4118
+        },
+        {
+          "bit_len": 24,
+          "bit_pos": 8,
+          "category": "bitfield",
+          "kind": "member",
+          "name": "rest",
+          "offset": 0,
+          "scalar": "u32",
+          "size": 4,
+          "type": "unsigned int : 24",
+          "type_index": 4119
+        }
+      ],
+      "forward": false,
+      "index": 4121,
+      "kind": "struct",
+      "name": "Flags",
+      "size": 4
+    },
+    {
+      "fields": [
+        {
+          "category": "primitive",
+          "kind": "member",
+          "name": "i",
+          "offset": 0,
+          "scalar": "i32",
+          "size": 4,
+          "type": "int",
+          "type_index": 116
+        },
+        {
+          "category": "primitive",
+          "kind": "member",
+          "name": "f",
+          "offset": 0,
+          "scalar": "f32",
+          "size": 4,
+          "type": "float",
+          "type_index": 64
+        },
+        {
+          "category": "array",
+          "count": 4,
+          "elem": {
+            "category": "primitive",
+            "scalar": "u8",
+            "size": 1,
+            "type": "unsigned char",
+            "type_index": 32
+          },
+          "kind": "member",
+          "name": "bytes",
+          "offset": 0,
+          "size": 4,
+          "type": "unsigned char[4]",
+          "type_index": 4122
+        }
+      ],
+      "forward": false,
+      "index": 4124,
+      "kind": "union",
+      "name": "Value",
+      "size": 4
+    },
+    {
+      "forward": false,
+      "index": 4105,
+      "kind": "enum",
+      "name": "Color",
+      "size": 4,
+      "underlying": "int",
+      "values": [
+        {
+          "name": "COLOR_RED",
+          "value": 1
+        },
+        {
+          "name": "COLOR_GREEN",
+          "value": 2
+        },
+        {
+          "name": "COLOR_BLUE",
+          "value": 4
+        }
+      ]
+    }
+  ],
+  "size": 128,
+  "success": true,
+  "text": "Entity",
+  "type": "pdb_type_result"
+}

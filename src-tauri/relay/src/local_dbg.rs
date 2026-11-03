@@ -9,7 +9,7 @@
 //! Verbs (`dbg_*`, ext routing): `dbg_attach`, `dbg_detach`, `dbg_status`, `dbg_break`
 //! {address, enabled}, `dbg_hwbreak` {slot 0-3, address, kind exec|write|rw, len 1|2|4|8,
 //! enabled}, `dbg_continue`, `dbg_step` {tid?}, `dbg_pause`, `dbg_regs` {tid?}, `dbg_set_regs`
-//! {tid?, regs}. Stops broadcast `{type:"event", event:"dbg_stop", reason, tid, address, regs}`;
+//! {tid?, regs}, `dbg_all_regs` (every thread). Stops broadcast `{type:"event", event:"dbg_stop", reason, tid, address, regs}`;
 //! process exit broadcasts `dbg_exit`.
 
 use std::collections::BTreeMap;
@@ -50,8 +50,14 @@ pub fn handle(_relay: &Relay, _req: &Map<String, Value>) -> Value {
 #[cfg(not(target_os = "linux"))]
 pub fn detach_all() {}
 
+/// Is a ptrace debug session attached? (Its threads cannot be seized a second time.)
+#[cfg(not(target_os = "linux"))]
+pub fn active() -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
-pub use imp::{detach_all, handle};
+pub use imp::{active, detach_all, handle};
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -129,6 +135,10 @@ mod imp {
             *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         reply
+    }
+
+    pub fn active() -> bool {
+        SESSION.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// Detach (restoring breakpoints) when the local backend detaches from its target.
@@ -596,6 +606,16 @@ mod imp {
                         }
                         Err(e) => failed(e),
                     }
+                }
+                // every thread's registers at once (the Threads view while a session is active)
+                "dbg_all_regs" => {
+                    let was_running = self.running;
+                    self.need_stopped();
+                    let threads: Vec<Value> = self.threads.keys().map(|t| json!({ "tid": t, "regs": regs_json(*t) })).collect();
+                    if was_running {
+                        let _ = self.resume_all();
+                    }
+                    json!({ "type": "dbg_all_regs_result", "success": true, "threads": threads, "was_running": was_running })
                 }
                 "dbg_detach" => {
                     self.detach();
