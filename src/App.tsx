@@ -20,6 +20,7 @@ import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
 import { Boundary, Lazy } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
+import { startSymbols } from "@/lib/pdb";
 import { startMcpPolicy } from "@/store/mcp";
 import { startMonitors } from "@/store/monitors";
 import ApprovalDialog from "@/components/ApprovalDialog";
@@ -62,6 +63,7 @@ export default function App() {
     startProjects();
     startWorkspace();
     startAutoPatches();
+    startSymbols();
     if (appRef.current) applyLayout(appRef.current);
     if (isTauri()) {
       void hostOs().then((os) => {

@@ -11,6 +11,7 @@ const kViews: Record<TabId, ComponentType> = {
   structs: lazy(() => import("./views/StructsView")),
   strings: lazy(() => import("./views/StringsView")),
   pe: lazy(() => import("./views/PeView")),
+  symbols: lazy(() => import("./views/SymbolsView")),
   signatures: lazy(() => import("./views/SignaturesView")),
   pointers: lazy(() => import("./views/PointersView")),
   emulator: lazy(() => import("./views/EmulatorView")),

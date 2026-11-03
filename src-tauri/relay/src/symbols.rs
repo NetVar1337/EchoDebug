@@ -539,7 +539,8 @@ fn symbols(req: &Map<String, Value>) -> Value {
                 },
                 None if allow_mismatch && !local.mismatches.is_empty() => (local.mismatches[0].0.clone(), "mismatch"),
                 None => {
-                    let mut v = json!({ "type": "error", "code": 3004, "message": "PDB not found locally",
+                    // a reply (not an error frame) so callers get the places tried and other builds found
+                    let mut v = json!({ "type": "pdb_symbols_result", "success": false, "found": false, "code": 3004, "message": "PDB not found locally",
                         "detail": format!("{name} {key}: not in the image directory, the symbol path or the cache{}; download it from a symbol server (Symbols view) or add its folder to the symbol path",
                             if local.mismatches.is_empty() { String::new() } else { format!(" (found other builds: {})", local.mismatches.iter().map(|m| m.1.clone()).collect::<Vec<_>>().join(", ")) }),
                         "tried": tried });

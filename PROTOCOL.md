@@ -264,6 +264,28 @@ Built on `modules` / `read`, so they work with every backend:
 | `page_monitor` | `address`, `size?`, `label?`, `interval_ms?`, `enabled?` | `page_changed` events (`address`, `size`, `label`, `count`, `pages`), FNV-1a per 4 KiB page; 64 MiB total |
 | `page_monitor_list` | — | `entries:[{address,size,label,interval_ms,changes,last_change}]` |
 
+### PDB symbols (relay)
+
+Relay-local, any backend; blocking work runs on a worker thread. `key` is the symbol-store key of the
+image's CodeView (RSDS) record: GUID (32 hex digits, no dashes) followed by the age in hex.
+
+| verb | request | reply |
+|---|---|---|
+| `pdb_symbols` | `pdb` (file name) + `key`, or `path`; `symbol_path?` (`_NT_SYMBOL_PATH` syntax), `use_env?` (default true: also `_NT_SYMBOL_PATH` / `_NT_ALT_SYMBOL_PATH`), `image_path?` (its folder is searched), `servers?`, `download?` (default **false**), `allow_mismatch?`, `max?` | `path`, `source` (`symbol path` / `cache` / `server` / `path` / `mismatch`), `guid`, `age`, `key`, `expected_key`, `matched`, `machine`, counts (`count`, `functions`, `types`, `lines`, `files`), `tried`, `symbols:[{rva,name,kind,size,type?,ret?,cc?,params?:[{name,type,size}],mangled?}]`. Not found locally: `success:false, found:false, code:3004`, `tried`, `mismatches:[{path,key}]` |
+| `pdb_fetch` | as `pdb_symbols` (name + key) | a matching local copy: `state:"done", path`; else starts a background download: `state:"downloading", job` |
+| `pdb_progress` | — | `jobs:[{job,pdb,key,state:"downloading" \| "done" \| "error",done,total,url,path,error,seconds}]` |
+| `pdb_image` | `image_path` (a PE on disk) | `pdb`, `pdb_path`, `guid`, `age`, `key` |
+| `pdb_types` | `path`, `filter?`, `max?` | `total`, `types:[{index,name,kind,size,fields or target}]` (struct/class/union/interface/enum/typedef) |
+| `pdb_type` | `path`, `name` or `index`, `depth?` | `index`, `name`, `kind`, `size`, `fields:[{name,offset,size,type,type_index,kind:"member" \| "base" \| "vtable",category,scalar?,udt?,points_to?,count?,elem?,bit_pos?,bit_len?}]`, enum `values`/`underlying`, `nested:[…same…]` (types embedded by value), `text` |
+| `pdb_lines` | `path`, `rva`, `size?` | `lines:[{rva,size,file,line}]`, `function` (the symbol containing `rva`) |
+
+Lookup order: the image's folder, the symbol path's folders (`<dir>/<pdb>` and `<dir>/<pdb>/<key>/<pdb>`),
+its stores and the app cache (`<config>/EchoDebug/symbols`) in store layout, each also as a compressed
+`<pdb minus last char>_` cabinet (expanded into the download store). Every candidate's GUID/age is checked.
+Downloads try `<server>/<pdb>/<key>/<pdb>`, then the `.pd_` name, and go to the first `srv*`/`cache*` store of
+the symbol path, else the app cache. Servers: `servers`, then the symbol path's `srv*` URLs, then
+`ECHODEBUG_SYMBOL_SERVERS` (`;`-separated), else `https://msdl.microsoft.com/download/symbols`.
+
 ## Provider verbs (`ui_*`) and authentication
 
 Verbs that start with `ui_` are answered by the desktop app window, because the analyses behind them
@@ -307,7 +329,9 @@ Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (wit
 `resources/subscribe`/`unsubscribe`, `completion/complete`, `logging/setLevel`.
 
 **Tools** carry `title`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
-`openWorldHint`, derived from the verb) and an object `outputSchema`; results add `structuredContent`
+`openWorldHint`, derived from the verb; `ui_load_symbols` is the one open-world tool: it may download from
+the symbol servers, while `ui_pdb_symbols`, `ui_pdb_types`, `ui_pdb_type` and `ui_pdb_lookup` only read local
+copies and `ui_import_pdb_type` changes the Structs catalog) and an object `outputSchema`; results add `structuredContent`
 (the reply object) next to the text block.
 
 **Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],

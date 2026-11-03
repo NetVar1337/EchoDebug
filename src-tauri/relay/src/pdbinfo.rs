@@ -718,12 +718,13 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                             cur = None;
                         }
                     }
-                    pdb::SymbolData::Local(l) if depth == 1 && l.flags.isparam => {
+                    // `this` is not part of a member function's argument list
+                    pdb::SymbolData::Local(l) if depth == 1 && l.flags.isparam && l.name.as_bytes() != b"this" => {
                         if let Some(s) = cur.and_then(|r| by_rva.get_mut(&r)) {
                             s.params.push((l.name.to_string().into_owned(), l.type_index.0));
                         }
                     }
-                    pdb::SymbolData::RegisterRelative(r) if depth == 1 => regrel.push((r.name.to_string().into_owned(), r.type_index.0)),
+                    pdb::SymbolData::RegisterRelative(r) if depth == 1 && r.name.as_bytes() != b"this" => regrel.push((r.name.to_string().into_owned(), r.type_index.0)),
                     pdb::SymbolData::Data(d) if depth == 0 => {
                         if let Some(rva) = d.offset.to_rva(&map) {
                             datas.push((rva.0, d.name.to_string().into_owned(), d.type_index.0));
