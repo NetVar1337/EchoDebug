@@ -65,7 +65,10 @@ function isClientClass(m: Img, o: number): boolean {
   return id >= 0 && id < 8192;
 }
 
-function walkTable(m: Img, tableAddr: bigint, tables: Record<string, NetvarTable>, depth = 0): string {
+/** Props read per dump: a real client.dll has tens of thousands, hostile tables share one 4096-prop array. */
+const kMaxProps = 1 << 20;
+
+function walkTable(m: Img, tableAddr: bigint, tables: Record<string, NetvarTable>, depth = 0, budget = { props: kMaxProps }): string {
   const l = m.l;
   const t = m.off(tableAddr);
   const name = m.str(m.ptr(t + l.rtName)) || `table_${tableAddr.toString(16)}`;
@@ -74,7 +77,7 @@ function walkTable(m: Img, tableAddr: bigint, tables: Record<string, NetvarTable
   tables[name] = tbl;
   const props = m.off(m.ptr(t + l.rtProps));
   const n = Math.min(m.i32(t + l.rtCount), 4096);
-  for (let i = 0; i < n && props >= 0; i++) {
+  for (let i = 0; i < n && props >= 0 && budget.props > 0; i++, budget.props--) {
     const p = props + i * l.rpSize;
     const pname = m.str(m.ptr(p + l.rpName));
     if (!pname) continue;
@@ -83,7 +86,7 @@ function walkTable(m: Img, tableAddr: bigint, tables: Record<string, NetvarTable
     const elems = m.i32(p + l.rpElems);
     if (elems > 1) prop.elements = elems;
     const sub = m.ptr(p + l.rpTable);
-    if (type === "datatable" && m.off(sub) >= 0) prop.table = walkTable(m, sub, tables, depth + 1);
+    if (type === "datatable" && m.off(sub) >= 0) prop.table = walkTable(m, sub, tables, depth + 1, budget);
     tbl.props.push(prop);
   }
   return name;
@@ -96,7 +99,10 @@ export function dumpNetvars(img: Uint8Array, base: bigint, is64: boolean, sectio
   const ranges = sections?.length ? sections : [{ rva: 0, size: img.length }];
   // every ClientClass candidate, then the chains through their next pointers
   const cands = new Set<number>();
+  let left = 2 * img.length + 0x10000; // overlapping section ranges cannot multiply the scan
   for (const r of ranges) {
+    if (r.size > left) continue;
+    left -= r.size;
     for (let o = r.rva; o + l.ccSize <= Math.min(img.length, r.rva + r.size); o += l.ptr) if (isClientClass(m, o)) cands.add(o);
   }
   if (!cands.size) return null;
@@ -105,20 +111,42 @@ export function dumpNetvars(img: Uint8Array, base: bigint, is64: boolean, sectio
     const n = m.off(m.ptr(o + l.ccNext));
     if (n >= 0) pointedTo.add(n);
   }
-  let best: number[] = [];
+  // chain length from every candidate, memoised: heads that merge into one long tail used to walk
+  // it once each (quadratic in the candidates)
+  const next = (c: number) => m.off(m.ptr(c + l.ccNext));
+  const lengthFrom = new Map<number, number>();
+  const chainLength = (o: number): number => {
+    const path: number[] = [];
+    const onPath = new Set<number>();
+    let c = o;
+    let tail = 0;
+    for (; c >= 0 && cands.has(c); c = next(c)) {
+      const known = lengthFrom.get(c);
+      if (known !== undefined) { tail = known; break; }
+      if (onPath.has(c)) break; // a cycle ends the chain where it closes
+      onPath.add(c);
+      path.push(c);
+    }
+    for (let i = path.length - 1; i >= 0; i--) lengthFrom.set(path[i], ++tail);
+    return lengthFrom.get(o) ?? 0;
+  };
+  let bestHead = -1;
+  let bestLen = 0;
   for (const o of cands) {
     if (pointedTo.has(o)) continue; // not a head
-    const chain: number[] = [];
-    const seen = new Set<number>();
-    for (let c = o; c >= 0 && cands.has(c) && !seen.has(c); c = m.off(m.ptr(c + l.ccNext))) {
-      seen.add(c);
-      chain.push(c);
-    }
-    if (chain.length > best.length) best = chain;
+    const n = chainLength(o);
+    if (n > bestLen) { bestLen = n; bestHead = o; }
+  }
+  const best: number[] = [];
+  const seen = new Set<number>();
+  for (let c = bestHead; c >= 0 && cands.has(c) && !seen.has(c) && best.length < bestLen; c = next(c)) {
+    seen.add(c);
+    best.push(c);
   }
   if (best.length < 2) return null;
   const tables: Record<string, NetvarTable> = {};
-  const classes = best.map((o) => ({ name: m.str(m.ptr(o + l.ccName)), id: m.i32(o + l.ccId), table: walkTable(m, m.ptr(o + l.ccTable), tables), address: base + BigInt(o) }));
+  const budget = { props: kMaxProps };
+  const classes = best.map((o) => ({ name: m.str(m.ptr(o + l.ccName)), id: m.i32(o + l.ccId), table: walkTable(m, m.ptr(o + l.ccTable), tables, 0, budget), address: base + BigInt(o) }));
   return { is64, head: base + BigInt(best[0]), classes, tables };
 }
 

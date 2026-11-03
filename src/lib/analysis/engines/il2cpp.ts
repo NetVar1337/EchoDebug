@@ -14,9 +14,14 @@ export type Il2CppMetadata = { version: number; images: Il2CppImage[]; sizes: { 
 
 const kSanity = 0xfab11baf;
 
+/** Longest identifier read from the string table (a table without NULs is not a name). */
+const kMaxName = 4096;
+
 function cstr(b: Uint8Array, o: number): string {
+  if (o < 0 || o >= b.length) return "";
   let e = o;
-  while (e < b.length && b[e] !== 0) e++;
+  const stop = Math.min(b.length, o + kMaxName);
+  while (e < stop && b[e] !== 0) e++;
   return new TextDecoder().decode(b.subarray(o, e));
 }
 
@@ -34,7 +39,15 @@ export function parseMetadata(b: Uint8Array): Il2CppMetadata {
   const methods = pair(0x30);
   const fields = pair(0x60);
   const types = pair(0xa0);
-  const str = (i: number) => cstr(b, strings + i);
+  // names are decoded once per string index (hostile tables point every record at one run)
+  const names = new Map<number, string>();
+  const str = (i: number) => {
+    let v = names.get(i);
+    if (v === undefined) names.set(i, (v = cstr(b, strings + i)));
+    return v;
+  };
+  // every table must lie inside the file and hold records big enough for the fields read
+  const inFile = (t: { off: number; size: number }) => t.off + t.size <= b.length;
 
   // images: the header slot moved (rgctx entries were dropped in 24.2); the record grew in 24.1
   let images: { name: string; typeStart: number; typeCount: number }[] | null = null;
@@ -61,6 +74,7 @@ export function parseMetadata(b: Uint8Array): Il2CppMetadata {
   const totalTypes = images.reduce((a, x) => a + x.typeCount, 0);
   if (!totalTypes || types.size % totalTypes) throw new Error("type table size does not match the image type counts");
   const ts = types.size / totalTypes;
+  if (!inFile(types) || ts < 56) throw new Error("type table does not fit the file");
   const t = (i: number) => types.off + i * ts;
   let totalMethods = 0;
   let totalFields = 0;
@@ -72,6 +86,11 @@ export function parseMetadata(b: Uint8Array): Il2CppMetadata {
   const ms = totalMethods ? methods.size / totalMethods : 0;
   const fs = totalFields ? fields.size / totalFields : 0;
   if ((totalMethods && !Number.isInteger(ms)) || (totalFields && !Number.isInteger(fs))) throw new Error("method/field table sizes do not match the type counts");
+  if ((totalMethods && (!inFile(methods) || ms < 12)) || (totalFields && (!inFile(fields) || fs < 4))) throw new Error("method/field tables do not fit the file");
+  // Every field / method belongs to one type in valid metadata, so the totals bound what is
+  // listed; hostile types all claim the same 65535 records.
+  let fieldBudget = totalFields;
+  let methodBudget = totalMethods;
 
   const out: Il2CppImage[] = images.map((im) => ({ name: im.name, types: [], methodCount: 0 }));
   images.forEach((im, k) => {
@@ -82,11 +101,11 @@ export function parseMetadata(b: Uint8Array): Il2CppMetadata {
       const mc = dv.getUint16(o + ts - 24, true);
       const fc = dv.getUint16(o + ts - 20, true);
       const type: Il2CppType = { name: str(dv.getInt32(o, true)), namespace: str(dv.getInt32(o + 4, true)), token: dv.getUint32(o + ts - 4, true), fields: [], methods: [] };
-      for (let f = 0; f < fc && fieldStart >= 0; f++) {
+      for (let f = 0; f < fc && fieldStart >= 0 && fieldBudget > 0; f++, fieldBudget--) {
         const fo = fields.off + (fieldStart + f) * fs;
         type.fields.push({ name: str(dv.getInt32(fo, true)), token: dv.getUint32(fo + fs - 4, true) });
       }
-      for (let m = 0; m < mc && methodStart >= 0; m++) {
+      for (let m = 0; m < mc && methodStart >= 0 && methodBudget > 0; m++, methodBudget--) {
         const mo = methods.off + (methodStart + m) * ms;
         type.methods.push({ name: str(dv.getInt32(mo, true)), token: dv.getUint32(mo + ms - 12, true), flags: dv.getUint16(mo + ms - 8, true), params: dv.getUint16(mo + ms - 2, true) });
       }
