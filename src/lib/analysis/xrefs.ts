@@ -1,9 +1,25 @@
-// byte-level reference finder: rel32 call/jmp/jcc and RIP-relative disp32 operands
+// byte-level reference finder: rel32 call/jmp/jcc and RIP-relative disp32 operands on x86-64;
+// direct branches and PC-relative address materialisation (adrp+add/ldr, adr, ldr literal) on
+// arm64, where "rip" stands for any PC-relative data reference.
+import { a64Refs } from "./a64";
+import { detectArch, type Arch } from "./arch";
 
 export type Xref = { rva: number; kind: "call" | "jmp" | "jcc" | "rip" };
 export type Range = { rva: number; size: number };
 
-export function findXrefs(img: Uint8Array, ranges: readonly Range[], target: number, limit = 5000): Xref[] {
+/** `arch` defaults to what the image's headers say (x86-64 without headers). */
+export function findXrefs(img: Uint8Array, ranges: readonly Range[], target: number, limit = 5000, arch?: Arch): Xref[] {
+  if ((arch ?? detectArch(img)?.arch) === "arm64") {
+    const seen = new Set<number>();
+    const hits: Xref[] = [];
+    for (const r of a64Refs(img, ranges)) {
+      if (r.toRva !== target || seen.has(r.fromRva)) continue;
+      seen.add(r.fromRva);
+      hits.push({ rva: r.fromRva, kind: r.kind });
+      if (hits.length >= limit) break;
+    }
+    return hits;
+  }
   const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
   const out: Xref[] = [];
   const seen = new Set<number>();

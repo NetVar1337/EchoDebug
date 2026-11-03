@@ -496,7 +496,13 @@ fn native_modules(mem: &impl MemIo) -> Value {
         Ok(mods) => {
             let list: Vec<Value> = mods
                 .iter()
-                .map(|(name, base, size)| json!({ "name": name, "base": hex_addr(*base), "size": size }))
+                .map(|(name, base, size)| {
+                    let mut m = json!({ "name": name, "base": hex_addr(*base), "size": size });
+                    if let Some(a) = module_arch(mem, *base) {
+                        m["arch"] = json!(a.as_str());
+                    }
+                    m
+                })
                 .collect();
             json!({ "type": "modules_result", "success": true, "modules": list })
         }
@@ -720,6 +726,10 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
         size = n;
         buf.truncate(n);
     }
+    let arch = crate::arch::from_req(req).unwrap_or_else(|| arch_at(mem, addr));
+    if arch == crate::arch::Arch::Arm64 {
+        return a64_listing(&buf[..size], addr, function_mode);
+    }
     let mut out = Vec::new();
     let mut ip = addr;
     let mut off = 0usize;
@@ -739,6 +749,44 @@ fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
         }
     }
     json!({ "type": "disassemble_result", "success": true, "complete": off >= size, "address": hex_addr(addr), "count": out.len(), "results": out })
+}
+
+/// AArch64 listing in the `disassemble_result` shape. `function_mode` stops after the first
+/// ret / brk / udf / undecodable word.
+pub fn a64_listing(code: &[u8], addr: u64, function_mode: bool) -> Value {
+    let mut out = Vec::new();
+    let mut decoded = 0usize;
+    for l in crate::a64::disasm(code, addr) {
+        let off = (l.address - addr) as usize;
+        let stop = function_mode && crate::a64::ends_function(&l.text);
+        out.push(json!({ "address": hex_addr(l.address), "length": 4, "bytes": hex_bytes(&code[off..off + 4]), "text": l.text }));
+        decoded = off + 4;
+        if stop {
+            break;
+        }
+    }
+    let size = if function_mode { decoded } else { code.len() };
+    json!({ "type": "disassemble_result", "success": true, "complete": decoded >= size, "address": hex_addr(addr), "count": out.len(), "arch": "arm64", "results": out })
+}
+
+/// The architecture of the module mapped at `addr`, from its ELF header in memory (the lowest
+/// mapping of the same file); the host's architecture when that cannot be read.
+pub fn arch_at(mem: &impl MemIo, addr: u64) -> crate::arch::Arch {
+    let maps = mem.maps().unwrap_or_default();
+    let Some(path) = maps.iter().find(|m| m.start <= addr && addr < m.end).map(|m| m.path.clone()).filter(|p| !p.is_empty()) else {
+        return crate::arch::Arch::host();
+    };
+    let start = maps.iter().filter(|m| m.path == path).map(|m| m.start).min().unwrap_or(addr);
+    module_arch(mem, start).unwrap_or_else(crate::arch::Arch::host)
+}
+
+/// Architecture from the headers mapped at a module's base.
+pub fn module_arch(mem: &impl MemIo, base: u64) -> Option<crate::arch::Arch> {
+    let mut head = [0u8; 64];
+    match mem.read_at(base, &mut head) {
+        Ok(n) if n >= 20 => crate::arch::detect(&head[..n]),
+        _ => None,
+    }
 }
 
 /// Decodes one x86-64 instruction at `ip`; returns (length, text). Pure Rust via iced-x86.
@@ -874,9 +922,10 @@ fn local_attach(relay: &Relay, req: &Map<String, Value>, orig: &Value) -> Value 
     let mem = io(pid).unwrap();
     let base = modules_base(&mem);
     let name = req.get("name").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| main_module(&mem).map(|(n, _, _)| n).unwrap_or_default());
-    relay.set_target(json!({ "pid": pid, "base": base, "name": name }));
+    let arch = main_module(&mem).and_then(|(_, b, _)| module_arch(&mem, b)).unwrap_or_else(crate::arch::Arch::host).as_str();
+    relay.set_target(json!({ "pid": pid, "base": base, "name": name, "arch": arch }));
     relay.broadcast_status();
-    json!({ "type": "attach_result", "id": orig, "success": true, "pid": pid, "base": base, "name": name, "native_socket": false })
+    json!({ "type": "attach_result", "id": orig, "success": true, "pid": pid, "base": base, "name": name, "arch": arch, "native_socket": false })
 }
 
 fn local_detach(relay: &Relay, orig: &Value) -> Value {
@@ -1585,6 +1634,32 @@ mod tests {
         assert!(text.contains("rsp"));
         let target = resolve_rip_relative(&code, 0x1000, 4, 6).unwrap();
         assert_eq!(target, 0x1000 + 4 + 6 + 0x10);
+    }
+
+    #[test]
+    fn arm64_module_is_detected_and_disassembled() {
+        // the fix-a64.elf fixture's text mapped at the fake module's base
+        let elf = include_bytes!("../../../src/lib/analysis/fixtures/fix-a64.elf");
+        let mem = FakeMem::new();
+        mem.put(0x1000, &elf[..0x200]);
+        // walk(): mov x8, x0 ... b.lo ; ret
+        let walk = [0xaa0003e8u32, 0xaa1f03e0, 0x39400109, 0xb40000a9, 0x8b090000, 0x91000508, 0xf10fa41f, 0x54ffff63, 0xd65f03c0, 0xa9be7bfd];
+        let code: Vec<u8> = walk.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.put(0x2174, &code);
+        assert_eq!(module_arch(&mem, 0x1000), Some(crate::arch::Arch::Arm64));
+        assert_eq!(arch_at(&mem, 0x2174), crate::arch::Arch::Arm64);
+        let mods = native_modules(&mem);
+        assert_eq!(mods["modules"][0]["arch"], "arm64");
+        // size 0: up to the ret, the arch picked from the module's header
+        let r = native_disassemble(&mem, &match json!({ "address": "0x2174", "size": 0 }) { Value::Object(m) => m, _ => unreachable!() });
+        let lines = r["results"].as_array().unwrap();
+        assert_eq!(lines.len(), 9, "{r}");
+        assert_eq!(lines[3]["text"], "cbz x9, 0x2194");
+        assert_eq!(lines[7]["text"], "b.lo 0x217c");
+        assert_eq!(lines[8]["text"], "ret");
+        // an explicit arch wins over detection
+        let r = native_disassemble(&mem, &match json!({ "address": "0x2174", "size": 4, "arch": "x86_64" }) { Value::Object(m) => m, _ => unreachable!() });
+        assert_ne!(r["arch"], "arm64");
     }
 
     #[test]

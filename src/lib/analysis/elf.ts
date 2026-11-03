@@ -56,6 +56,12 @@ const kStb = ["LOCAL", "GLOBAL", "WEAK"];
 /** x86-64 relocation types worth naming */
 const kRelX64: Record<number, string> = { 1: "64", 2: "PC32", 6: "GLOB_DAT", 7: "JUMP_SLOT", 8: "RELATIVE", 37: "IRELATIVE", 16: "DTPMOD64", 17: "DTPOFF64", 18: "TPOFF64" };
 
+/** AArch64 relocation types worth naming */
+const kRelA64: Record<number, string> = {
+  257: "ABS64", 1024: "COPY", 1025: "GLOB_DAT", 1026: "JUMP_SLOT", 1027: "RELATIVE", 1028: "TLS_DTPMOD64",
+  1029: "TLS_DTPREL64", 1030: "TLS_TPREL64", 1031: "TLSDESC", 1032: "IRELATIVE",
+};
+
 export class ElfError extends Error {}
 
 export function isElf(b: Uint8Array): boolean {
@@ -84,7 +90,18 @@ function secFlags(f: bigint): string {
 }
 
 export function relocTypeName(machine: number, type: number): string {
-  return machine === 62 ? (kRelX64[type] ?? String(type)) : String(type);
+  return machine === 62 ? (kRelX64[type] ?? String(type)) : machine === 183 ? (kRelA64[type] ?? String(type)) : String(type);
+}
+
+/** FUNC symbols with an address as {address, size} file vaddrs (add the load bias), deduplicated. */
+export function elfFunctions(info: ElfInfo): { address: bigint; size: number; name: string }[] {
+  const byAddr = new Map<bigint, { address: bigint; size: number; name: string }>();
+  for (const s of info.symbols) {
+    if (s.type !== "FUNC" || !s.value || s.section === 0) continue;
+    const cur = byAddr.get(s.value);
+    if (!cur || (!s.dynamic && cur.size < s.size)) byAddr.set(s.value, { address: s.value, size: Math.max(s.size, cur?.size ?? 0), name: s.name || cur?.name || "" });
+  }
+  return [...byAddr.values()].sort((a, b) => (a.address < b.address ? -1 : 1));
 }
 
 export function parseElf(buf: Uint8Array): ElfInfo {

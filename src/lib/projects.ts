@@ -330,8 +330,9 @@ export async function signProjects(): Promise<{ made: number; failed: number }> 
       const base = toBig(m.base);
       for (const [i, e] of todo.entries()) {
         useRelocation.setState({ busy: `signing ${m.name} ${i + 1}/${todo.length}` });
-        const insns = await request<{ results: Insn[] }>("disassemble", { address: fmtAddr(base + BigInt(e.rva)), size: 0x200 }, true).then((r) => r.results ?? []).catch(() => [] as Insn[]);
-        const r = insns.length ? await makeSignature(insns, async (pat) => (await sigHits(pat, m.name)).length).catch(() => null) : null;
+        const listing = await request<{ results: Insn[]; arch?: string }>("disassemble", { address: fmtAddr(base + BigInt(e.rva)), size: 0x200 }, true).catch(() => null);
+        const insns = listing?.results ?? [];
+        const r = insns.length ? await makeSignature(insns, async (pat) => (await sigHits(pat, m.name)).length, 5, listing?.arch).catch(() => null) : null;
         if (r) {
           e.sig = toIda(r.pattern);
           made++;
