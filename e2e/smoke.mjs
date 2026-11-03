@@ -270,6 +270,19 @@ await step("module projects bring the name back after the target restarts at a n
   await until(async () => (await page.locator(".fn-row", { hasText: "classify_e2e" }).count()) > 0, 20000);
 });
 
+await step("threads view unwinds the target's main thread into main()", async () => {
+  await tab("Threads");
+  await until(async () => (await page.locator("td", { hasText: /^main(\+0x[0-9a-f]+)?$/ }).count()) > 0, 20000);
+  expect((await page.locator(".pill", { hasText: /^main$/ }).count()) > 0, "main thread not marked");
+  await page.locator("button", { hasText: "Handles" }).click();
+  await until(async () => (await page.locator("td", { hasText: /^(file|device|pipe|socket)$/ }).count()) > 0);
+});
+
+await step("TLS & SEH says an ELF module has no PE tables", async () => {
+  await tab("TLS & SEH");
+  await until(async () => (await page.locator(".empty-title", { hasText: "is not a PE module" }).count()) > 0);
+});
+
 await step("value graph plots the counter from the watchlist", async () => {
   await page.locator(".rail-button[aria-label='Watchlist & Bookmarks']").click();
   const box = page.locator('input[placeholder="address or module+0x…"]').first();

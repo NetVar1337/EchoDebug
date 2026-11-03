@@ -63,6 +63,7 @@ import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
+import { sehForMcp, tlsReport } from "./threadslive";
 
 export type Args = Record<string, unknown>;
 export type Handler = (args: Args) => Promise<unknown>;
@@ -392,6 +393,10 @@ provide("ui_pe_details", async (args) => {
   }
   return out;
 });
+
+// TLS callbacks and .pdata exception handlers (threadslive.ts / analysis/seh.ts)
+provide("ui_tls_callbacks", async (args) => tlsReport(pickModule(args)));
+provide("ui_exception_handlers", async (args) => sehForMcp(pickModule(args), num(args, "limit", 2000, 20000)));
 
 provide("ui_resources", async (args) => {
   const { m, img } = await moduleImage(args);
