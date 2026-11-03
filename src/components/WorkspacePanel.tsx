@@ -36,7 +36,7 @@ import UnpackView from "./views/UnpackView";
 import DecryptView from "./views/DecryptView";
 import ScriptView from "./views/ScriptView";
 
-const kViews: Record<TabId, () => JSX.Element> = {
+const kViews: Record<TabId, () => React.JSX.Element> = {
   disassembly: DisassemblyView,
   memory: MemoryView,
   structs: StructsView,
