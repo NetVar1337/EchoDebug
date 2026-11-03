@@ -11,7 +11,7 @@ import { layoutCfg, type Block, type Cfg, type CfgEdge, type CfgLine } from "@/l
 import { graphInfo } from "@/lib/analysis/structure";
 import { pseudocode, type PseudoLine } from "@/lib/analysis/pseudocode";
 import { decompile, irGraph, type Decompiled } from "@/lib/analysis/decompile";
-import { analyzeCallees, directCallees, liveOptions, loadFunction, type LiveFunction } from "@/lib/decomplive";
+import { analyzeCallees, directCallees, liveOptions, loadFunction, notDecompilable, type LiveFunction } from "@/lib/decomplive";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
 import { useTypes } from "@/store/types";
@@ -112,7 +112,9 @@ export default function CfgView() {
   // decompiling runs on the UI thread: very large functions only on request
   const tooBig = insnCount > kAutoDecompile && !force;
   useEffect(() => setForce(false), [root]);
-  const needDecompile = !!fn && !tooBig && ((mode === "pseudo" && !decomp.raw) || decomp.unflatten);
+  // AArch64 functions get the graph only: the lifter and the raw pseudocode are x86-64
+  const noDecomp = fn ? notDecompilable(fn) : null;
+  const needDecompile = !!fn && !noDecomp && !tooBig && ((mode === "pseudo" && !decomp.raw) || decomp.unflatten);
   const dec = useMemo((): { d: Decompiled | null; error: string | null } => {
     if (!fn || !needDecompile) return { d: null, error: null };
     try {
@@ -130,7 +132,7 @@ export default function CfgView() {
     return () => { live = false; };
   }, [dec.d?.ir]);
 
-  const showRaw = mode === "pseudo" && (decomp.raw || !dec.d);
+  const showRaw = mode === "pseudo" && !noDecomp && (decomp.raw || !dec.d);
   const rawLines = useMemo(() => (fn && showRaw ? pseudocode(fn.structure, { abi, nameOf: names.nameOf, protoOf: protoAt }) : []), [fn, showRaw, abi, names, symVersion]);
   const report = decomp.unflatten ? dec.d?.report ?? null : null;
   const cfg = useMemo(() => (fn && report?.flattened && dec.d ? recoveredCfg(dec.d, fn.cfg) : fn?.cfg ?? null), [fn, report, dec.d]);
@@ -181,7 +183,9 @@ export default function CfgView() {
         {busy && <Progress value={0.5} />}
         {decomp.unflatten && fn && dec.d && <UnflattenNote report={dec.d.report} onGo={ui.goDisasm} />}
         {mode === "pseudo" ? (
-          fn && fn.structure.blocks.length ? (
+          noDecomp ? (
+            <div className="empty"><div className="empty-title">{noDecomp}</div></div>
+          ) : fn && fn.structure.blocks.length ? (
             showRaw || !dec.d ? (
               <>
               {tooBig && !decomp.raw && (

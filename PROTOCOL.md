@@ -84,6 +84,22 @@ plus the Linux-only verbs below. Only `reopen_socket` and the conditional alerts
 | `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base) |
 | `dbg_all_regs` | – | `threads:[{tid, regs}]`, `was_running` (stops the session for the read if it was running, then resumes) |
 
+**Architectures.** x86-64 is the default. `disassemble`, `disasm_function` and `disasm_bytes` take
+`arch` (`"x86_64"` | `"arm64"`, aliases `aarch64`, `x64`, …). The lines keep their shape
+(`address`, `length` = 4, `bytes`, `text`); PC-relative operands are printed as absolute addresses
+(`bl 0x210168`, `cbz x9, 0x210194`, `adrp x20, 0x220000`) and an `add`/`ldr`/`str` that completes an
+`adrp` pair ends in `  ; 0x<resolved address>`; undecodable words read `.inst 0x…`; the reply adds
+`"arch":"arm64"`. With an Echo upstream the relay serves `arch:"arm64"` itself (Echo's disassembler
+is x86-64 only): it reads the code with `read` and decodes it (size 0 / `disasm_function`: page by
+page up to the first ret, at most 64 KiB). The local backend detects the architecture from the
+module's ELF header when `arch` is omitted, reports `arch` per module in `modules_result` and on the
+attach target, and `emulate` with `arch:"arm64"` (or a start address inside an AArch64 module) runs
+Unicorn's AArch64 CPU: `regs` takes/returns `x0`…`x30` (`fp`, `lr` accepted), `sp`, `pc`, `nzcv`,
+`tpidr_el0`; `v` (`{"v0":"<32 hex>"}`) or `simd:true` adds `v0`…`v31` to the reply; `x30` starts at
+`end` so a `ret` ends the run; `mem_log` entries and `faults` carry `pc` instead of `rip`; `stubs`,
+`layers`, `trace_regs` and `xmm` are x86-64 only and refused. There is no ARM64 debugger backend
+(`dbg_*` is x86-64 ptrace), and the emulated debugger (`emu_*`) and lifter are x86-64 only.
+
 Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause", "tid", "address", "regs", "slot?", "watch?", "signal?" }`
 and `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`.
 
@@ -341,7 +357,7 @@ Annotation verbs (MCP tools without the `ui_` prefix) read and change the app's 
 | `ui_list_signatures` (`list_signatures`) | – | `signatures:[{id,name,module,ida,address,hits,note}]` |
 
 Decompiler verbs (read-only; the function is disassembled through `disassemble`, bounded by `.pdata`, switch tables
-read from the module image):
+read from the module image; x86-64 only, a function in an AArch64 module is refused with an error):
 
 | Verb (tool) | Args | Result |
 |---|---|---|

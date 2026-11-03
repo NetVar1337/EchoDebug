@@ -7,6 +7,7 @@ import { request } from "./client";
 import { fmtAddr, moduleOf, toBig, type Module } from "./hex";
 import { loadImage } from "./memory";
 import { pdataFunctions } from "./live";
+import { moduleArch } from "./archlive";
 import { buildCfg, type Cfg, type CfgLine } from "./analysis/cfg";
 import { resolveSwitch } from "./analysis/jumptables";
 import { buildStructure, type Cfg as StructCfg } from "./analysis/structure";
@@ -16,10 +17,12 @@ import { analyzeSignature } from "./analysis/dataflow";
 import { layout } from "./analysis/struct";
 import { registerPrototypeProvider, type Prototype } from "./analysis/prototypes";
 import type { Abi, IrFunc } from "./analysis/ir";
+import type { Arch } from "./analysis/arch";
 import type { DecompileOptions, StructField } from "./analysis/decompile";
 import type { TypeDef } from "@/store/types";
 
-export type LiveFunction = { cfg: Cfg; structure: StructCfg; module: Module | null; img: Uint8Array | null; base: bigint };
+/** `arch`: the module's; the lifter (and so the decompiler) is x86-64 only, see `notDecompilable`. */
+export type LiveFunction = { cfg: Cfg; structure: StructCfg; module: Module | null; img: Uint8Array | null; base: bigint; arch: Arch };
 
 const decode = async (a: bigint): Promise<CfgLine[]> =>
   (await request<{ results: CfgLine[] }>("disassemble", { address: fmtAddr(a), size: 0x100 }, true).catch(() => null))?.results ?? [];
@@ -29,6 +32,7 @@ export async function loadFunction(entry: bigint, modules: readonly Module[], ma
   const m = moduleOf(entry, modules) ?? null;
   const img = m ? await loadImage(m).catch(() => null) : null;
   const base = m ? toBig(m.base) : 0n;
+  const arch: Arch = m ? await moduleArch(m).catch((): Arch => "x86_64") : "x86_64";
   let bounds = m ? { lo: base, hi: base + BigInt(m.size) } : undefined;
   if (m) {
     const fn = (await pdataFunctions(m).catch(() => [])).find((f) => toBig(f.address) <= entry && entry < toBig(f.address) + BigInt(f.size));
@@ -39,7 +43,12 @@ export async function loadFunction(entry: bigint, modules: readonly Module[], ma
     bounds,
     switchTargets: img ? (lines, i) => resolveSwitch(lines, i, img, base)?.targets ?? null : undefined,
   });
-  return { cfg, structure: structureOf(cfg), module: m, img, base };
+  return { cfg, structure: structureOf(cfg), module: m, img, base, arch };
+}
+
+/** Why the function cannot be decompiled (an AArch64 module: the lifter is x86 only), else null. */
+export function notDecompilable(fn: LiveFunction): string | null {
+  return fn.arch !== "arm64" ? null : `${fn.module?.name ?? "this module"} is ${fn.arch}: the decompiler and pseudocode are x86-64 only`;
 }
 
 /** The discovered instructions in address order, re-split into blocks with the switch tables as case edges. */

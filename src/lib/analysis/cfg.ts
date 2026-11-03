@@ -1,5 +1,6 @@
 // Control-flow graph of one function: basic blocks and the edges between them, built by
-// recursive descent over the disassembly (Echo's or iced-x86's text, Intel or AT&T style).
+// recursive descent over the disassembly (Echo's or iced-x86's text, Intel or AT&T style, or the
+// relay's AArch64 text).
 //
 // Blocks start at the entry, at every branch target inside the function and after every
 // conditional branch; they end at a branch, a return or right before another block's start.
@@ -14,7 +15,26 @@ export type Cfg = { entry: bigint; blocks: Block[]; edges: CfgEdge[]; truncated:
 
 export type Flow = { kind: "ret" | "jmp" | "jcc" | "call" | "indirect-jmp" | "stop" | "none"; target: bigint | null };
 
-/** What an instruction does to control flow; `target` for direct branches. */
+/**
+ * AArch64 (the relay prints PC-relative targets as absolute addresses): b, bl, br, blr, ret,
+ * b.cond / bc.cond, cbz / cbnz, tbz / tbnz, the pointer-authentication forms, brk / udf / hlt.
+ * null when the mnemonic is not an AArch64 control-flow instruction.
+ */
+export function a64FlowOf(mn: string, op: string): Flow | null {
+  const last = op.split(",").pop()?.trim() ?? "";
+  const m = /^#?(0x[0-9a-f]+)(?: <[^>]*>)?$/.exec(last);
+  const target = m ? BigInt(m[1]) : null;
+  if (mn === "b") return target !== null ? { kind: "jmp", target } : { kind: "indirect-jmp", target: null };
+  if (mn === "bl") return { kind: "call", target };
+  if (/^(?:blr|blraaz?|blrabz?)$/.test(mn)) return { kind: "call", target: null };
+  if (/^(?:br|braaz?|brabz?)$/.test(mn)) return { kind: "indirect-jmp", target: null };
+  if (/^(?:retaa|retab|eret|eretaa|eretab)$/.test(mn)) return { kind: "ret", target: null };
+  if (/^bc?\.[a-z]{2}$/.test(mn) || /^(?:cbz|cbnz|tbz|tbnz)$/.test(mn)) return { kind: "jcc", target };
+  if (mn === "brk" || mn === "udf" || mn === ".inst") return { kind: "stop", target: null };
+  return null;
+}
+
+/** What an instruction does to control flow; `target` for direct branches. x86-64 and AArch64. */
 export function flowOf(text: string): Flow {
   // prefixes that do not change control flow: CET notrack, MPX bnd, branch hints
   const t = text.trim().toLowerCase().replace(/\s+/g, " ").replace(/^(?:(?:notrack|bnd|ds|cs|rep|repz|repnz|lock) )+/, "");
@@ -24,6 +44,8 @@ export function flowOf(text: string): Flow {
   const direct = /^(?:qword ptr |near |short )?\$?(0x[0-9a-f]+)(?: <[^>]*>)?$/.exec(op);
   const target = direct ? BigInt(direct[1]) : null;
   if (/^ret[qnfw]?$|^iret[dq]?$|^sysret|^retf/.test(mn)) return { kind: "ret", target: null };
+  const a64 = a64FlowOf(mn, op);
+  if (a64) return a64;
   if (mn === "int3" || mn === "hlt" || mn === "ud2" || mn === "ud1" || mn === "int" && op === "0x29") return { kind: "stop", target: null };
   if (/^jmp[qw]?$/.test(mn)) return target !== null ? { kind: "jmp", target } : { kind: "indirect-jmp", target: null };
   if (/^call[qw]?$/.test(mn)) return { kind: "call", target };

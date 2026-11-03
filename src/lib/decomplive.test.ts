@@ -3,11 +3,19 @@ import { describe, expect, it, vi } from "vitest";
 vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => undefined, removeItem: () => undefined });
 vi.mock("./client", () => ({ client: { send: () => undefined }, request: async () => ({ results: [] }) }));
 
-const { directCallees, fieldsFrom, imageString, liveNameOf, structureOf } = await import("./decomplive");
+const { directCallees, fieldsFrom, imageString, liveNameOf, loadFunction, notDecompilable, structureOf } = await import("./decomplive");
 const { buildIr } = await import("./analysis/decompile");
 const { buildStructure } = await import("./analysis/structure");
 
 describe("decompiler against the live target", () => {
+  it("refuses AArch64 modules: the lifter is x86-64 only", async () => {
+    const arm = await loadFunction(0x10000n, [{ name: "libgame.so", base: "0x10000", size: 0x1000, arch: "arm64" }]);
+    expect(arm.arch).toBe("arm64");
+    expect(notDecompilable(arm)).toBe("libgame.so is arm64: the decompiler and pseudocode are x86-64 only");
+    const x64 = await loadFunction(0x10000n, [{ name: "game.exe", base: "0x10000", size: 0x1000, arch: "x86_64" }]);
+    expect(notDecompilable(x64)).toBeNull();
+  });
+
   it("reads C strings from the module image", () => {
     const img = new Uint8Array(0x40);
     img.set(new TextEncoder().encode("hello %s\n\0"), 0x10);

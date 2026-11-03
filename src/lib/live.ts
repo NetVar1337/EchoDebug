@@ -1,7 +1,7 @@
 // analysis that combines module images with the pure analysers
 import { moduleOf, toBig, type Module } from "./hex";
 import { loadImage } from "./memory";
-import { parsePe, parseRuntimeFunctions } from "./analysis/pe";
+import { parseRuntimeFunctions } from "./analysis/pe";
 import { buildXrefIndex, executableRanges, type XrefIndex } from "./analysis/xrefindex";
 import { request } from "./client";
 import { findXrefs, type Xref } from "./analysis/xrefs";
@@ -14,10 +14,8 @@ export async function xrefsTo(address: string, modules: readonly Module[]): Prom
   if (!m) throw new Error("address is outside every module");
   const img = await loadImage(m);
   let ranges = [{ rva: 0x1000, size: Math.max(0, m.size - 0x1000) }];
-  try {
-    const x = parsePe(img).sections.filter((s) => s.x);
-    if (x.length) ranges = x.map((s) => ({ rva: s.rva, size: s.vsize }));
-  } catch { /* headers unreadable: scan the whole image */ }
+  const x = executableRanges(img); // PE sections or ELF PT_LOAD segments
+  if (x.length) ranges = x;
   const base = toBig(m.base);
   return findXrefs(img, ranges, Number(a - base)).map((x) => ({ ...x, address: base + BigInt(x.rva) }));
 }
@@ -57,10 +55,8 @@ export type CodeHit = { address: string; text: string };
 export async function searchModuleCode(m: Module, re: RegExp, opts: { limit?: number; onProgress?: (f: number) => void; signal?: { aborted: boolean } } = {}): Promise<CodeHit[]> {
   const img = await loadImage(m);
   let ranges = [{ rva: 0x1000, size: Math.max(0, m.size - 0x1000) }];
-  try {
-    const x = parsePe(img).sections.filter((s) => s.x);
-    if (x.length) ranges = x.map((s) => ({ rva: s.rva, size: s.vsize }));
-  } catch { /* ELF or unreadable headers: whole image */ }
+  const x = executableRanges(img); // PE sections or ELF PT_LOAD segments; else the whole image
+  if (x.length) ranges = x;
   const base = toBig(m.base);
   const total = ranges.reduce((n, r) => n + r.size, 0) || 1;
   let done = 0;

@@ -30,7 +30,8 @@ describe("ELF parser", () => {
   it("names x86-64 relocations", () => {
     expect(relocTypeName(62, 7)).toBe("JUMP_SLOT");
     expect(relocTypeName(62, 8)).toBe("RELATIVE");
-    expect(relocTypeName(183, 1025)).toBe("1025");
+    expect(relocTypeName(183, 1025)).toBe("GLOB_DAT"); // AArch64 names too
+    expect(relocTypeName(183, 9999)).toBe("9999");
   });
 });
 

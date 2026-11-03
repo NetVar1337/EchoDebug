@@ -181,6 +181,8 @@ export type ExceptionReport = {
 export function listExceptionHandlers(img: Uint8Array, pe?: PeInfo, opts: { nameOf?: (rva: number) => string | undefined } = {}): ExceptionReport {
   const info = pe ?? parsePe(img);
   const fns = parseRuntimeFunctions(img, info);
+  // ARM64 .pdata points at packed words or ARM64 .xdata, not x64 UNWIND_INFO: ranges only
+  if (info.machine === 0xaa64) return { functions: fns.length, chained: 0, handlers: [], routines: [] };
   const handlers: HandlerEntry[] = [];
   const names = new Map<number, string | undefined>();
   let chained = 0;
