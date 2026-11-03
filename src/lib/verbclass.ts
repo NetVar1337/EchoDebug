@@ -11,7 +11,7 @@ export const kStateful = new Set([
   "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
   "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove", "trace_record",
   // dump tools: write files to disk
-  "dump_process_full", "kdump_extract", "ui_dump_module", "ui_dump_target",
+  "dump_process_full", "kdump_extract", "ui_dump_module", "ui_dump_target", "ui_dump_all",
   // the native debuggers: attaching, int3s and debug registers, the access finder, the API monitor
   "dbg_attach", "dbg_detach", "dbg_break", "dbg_hwbreak", "dbg_continue", "dbg_step", "dbg_pause", "dbg_set_regs",
   "dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear",
@@ -33,5 +33,5 @@ export const kGatedDebugger = new Set([
 
 /** What the "ask" and "readonly" policies gate (mcp.rs `is_gated`). */
 export function isGatedVerb(verb: string): boolean {
-  return kRawWrites.has(verb) || verb === "dump" || verb === "dump_process_full" || verb === "ui_dump_module" || verb === "ui_dump_target" || verb === "trace_record" || kGatedDebugger.has(verb);
+  return kRawWrites.has(verb) || verb === "dump" || verb === "dump_process_full" || verb === "ui_dump_module" || verb === "ui_dump_target" || verb === "ui_dump_all" || verb === "trace_record" || kGatedDebugger.has(verb);
 }

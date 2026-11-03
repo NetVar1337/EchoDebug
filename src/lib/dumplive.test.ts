@@ -40,7 +40,7 @@ vi.mock("./modfile", () => ({ readModuleFileBytes: async () => ({ bytes: file, p
 vi.mock("./unpacklive", () => ({ exportIndex: async () => new Map() }));
 vi.mock("./tauri", () => ({ isTauri: () => false }));
 
-const { dumpImage, dumpName, dumpTarget, findHiddenImages, isDriverFile, probeKernelReads, readSalvaged } = await import("./dumplive");
+const { dumpImage, dumpMany, dumpName, dumpTarget, findHiddenImages, isDriverFile, joinPath, probeKernelReads, readSalvaged } = await import("./dumplive");
 const mod = { name: "fix-seh.exe", base: "0x140000000", size: image.length };
 
 describe("live dumps", () => {
@@ -135,5 +135,34 @@ describe("live dumps", () => {
     const garbage = await probeKernelReads([{ name: "x.sys", path: "", base: "0x7ff00000", size: 0x1000 }]);
     expect(garbage.detail).toMatch(/without valid PE headers/);
     expect((await probeKernelReads([{ name: "x.sys", path: "", base: "0x0", size: 1 }])).detail).toMatch(/elevated/);
+  });
+
+  it("fills pages that are not resident from the file on disk", async () => {
+    unreadable.add(0x140001000n);
+    try {
+      const d = await dumpImage({ name: mod.name, base: kBase, size: mod.size, module: mod }, [mod], { layout: "file", headers: "auto" });
+      expect(d.report.filledFromDisk).toBe(1);
+      expect(d.report.badPages).toBe(0);
+      expect(d.report.file).toBe("C:\\fix-seh.exe");
+      expect(mapPeFile(d.bytes).subarray(0x1000, 0x10c6)).toEqual(image.subarray(0x1000, 0x10c6));
+      expect(d.report.warnings.join(" ")).toMatch(/filled from C:\\fix-seh.exe/);
+      // without the fill the page stays zero
+      const z = await dumpImage({ name: mod.name, base: kBase, size: mod.size, module: mod }, [mod], { layout: "file", headers: "auto", fillFromDisk: false });
+      expect(z.report.badPages).toBe(1);
+    } finally {
+      unreadable.delete(0x140001000n);
+    }
+  });
+
+  it("dumps many images into one folder, keeping going past failures", async () => {
+    const written = new Map<string, number>();
+    const rows = await dumpMany([
+      { name: mod.name, base: kBase, size: mod.size, module: mod },
+      { name: mod.name, base: kBase, size: mod.size, module: mod },
+      { name: "gone.sys", base: 0xfffff800_00000000n, size: 0x2000 },
+    ], [mod], { layout: "file", headers: "auto" }, (f) => ({ write: async (b) => { written.set(f, b.length); }, close: async () => joinPath("C:\\dumps\\", f) }));
+    expect(rows.map((r) => r.path ?? r.error?.slice(0, 20))).toEqual(["C:\\dumps\\fix-seh_dump.exe", "C:\\dumps\\fix-seh_dump_140000000.exe", "no page of gone.sys "]);
+    expect([...written.keys()]).toEqual(["fix-seh_dump.exe", "fix-seh_dump_140000000.exe"]);
+    expect(joinPath("/tmp/out/", "a.dll")).toBe("/tmp/out/a.dll");
   });
 });

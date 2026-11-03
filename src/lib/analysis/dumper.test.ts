@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { codeViewRecord, dumpSize, elfCorePrefix, findImages, fixDump, headerProblem, minidumpPrefix, peChecksum, readHeaders, recoverHeaders, updateChecksum } from "./dumper";
+import { codeViewRecord, dumpSize, elfCorePrefix, fillFromDisk, findImages, fixDump, headerProblem, minidumpPrefix, overlayOf, peChecksum, readHeaders, recoverHeaders, updateChecksum } from "./dumper";
 import { mapPeFile, parsePe } from "./pe";
 import { buildTestPe } from "./testpe";
 
@@ -195,5 +195,29 @@ describe("full dumps", () => {
     expect(dv.getBigUint64(ph(2) + 8, true)).toBe(BigInt(p.length + 0x2000));
     expect(dv.getUint32(ph(2) + 4, true)).toBe(6);
     expect(dv.getBigUint64(ph(2) + 16, true)).toBe(0x7f00_0000_0000n);
+  });
+});
+
+describe("full images from disk", () => {
+  it("fills pages that were not resident from the file", () => {
+    const file = fixture("fix-res.exe");
+    const img = mapPeFile(file);
+    const holed = img.slice();
+    holed.fill(0, 0x1000, 0x2000); // .text not resident
+    holed.fill(0, 0x3000, 0x4000); // .data: no file data behind it
+    const r = fillFromDisk(holed, [0x1000, 0x3000, 0x3123], file);
+    expect(r.filled).toEqual([0x1000]);
+    expect(r.empty).toEqual([0x3000]);
+    expect(r.img.subarray(0x1000, 0x2000)).toEqual(img.subarray(0x1000, 0x2000));
+    expect(holed[0x1000]).toBe(0); // the input is not changed
+  });
+
+  it("finds the overlay after the last section", () => {
+    const file = fixture("fix-res.exe");
+    expect(overlayOf(file).length).toBe(0);
+    const withOverlay = new Uint8Array(file.length + 5);
+    withOverlay.set(file);
+    withOverlay.set([1, 2, 3, 4, 5], file.length);
+    expect([...overlayOf(withOverlay)]).toEqual([1, 2, 3, 4, 5]);
   });
 });

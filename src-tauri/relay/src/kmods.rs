@@ -24,8 +24,38 @@ pub struct KMod {
 
 impl KMod {
     fn to_json(&self) -> Value {
-        json!({ "name": self.name, "path": self.path, "base": format!("0x{:x}", self.base), "size": self.size })
+        let mut v = json!({ "name": self.name, "path": self.path, "base": format!("0x{:x}", self.base), "size": self.size });
+        if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+            if let Some(f) = dos_path(&self.path, &root, &drive) {
+                v["file"] = json!(f);
+            }
+        }
+        v
     }
+}
+
+/// The file behind a kernel image path as the kernel reports it: `\SystemRoot\...` (the Windows
+/// directory), `\??\C:\...` (a DOS path), `\Windows\...` or `\System32\...` (on the system
+/// drive), or already `C:\...`. `None` for anything else (device paths, Linux).
+pub fn dos_path(nt: &str, system_root: &str, system_drive: &str) -> Option<String> {
+    let lower = nt.to_ascii_lowercase();
+    let root = system_root.trim_end_matches('\\');
+    if let Some(rest) = lower.strip_prefix("\\systemroot\\") {
+        return Some(format!("{root}\\{}", &nt[nt.len() - rest.len()..]));
+    }
+    if let Some(rest) = nt.strip_prefix("\\??\\").or_else(|| nt.strip_prefix("\\DosDevices\\")) {
+        return Some(rest.to_owned());
+    }
+    if lower.starts_with("\\windows\\") {
+        return Some(format!("{}{nt}", system_drive.trim_end_matches('\\')));
+    }
+    if let Some(rest) = lower.strip_prefix("\\system32\\") {
+        return Some(format!("{root}\\System32\\{}", &nt[nt.len() - rest.len()..]));
+    }
+    let b = nt.as_bytes();
+    (b.len() > 2 && b[1] == b':' && b[0].is_ascii_alphabetic()).then(|| nt.to_owned())
 }
 
 /// RTL_PROCESS_MODULES as NtQuerySystemInformation(SystemModuleInformation) fills it on x64:
@@ -164,6 +194,19 @@ mod tests {
         buf[0] = 9;
         assert_eq!(parse_rtl_modules(&buf).len(), 2);
         assert!(parse_rtl_modules(&[1, 0]).is_empty());
+    }
+
+    #[test]
+    fn kernel_paths_to_files() {
+        let f = |p: &str| dos_path(p, "C:\\Windows", "C:");
+        assert_eq!(f("\\SystemRoot\\System32\\drivers\\ACPI.sys").as_deref(), Some("C:\\Windows\\System32\\drivers\\ACPI.sys"));
+        assert_eq!(f("\\systemroot\\system32\\ntoskrnl.exe").as_deref(), Some("C:\\Windows\\system32\\ntoskrnl.exe"));
+        assert_eq!(f("\\??\\D:\\Tools\\my.sys").as_deref(), Some("D:\\Tools\\my.sys"));
+        assert_eq!(f("\\Windows\\System32\\drivers\\x.sys").as_deref(), Some("C:\\Windows\\System32\\drivers\\x.sys"));
+        assert_eq!(f("\\System32\\drivers\\y.sys").as_deref(), Some("C:\\Windows\\System32\\drivers\\y.sys"));
+        assert_eq!(f("C:\\x.sys").as_deref(), Some("C:\\x.sys"));
+        assert_eq!(f("\\Device\\HarddiskVolume3\\x.sys"), None);
+        assert_eq!(dos_path("\\SystemRoot\\a.sys", "C:\\WINDOWS\\", "C:").as_deref(), Some("C:\\WINDOWS\\a.sys"));
     }
 
     #[test]

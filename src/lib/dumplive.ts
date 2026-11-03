@@ -11,7 +11,7 @@ import { readModuleFileBytes } from "./modfile";
 import { exportIndex } from "./unpacklive";
 import { buildDumpPe, findIat } from "./analysis/unpack";
 import {
-  codeViewRecord, dumpSize, elfCorePrefix, findImages, fixDump, headerProblem, minidumpPrefix, readHeaders, recoverHeaders, updateChecksum,
+  codeViewRecord, dumpSize, elfCorePrefix, fillFromDisk, findImages, fixDump, headerProblem, minidumpPrefix, overlayOf, readHeaders, recoverHeaders, updateChecksum,
   type DumpLayout, type DumpRegion, type DumpReport, type FoundImage, type MdModule,
 } from "./analysis/dumper";
 
@@ -58,18 +58,37 @@ export async function readSalvaged(base: bigint, size: number, onProgress?: Prog
   return { bytes: out, badPages: bad };
 }
 
-export type ImageTarget = { name: string; base: bigint; size?: number; module?: Module };
+/** `file`: the image's file on disk when it is not a loaded module (a driver), for the fill-ins. */
+export type ImageTarget = { name: string; base: bigint; size?: number; module?: Module; file?: string };
 export type ModuleDumpOptions = {
   layout: DumpLayout;
   /** "auto": memory, else the file on disk when the headers in memory are broken */
   headers: "auto" | "memory" | "disk";
+  /** pages that are not resident (paged out, discarded INIT sections) taken from the file on disk (default on) */
+  fillFromDisk?: boolean;
+  /** append the file's overlay (data after the last section, never mapped) */
+  overlay?: boolean;
   /** rebuild the import table from the live IAT (PE32+, forces the virtual layout) */
   rebuildImports?: boolean;
   oepRva?: number;
   onProgress?: Progress;
   cancel?: Cancel;
 };
-export type ModuleDump = { name: string; bytes: Uint8Array; report: DumpReport & { headerSource: "memory" | "disk"; imports?: number } };
+export type ModuleDump = {
+  name: string;
+  bytes: Uint8Array;
+  report: DumpReport & { headerSource: "memory" | "disk"; imports?: number; filledFromDisk: number; overlay: number; file?: string };
+};
+
+/** A file on this machine, through the app (drivers) or the local backend's module_file (modules). */
+async function diskImage(t: ImageTarget): Promise<{ bytes: Uint8Array; path: string } | null> {
+  if (t.module) return readModuleFileBytes(t.module).catch(() => null);
+  if (t.file && isTauri()) {
+    const bytes = await invoke<number[]>("read_binary_file", { path: t.file }).catch(() => null);
+    return bytes ? { bytes: new Uint8Array(bytes), path: t.file } : null;
+  }
+  return null;
+}
 
 /** A loaded image (module, driver, or a PE found at an address) rebuilt into a loadable PE. */
 export async function dumpImage(t: ImageTarget, modules: readonly Module[], o: ModuleDumpOptions): Promise<ModuleDump> {
@@ -83,29 +102,95 @@ export async function dumpImage(t: ImageTarget, modules: readonly Module[], o: M
   const { bytes, badPages } = await readSalvaged(t.base, size, o.onProgress, o.cancel);
   const pages = Math.ceil(size / kPage);
   if (badPages.length === pages) throw new Error(`no page of ${t.name} at ${fmtAddr(t.base)} could be read${t.base >= 0xffff_8000_0000_0000n ? " (kernel memory: this backend cannot read it here — Echo documents no kernel-memory access, and the local /proc backend has none)" : ""}`);
-  let disk: Uint8Array | null = null;
-  if (o.headers === "disk" || (o.headers === "auto" && headerProblem(bytes))) {
-    if (t.module) disk = await readModuleFileBytes(t.module).then((f) => f.bytes).catch(() => null);
-  }
-  const rec = recoverHeaders(bytes, disk, o.headers === "disk" ? "disk" : "memory");
+  const fill = o.fillFromDisk !== false;
+  const wantDisk = o.headers === "disk" || (o.headers === "auto" && headerProblem(bytes)) || (fill && badPages.length > 0) || o.overlay;
+  const disk = wantDisk ? await diskImage(t) : null;
+  const rec = recoverHeaders(bytes, disk?.bytes ?? null, o.headers === "disk" ? "disk" : "memory");
   const problem = headerProblem(rec.img);
   if (problem) throw new Error(`${t.name}: ${problem}${rec.note ? ` (${rec.note})` : ""}`);
+  // pages that were not resident: the file's bytes where it has them
+  let img = rec.img;
+  let stillBad: number[] = badPages;
+  let filled = 0;
+  if (fill && disk && badPages.length && !headerProblem(disk.bytes)) {
+    const f = fillFromDisk(img, rec.source === "disk" ? badPages.filter((p) => p !== 0) : badPages, disk.bytes);
+    img = f.img;
+    filled = f.filled.length;
+    stillBad = f.empty;
+  }
   const layout: DumpLayout = o.rebuildImports ? "virtual" : o.layout;
-  let { bytes: out, report } = fixDump(rec.img, { layout, base: t.base, oepRva: o.oepRva, badPages });
+  let { bytes: out, report } = fixDump(img, { layout, base: t.base, oepRva: o.oepRva, badPages: stillBad });
   let imports: number | undefined;
   if (o.rebuildImports) {
     const self = t.module ?? { name: t.name, base: fmtAddr(t.base), size };
     const idx = await exportIndex(modules, self);
-    const blocks = findIat(rec.img, idx);
+    const blocks = findIat(img, idx);
     if (blocks.length) {
       out = buildDumpPe(out, t.base, o.oepRva ?? readHeaders(out).entryRva, blocks);
       report = { ...report, size: out.length, checksum: updateChecksum(out), warnings: [...report.warnings] };
       imports = blocks.reduce((a, b) => a + b.thunks.length, 0);
     } else report.warnings.push("no IAT found to rebuild: the import table is the one in memory");
   }
+  let overlay = 0;
+  if (o.overlay) {
+    const ov = disk && !headerProblem(disk.bytes) ? overlayOf(disk.bytes) : null;
+    if (ov?.length) {
+      const joined = new Uint8Array(out.length + ov.length);
+      joined.set(out);
+      joined.set(ov, out.length);
+      out = joined;
+      overlay = ov.length;
+      report = { ...report, size: out.length, checksum: updateChecksum(out) };
+    } else if (!disk) report.warnings.push("no file on disk to take the overlay from");
+  }
   if (rec.note) report.warnings.unshift(rec.note);
-  if (badPages.length) report.warnings.push("unreadable pages are usually not resident (paged out or never touched): touching that code or data in the target before dumping brings them in");
-  return { name: t.name, bytes: out, report: { ...report, headerSource: rec.source, imports } };
+  if (filled) report.warnings.push(`${filled} page(s) were not resident and were filled from ${disk?.path ?? "the file on disk"} (the file's bytes: before relocation and any runtime change)`);
+  if (stillBad.length) {
+    report.warnings.push(fill && !disk
+      ? "unreadable pages are zero-filled: the file on disk was not available to fill them (touching that code or data in the target before dumping brings it in)"
+      : "unreadable pages with no file data behind them (.bss, data the file does not back) are zero-filled");
+  }
+  return { name: t.name, bytes: out, report: { ...report, headerSource: rec.source, imports, filledFromDisk: filled, overlay, file: disk?.path } };
+}
+
+export type BulkRow = { name: string; base: string; path?: string; bytes?: number; badPages?: number; filledFromDisk?: number; error?: string };
+
+/** Dumps several images, one file each, through `sinkFor`; one failure does not stop the rest. */
+export async function dumpMany(targets: readonly ImageTarget[], modules: readonly Module[], o: Omit<ModuleDumpOptions, "onProgress">, sinkFor: (fileName: string) => Sink, onEach?: (row: BulkRow, done: number, total: number) => void): Promise<BulkRow[]> {
+  const rows: BulkRow[] = [];
+  const used = new Set<string>();
+  for (const [i, t] of targets.entries()) {
+    if (o.cancel?.aborted) break;
+    let row: BulkRow = { name: t.name || fmtAddr(t.base), base: fmtAddr(t.base) };
+    try {
+      const d = await dumpImage(t, modules, o);
+      // two modules with one name (side-by-side DLLs): keep both files
+      let file = dumpName(d.name, t.base);
+      if (used.has(file.toLowerCase())) file = file.replace(/(\.[^.]+)?$/, `_${t.base.toString(16)}$1`);
+      used.add(file.toLowerCase());
+      const sink = sinkFor(file);
+      await sink.write(d.bytes);
+      row = { ...row, path: await sink.close(), bytes: d.bytes.length, badPages: d.report.badPages, filledFromDisk: d.report.filledFromDisk };
+    } catch (e) {
+      row.error = e instanceof Error ? e.message : String(e);
+    }
+    rows.push(row);
+    onEach?.(row, i + 1, targets.length);
+  }
+  return rows;
+}
+
+/** A folder the user picks (the app), for bulk dumps; null in the browser or when cancelled. */
+export async function pickFolder(): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const r = await open({ directory: true });
+  return typeof r === "string" ? r : null;
+}
+
+export function joinPath(dir: string, file: string): string {
+  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir.replace(/[\\/]+$/, "") + sep + file;
 }
 
 /** File name for a dump: game.exe → game_dump.exe (`_<base>` for images without a name). */
@@ -138,7 +223,7 @@ export async function findHiddenImages(modules: readonly Module[], onProgress?: 
 
 // ---- kernel drivers -----------------------------------------------------------------------------
 
-export type KernelModule = { name: string; path: string; base: string; size: number };
+export type KernelModule = { name: string; path: string; base: string; size: number; /** the driver file on disk (Windows) */ file?: string };
 export async function kernelModules(): Promise<{ modules: KernelModule[]; source: string; note?: string }> {
   return request("kernel_modules", {});
 }

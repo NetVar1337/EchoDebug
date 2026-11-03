@@ -9,9 +9,10 @@ import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { Progress } from "../../ui";
+import { isTauri as isTauriApp } from "@/lib/tauri";
 import {
-  defaultFormat, dumpImage, dumpName, dumpTarget, findHiddenImages, isDriverFile, kernelModules, pickSink, probeKernelReads,
-  type KernelProbe,
+  defaultFormat, downloadSink, dumpImage, dumpMany, dumpName, dumpTarget, fileSink, findHiddenImages, isDriverFile, joinPath, kernelModules, pickFolder, pickSink, probeKernelReads,
+  type BulkRow, type ImageTarget, type KernelProbe,
   type Cancel, type KernelModule, type ModuleDump, type ModuleDumpOptions, type TargetDumpReport,
 } from "@/lib/dumplive";
 import type { FoundImage } from "@/lib/analysis/dumper";
@@ -43,6 +44,12 @@ function DumpOptionsForm({ o, set, allowImports = true }: { o: Omit<ModuleDumpOp
           <input type="checkbox" checked={!!o.rebuildImports} onChange={(e) => set({ ...o, rebuildImports: e.target.checked })} />rebuild imports
         </label>
       )}
+      <label className="row" title="pages that are not resident (paged out, discarded INIT sections) come from the module's file on disk instead of zeros">
+        <input type="checkbox" checked={o.fillFromDisk !== false} onChange={(e) => set({ ...o, fillFromDisk: e.target.checked })} />fill from disk
+      </label>
+      <label className="row" title="append the file's overlay (data after the last section, never mapped into memory)">
+        <input type="checkbox" checked={!!o.overlay} onChange={(e) => set({ ...o, overlay: e.target.checked })} />overlay
+      </label>
       <label title="new entry point (RVA, hex), e.g. the OEP from the Unpack tab">OEP</label>
       <input className="dump-input" style={{ width: 90 }} placeholder="RVA" value={o.oepRva === undefined ? "" : o.oepRva.toString(16)}
         onChange={(e) => { const v = e.target.value.trim().replace(/^0x/i, ""); set({ ...o, oepRva: v && /^[0-9a-f]+$/i.test(v) ? parseInt(v, 16) : undefined }); }} />
@@ -62,7 +69,9 @@ function Report({ d, path }: { d: ModuleDump; path: string | null }) {
         <span className="dump-badge">checksum 0x{r.checksum.toString(16)}</span>
         <span className={`dump-badge ${r.headerSource === "disk" ? "warn" : ""}`}>headers from {r.headerSource}</span>
         {r.imports !== undefined && <span className="dump-badge ok">{r.imports} imports rebuilt</span>}
-        <span className={`dump-badge ${r.badPages ? "warn" : "faint"}`}>{r.badPages} unreadable pages</span>
+        {r.filledFromDisk > 0 && <span className="dump-badge ok">{r.filledFromDisk} pages from disk</span>}
+        {r.overlay > 0 && <span className="dump-badge ok">overlay {fmtBytes(r.overlay)}</span>}
+        <span className={`dump-badge ${r.badPages ? "warn" : "faint"}`}>{r.badPages} zero-filled pages</span>
       </div>
       {path && <div className="dump-result ok">Saved → <code>{path}</code></div>}
       {r.warnings.map((w) => <div key={w} className="warn" style={{ fontSize: 12 }}>{w}</div>)}
@@ -104,7 +113,60 @@ function useImageDump() {
   return { busy, prog, last, run };
 }
 
-const kDefaults: Omit<ModuleDumpOptions, "onProgress" | "cancel"> = { layout: "file", headers: "auto" };
+const kDefaults: Omit<ModuleDumpOptions, "onProgress" | "cancel"> = { layout: "file", headers: "auto", fillFromDisk: true };
+
+/** "Dump all": every target into a folder the user picks (downloads in the browser). */
+function useBulkDump() {
+  const modules = useConn((s) => s.modules);
+  const [rows, setRows] = useState<BulkRow[] | null>(null);
+  const [prog, setProg] = useState<{ done: number; total: number } | null>(null);
+  const cancel = useRef<Cancel>({ aborted: false });
+  const run = async (targets: ImageTarget[], o: Omit<ModuleDumpOptions, "onProgress" | "cancel">, what: string) => {
+    if (!targets.length) return;
+    let dir: string | null = null;
+    if (isTauriApp()) {
+      dir = await pickFolder();
+      if (!dir) return;
+    }
+    cancel.current = { aborted: false };
+    setRows([]);
+    setProg({ done: 0, total: targets.length });
+    const out = await dumpMany(targets, modules, { ...o, cancel: cancel.current }, (f) => (dir ? fileSink(joinPath(dir, f)) : downloadSink(f)), (row, done, total) => {
+      setRows((r) => [...(r ?? []), row]);
+      setProg({ done, total });
+    });
+    setProg(null);
+    const ok = out.filter((r) => !r.error).length;
+    log(ok === out.length ? "info" : "warn", "dump", `${what}: ${ok} of ${out.length} dumped${dir ? ` to ${dir}` : ""}${ok < out.length ? `, ${out.length - ok} failed` : ""}`);
+  };
+  const view = (
+    <>
+      {prog && (
+        <div className="row">
+          <span className="faint" style={{ fontSize: 12 }}>{prog.done} / {prog.total}</span>
+          <Progress value={prog.done / Math.max(1, prog.total)} />
+          <button className="dump-btn" onClick={() => { cancel.current.aborted = true; }}><Square size={13} /> Stop</button>
+        </div>
+      )}
+      {rows && rows.length > 0 && (
+        <table className="table mono" style={{ fontSize: 12 }}>
+          <thead><tr><th>image</th><th>base</th><th>size</th><th>from disk</th><th>zero-filled</th><th>file</th></tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={`${r.name}${r.base}`}>
+                <td>{r.name}</td><td>{r.base}</td>
+                {r.error
+                  ? <td colSpan={4} className="warn ellipsis" title={r.error}>{r.error}</td>
+                  : <><td>{fmtBytes(r.bytes ?? 0)}</td><td>{r.filledFromDisk || ""}</td><td className={r.badPages ? "warn" : "faint"}>{r.badPages}</td><td className="faint ellipsis">{r.path}</td></>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+  return { run, busy: !!prog, view };
+}
 
 export function ModuleDumpPanel() {
   const { modules, target } = useConn();
@@ -113,7 +175,12 @@ export function ModuleDumpPanel() {
   const [o, setO] = useState(kDefaults);
   const [addr, setAddr] = useState("");
   const { busy, prog, last, run } = useImageDump();
+  const bulk = useBulkDump();
+  const [bulkKind, setBulkKind] = useState<"all" | "exe" | "dll">("all");
   const m = modules.find((x) => x.name === name) ?? modules.find((x) => x.base === target?.base) ?? modules[0];
+  const bulkTargets = modules
+    .filter((x) => bulkKind === "all" ? /\.(exe|dll)$/i.test(x.name) : new RegExp(`\\.${bulkKind}$`, "i").test(x.name))
+    .map((x) => ({ name: x.name, base: toBig(x.base), size: x.size, module: x }));
   const dumpAt = () => {
     const a = parseAddress(addr, modules);
     if (a === null) return log("warn", "dump", `cannot parse ${addr}`);
@@ -122,7 +189,7 @@ export function ModuleDumpPanel() {
   return (
     <div className="dump-panel">
       <p className="dump-blurb">
-        Dump a loaded module from memory into a PE that loads and disassembles (x64dbg / Scylla style): every readable page (a page that is not resident costs 4 KiB, not the whole read), ImageBase set to where it was dumped, the section table rewritten for the layout, debug-directory offsets fixed,
+        Dump a loaded module from memory into a PE that loads and disassembles (x64dbg / Scylla style): every readable page, and pages that are not resident (paged out) filled from the module's file on disk, ImageBase set to where it was dumped, the section table rewritten for the layout, debug-directory offsets fixed,
         the signature table dropped, the checksum recomputed; headers wiped by anti-dump code come from the file on disk. Reads go through the
         attached backend, so nothing touches the target.
       </p>
@@ -137,11 +204,24 @@ export function ModuleDumpPanel() {
       </div>
       <DumpOptionsForm o={o} set={setO} />
       <div className="dump-form">
+        <label>Every loaded</label>
+        <select className="select" value={bulkKind} onChange={(e) => setBulkKind(e.target.value as "all" | "exe" | "dll")}>
+          <option value="all">.exe and .dll</option>
+          <option value="exe">.exe</option>
+          <option value="dll">.dll</option>
+        </select>
+        <button className="dump-btn" disabled={!bulkTargets.length || bulk.busy || !!busy} onClick={() => void bulk.run(bulkTargets, o, "modules")}>
+          <Archive size={13} /> Dump all ({bulkTargets.length})…
+        </button>
+        <span className="faint" style={{ fontSize: 12 }}>one rebuilt file each, into a folder you pick</span>
+      </div>
+      <div className="dump-form">
         <label title="a PE image anywhere in memory: a manually mapped DLL, an unpacked payload (size from its headers)">Image at address</label>
         <input className="dump-input" style={{ width: 200 }} placeholder="0x… · module+0x…" value={addr} onChange={(e) => setAddr(e.target.value)} onKeyDown={(e) => e.key === "Enter" && dumpAt()} />
         <button className="dump-btn" disabled={!addr.trim() || !!busy} onClick={dumpAt}><Archive size={13} /> Dump image</button>
       </div>
       {busy && <div className="row"><span className="faint" style={{ fontSize: 12 }}>reading {busy}…</span><Progress value={prog} /></div>}
+      {bulk.view}
       {last && <Report d={last.d} path={last.path} />}
     </div>
   );
@@ -211,8 +291,10 @@ export function DriversPanel() {
   const [sysOnly, setSysOnly] = useState(true);
   const [probe, setProbe] = useState<KernelProbe | null>(null);
   const [probing, setProbing] = useState(false);
-  const [o, setO] = useState<Omit<ModuleDumpOptions, "onProgress" | "cancel">>({ layout: "file", headers: "memory" });
+  const [o, setO] = useState<Omit<ModuleDumpOptions, "onProgress" | "cancel">>({ layout: "file", headers: "auto", fillFromDisk: true });
   const { busy, prog, last, run } = useImageDump();
+  const bulk = useBulkDump();
+  const target = (m: KernelModule): ImageTarget => ({ name: m.name, base: toBig(m.base), size: m.size, file: m.file });
   const load = async () => {
     try {
       setList(await kernelModules());
@@ -253,6 +335,14 @@ export function DriversPanel() {
       {probe && <div className={probe.ok ? "dump-result ok" : "warn"} style={{ fontSize: 12 }}>{probe.detail}</div>}
       {list?.note && <div className="warn" style={{ fontSize: 12 }}>{list.note}</div>}
       <DumpOptionsForm o={o} set={setO} allowImports={false} />
+      <div className="dump-form">
+        <button className="dump-btn" disabled={!shown.some((m) => toBig(m.base) !== 0n) || bulk.busy || !!busy}
+          onClick={() => void bulk.run(shown.filter((m) => toBig(m.base) !== 0n).map(target), o, "drivers")}>
+          <Archive size={13} /> Dump all shown ({shown.filter((m) => toBig(m.base) !== 0n).length})…
+        </button>
+        <span className="faint" style={{ fontSize: 12 }}>pages Windows discarded after load (INIT) are filled from each driver's file on disk</span>
+      </div>
+      {bulk.view}
       <table className="table mono" style={{ fontSize: 12 }}>
         <thead><tr><th>driver</th><th>base</th><th>size</th><th>path</th><th></th></tr></thead>
         <tbody>
@@ -260,7 +350,7 @@ export function DriversPanel() {
             <tr key={`${m.name}${m.base}`}>
               <td>{m.name}</td><td>{m.base}</td><td>{fmtBytes(m.size)}</td><td className="faint ellipsis">{m.path}</td>
               <td><button className="row-action" disabled={!!busy || toBig(m.base) === 0n} title={toBig(m.base) === 0n ? "the kernel did not report its base" : undefined}
-                onClick={() => void run({ name: m.name, base: toBig(m.base), size: m.size }, o)}>dump</button></td>
+                onClick={() => void run(target(m), o)}>dump</button></td>
             </tr>
           ))}
         </tbody>

@@ -59,7 +59,7 @@ import { useMcp } from "@/store/mcp";
 import { scanModuleHooks } from "./hooklive";
 import { scanGrouped } from "./sigbatch";
 import { isTauri } from "./tauri";
-import { defaultFormat, dumpImage, dumpTarget, fileSink, findHiddenImages } from "./dumplive";
+import { defaultFormat, dumpImage, dumpMany, dumpTarget, fileSink, findHiddenImages, isDriverFile, joinPath, kernelModules } from "./dumplive";
 import { guessEngine, il2cppDump, sourceNetvars, unrealOpen, unrealSdk, type UnrealSession } from "./enginelive";
 import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
@@ -703,22 +703,40 @@ function outPath(args: Args): string {
   return p;
 }
 
-function dumpOpts(args: Args): { layout: "file" | "virtual"; headers: "auto" | "memory" | "disk"; rebuildImports: boolean; oepRva?: number } {
+function dumpOpts(args: Args): { layout: "file" | "virtual"; headers: "auto" | "memory" | "disk"; rebuildImports: boolean; oepRva?: number; fillFromDisk: boolean; overlay: boolean } {
   const layout = args.layout === "virtual" ? "virtual" : "file";
   const headers = args.headers === "memory" || args.headers === "disk" ? args.headers : "auto";
   const oep = typeof args.oep_rva === "string" || typeof args.oep_rva === "number" ? Number(BigInt(String(args.oep_rva))) : undefined;
-  return { layout, headers, rebuildImports: Boolean(args.rebuild_imports), oepRva: oep };
+  return { layout, headers, rebuildImports: Boolean(args.rebuild_imports), oepRva: oep, fillFromDisk: args.fill_from_disk !== false, overlay: Boolean(args.overlay) };
 }
 
 provide("ui_dump_module", async (args) => {
   const path = outPath(args);
   const mods = modules();
   const t = args.address !== undefined
-    ? { name: "", base: addrArg(args), size: num(args, "size", 0) || undefined }
+    ? { name: typeof args.name === "string" ? args.name : "", base: addrArg(args), size: num(args, "size", 0) || undefined, file: typeof args.file === "string" ? args.file : undefined }
     : (() => { const m = pickModule(args); return { name: m.name, base: toBig(m.base), size: m.size, module: m }; })();
   const d = await dumpImage(t, mods, dumpOpts(args));
   await fileSink(path).write(d.bytes);
   return { path, bytes: d.bytes.length, ...d.report };
+});
+
+provide("ui_dump_all", async (args) => {
+  const dir = typeof args.dir === "string" ? args.dir.trim() : "";
+  if (!dir) throw new Error("missing 'dir' (the folder to write the dumps to)");
+  if (!isTauri()) throw new Error("writing dump files needs the desktop app");
+  const f = typeof args.filter === "string" ? args.filter.toLowerCase() : "";
+  const mods = modules();
+  let targets;
+  if (args.what === "drivers") {
+    const k = await kernelModules();
+    targets = k.modules.filter((m) => toBig(m.base) !== 0n && (args.all_kernel_modules || isDriverFile(m)) && (!f || m.name.toLowerCase().includes(f)))
+      .map((m) => ({ name: m.name, base: toBig(m.base), size: m.size, file: m.file }));
+  } else {
+    targets = mods.filter((m) => /\.(exe|dll)$/i.test(m.name) && (!f || m.name.toLowerCase().includes(f))).map((m) => ({ name: m.name, base: toBig(m.base), size: m.size, module: m }));
+  }
+  const rows = await dumpMany(targets, mods, dumpOpts(args), (file) => fileSink(joinPath(dir, file)));
+  return { dir, dumped: rows.filter((r) => !r.error).length, failed: rows.filter((r) => r.error).length, results: rows };
 });
 
 provide("ui_find_hidden_images", async (args) => {

@@ -108,6 +108,64 @@ export function recoverHeaders(img: Uint8Array, disk: Uint8Array | null, prefer:
   return { img: out, source: "disk", note: bad ? `headers in memory are broken (${bad}); took them from the file on disk` : "headers taken from the file on disk" };
 }
 
+type DiskSec = { va: number; size: number; raw: number };
+
+function diskSections(disk: Uint8Array): { secs: DiskSec[]; hdrEnd: number; fileEnd: number } {
+  const h = readHeaders(disk);
+  const dv = new DataView(disk.buffer, disk.byteOffset, disk.byteLength);
+  const secs: DiskSec[] = [];
+  let fileEnd = Math.max(h.sizeOfHeaders, h.st + h.nsec * 40);
+  for (let i = 0; i < h.nsec; i++) {
+    const o = h.st + i * 40;
+    const vsize = dv.getUint32(o + 8, true);
+    const va = dv.getUint32(o + 12, true);
+    const rawSize = dv.getUint32(o + 16, true);
+    const raw = dv.getUint32(o + 20, true);
+    if (!raw || !rawSize) continue;
+    const size = Math.min(vsize || rawSize, rawSize, Math.max(0, disk.length - raw));
+    if (size > 0) secs.push({ va, size, raw });
+    fileEnd = Math.max(fileEnd, Math.min(disk.length, raw + rawSize));
+  }
+  return { secs, hdrEnd: Math.min(Math.max(h.sizeOfHeaders, h.st + h.nsec * 40), disk.length), fileEnd };
+}
+
+/**
+ * Pages that could not be read (not resident: paged out, discarded INIT sections) filled from the
+ * module's file on disk, where the file has data for them. Their bytes are the file's, i.e. what
+ * the loader put there before relocations and runtime changes. Returns the RVAs filled and those
+ * left zero (no file data: .bss, a section the file does not back).
+ */
+export function fillFromDisk(img: Uint8Array, badPages: readonly number[], disk: Uint8Array): { img: Uint8Array; filled: number[]; empty: number[] } {
+  const { secs, hdrEnd } = diskSections(disk);
+  const out = img.slice();
+  const filled: number[] = [];
+  const empty: number[] = [];
+  for (const page of [...new Set(badPages.map((p) => p & ~0xfff))].sort((a, b) => a - b)) {
+    let got = 0;
+    const end = Math.min(page + 0x1000, out.length);
+    if (page < hdrEnd) {
+      const n = Math.min(end, hdrEnd) - page;
+      out.set(disk.subarray(page, page + n), page);
+      got += n;
+    }
+    for (const s of secs) {
+      const lo = Math.max(page, s.va);
+      const hi = Math.min(end, s.va + s.size);
+      if (lo >= hi) continue;
+      out.set(disk.subarray(s.raw + (lo - s.va), s.raw + (hi - s.va)), lo);
+      got += hi - lo;
+    }
+    (got ? filled : empty).push(page);
+  }
+  return { img: out, filled, empty };
+}
+
+/** The file's overlay: bytes after the last section's raw data (installer payloads, appended data). */
+export function overlayOf(disk: Uint8Array): Uint8Array {
+  const { fileEnd } = diskSections(disk);
+  return disk.subarray(Math.min(fileEnd, disk.length));
+}
+
 /** The PE checksum (imagehlp's CheckSumMappedFile) with the checksum field taken as zero. */
 export function peChecksum(b: Uint8Array, csumOff: number): number {
   let sum = 0;
