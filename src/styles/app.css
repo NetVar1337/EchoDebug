@@ -408,3 +408,13 @@ html[data-motion="off"] *::after {
 .vtrace { display: flex; flex-wrap: wrap; gap: 3px; max-height: 160px; overflow: auto; }
 .vtrace .pill { padding: 0 5px; font-size: 11px; }
 .toolbar.wrap { flex-wrap: wrap; height: auto; padding-top: 6px; padding-bottom: 6px; }
+
+/* right-click menus (useContextMenu) */
+.context-menu { position: fixed; top: 0; left: 0; z-index: 120; min-width: 240px; }
+.menu-item:disabled { color: var(--text-faint); cursor: default; background: none; }
+
+/* debugger views: API monitor log, access finder */
+.call-row { display: grid; grid-template-columns: 44px 52px minmax(70px, 1.2fr) minmax(0, 3fr) minmax(48px, 0.8fr) minmax(0, 1fr); gap: 8px; height: var(--row-h); padding: 0 10px; align-items: center; font-family: var(--font-mono); font-size: 12px; white-space: nowrap; }
+.call-row > span { overflow: hidden; text-overflow: ellipsis; }
+.call-row[data-selected="true"] { background: var(--selection); }
+.call-row.head { font-family: var(--font-ui); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); border-bottom: 1px solid var(--border-soft); }

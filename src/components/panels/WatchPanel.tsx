@@ -10,7 +10,8 @@ import { usePatches } from "@/store/patches";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry } from "@/store/watch";
-import { CommitInput, IconButton, Panel } from "../ui";
+import { CommitInput, IconButton, Panel, useContextMenu } from "../ui";
+import { accessMenuItems } from "../accessMenu";
 
 const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "ptr", "ascii", "utf16"];
 const kAlertTypes = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bytes", "string", "wstring"];
@@ -29,6 +30,15 @@ export default function WatchPanel() {
   // conditional alerts live in the Echo agent; fired ones are logged to Output by the conn store
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [al, setAl] = useState({ address: "", type: "i32", cond: "changed", value: "", once: false });
+  const [openMenu, menu] = useContextMenu();
+  const rowMenu = (ev: React.MouseEvent, e: WatchEntry) => openMenu(ev, [
+    ...accessMenuItems(e.address, kSizes[e.type]),
+    "sep",
+    { label: "Browse memory", onClick: () => ui.goMemory(e.address) },
+    { label: "Disassemble here", onClick: () => ui.goDisasm(e.address) },
+    { label: e.frozen ? "Unfreeze" : "Freeze", onClick: () => void toggleFreeze(e) },
+    { label: "Remove", onClick: () => w.removeWatch(e.id) },
+  ]);
 
   const refreshAlerts = useCallback(async () => {
     if (!ext) return setAlerts([]);
@@ -126,7 +136,7 @@ export default function WatchPanel() {
           <thead><tr><th>Address</th><th>Type</th><th>Value</th><th /></tr></thead>
           <tbody>
             {w.watches.map((e) => (
-              <tr key={e.id}>
+              <tr key={e.id} onContextMenu={(ev) => rowMenu(ev, e)} title="right-click: find what writes / accesses it">
                 <td title={labelAddr(e.address, modules)}>
                   <CommitInput className="input mono" value={e.label || labelAddr(e.address, modules)} onCommit={(v) => {
                     const a = parseAddress(v, modules);
@@ -196,6 +206,7 @@ export default function WatchPanel() {
         </table>
         {w.bookmarks.length === 0 && <div className="panel-section faint">No bookmarks.</div>}
       </div>
+      {menu}
     </Panel>
   );
 }

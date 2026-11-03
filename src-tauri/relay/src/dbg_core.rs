@@ -398,6 +398,9 @@ pub static SIGS: &[Sig] = &[
     Sig { name: "malloc", args: &[("size", Size)], ret: Ptr },
     Sig { name: "free", args: &[("ptr", Ptr)], ret: Void },
     Sig { name: "getpid", args: &[], ret: I32 },
+    Sig { name: "usleep", args: &[("usec", U32)], ret: I32 },
+    Sig { name: "sleep", args: &[("seconds", U32)], ret: U32 },
+    Sig { name: "nanosleep", args: &[("req", Ptr), ("rem", Ptr)], ret: I32 },
     Sig { name: "execve", args: &[("pathname", Str), ("argv", Ptr), ("envp", Ptr)], ret: I32 },
     Sig { name: "ptrace", args: &[("request", I32), ("pid", I32), ("addr", Ptr), ("data", Ptr)], ret: Ssize },
 ];

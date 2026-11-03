@@ -28,6 +28,8 @@ type ConnStore = {
   extOk: boolean;
   extVersion: string;
   appVersion: string;
+  /** the native debugger the dbg_* verbs reach: "ptrace" (Linux local backend), "windows" (Win32 debug API, a process on this machine) or "" */
+  debugger: string;
   /** "echo" (Windows memory server), "local" (Linux /proc backend) or "none" */
   backend: string;
   /** host OS of the desktop app ("browser" in a plain browser) */
@@ -80,6 +82,7 @@ export const useConn = create<ConnStore>((set, get) => ({
   extVersion: "",
   appVersion: pkg.version,
   backend: "none",
+  debugger: "",
   os: "browser",
   target: null,
   modules: [],
@@ -171,7 +174,8 @@ function applyStatus(f: Frame): void {
   const backend = String(f.backend ?? (agent ? "echo" : "none"));
   const target = targetFrom(f) ?? (agent || backend === "local" ? s.target : null);
   const changed = agent !== s.agent || target?.pid !== s.target?.pid;
-  useConn.setState({ agent, mem: agent || backend === "local", extOk: Boolean(f.ext) || backend === "local", provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
+  const debuggerKind = typeof f.debugger === "string" ? f.debugger : "";
+  useConn.setState({ debugger: debuggerKind, agent, mem: agent || backend === "local", extOk: Boolean(f.ext) || backend === "local", provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
   if (changed) {
     clearImages();
     void s.refreshModules();
