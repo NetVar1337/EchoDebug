@@ -50,7 +50,7 @@ int main(void) {
   pthread_barrier_wait(&ready);
   /* last, so no later malloc reuses them (pthread_create allocates; a large malloc consolidates fastbins) */
   free(big); /* too big for tcache: unsorted bin */
-  for (int i = 0; i < 9; i++) free(fb[i]); /* 7 fill tcache[1], 2 go to fastbin[1] */
+  for (int i = 0; i < 9; i++) free(fb[i]); /* 7 fill tcache[1], 2 go to fastbin[1] (2.43+: all 9 in tcache[1]) */
   printf("{\"keep\":[\"%p\",\"%p\",\"%p\",\"%p\",\"%p\"],\"tc\":[\"%p\",\"%p\",\"%p\"],\"fb\":[\"%p\",\"%p\",\"%p\",\"%p\",\"%p\",\"%p\",\"%p\",\"%p\",\"%p\"],\"big\":\"%p\",\"guard\":\"%p\",\"mm\":\"%p\",\"thr\":[\"%p\",\"%p\",\"%p\",\"%p\"]}\n",
     keep[0], keep[1], keep[2], keep[3], keep[4], tc[0], tc[1], tc[2], fb[0], fb[1], fb[2], fb[3], fb[4], fb[5], fb[6], fb[7], fb[8], big, guard, mm, thr[0], thr[1], thr[2], thr[3]);
   getchar(); /* until the test closes stdin */
@@ -164,13 +164,20 @@ describe.runIf(hasCc)("glibc heap explorer against a live process", () => {
   });
 
   it("puts freed chunks in their tcache, fastbin and unsorted bins", () => {
+    // tcache_count is 7 up to 2.42 and 16 from 2.43, which also has no fastbins: there all 9 of
+    // the 0x30 chunks fit in tcache[1]; before, 7 do and the last 2 go to fastbin[1]
+    const minor = Number(/^2\.(\d+)$/.exec(report.version ?? "")?.[1] ?? 0);
+    const fill = Math.min(minor >= 43 ? 16 : 7, addrs.fb.length);
     for (const u of addrs.tc) expect(chunkOf(u)?.bin).toBe("tcache[2]");
-    for (const u of addrs.fb.slice(0, 7)) expect(chunkOf(u)?.bin).toBe("tcache[1]");
-    for (const u of addrs.fb.slice(7)) expect(chunkOf(u)?.bin).toBe("fastbin[1]");
+    for (const u of addrs.fb.slice(0, fill)) expect(chunkOf(u)?.bin).toBe("tcache[1]");
+    for (const u of addrs.fb.slice(fill)) expect(chunkOf(u)?.bin).toBe("fastbin[1]");
+    expect(report.bins.some((b) => b.kind === "fastbin")).toBe(minor < 43);
     expect(chunkOf(addrs.big)?.state).toBe("unsorted");
     expect(chunkOf(addrs.guard)?.state).toBe("in-use");
     const t1 = report.bins.find((b) => b.kind === "tcache" && b.index === 1 && b.heap === chunkOf(addrs.fb[0])?.heap);
-    expect(t1?.count).toBe(7);
+    // up to 2.42 the bin is full at 7; from 2.43 nothing caps it, so allow chunks libc freed itself
+    if (minor >= 43) expect(t1?.count).toBeGreaterThanOrEqual(fill);
+    else expect(t1?.count).toBe(fill);
     expect(t1?.error).toBeUndefined();
   });
 

@@ -7,12 +7,17 @@
 //      bin of an arena points at itself (fd == bk == &bins[2*(i-1)] - 0x10). Each such pair votes
 //      for the arena bases it can belong to; the winner must also close its `next` ring (the main
 //      arena's `next` is itself, or a chain of thread arenas that leads back to it).
-// Struct layouts are those of malloc/malloc.c and malloc/arena.c (glibc 2.26 to 2.40):
-//   - malloc_state gained `have_fastchunks` in 2.27 (fastbinsY moves from +0x08 to +0x10);
+// Struct layouts are those of malloc/malloc.c and malloc/arena.c (glibc 2.26 to 2.44):
+//   - malloc_state gained `have_fastchunks` in 2.27 (fastbinsY moves from +0x08 to +0x10), and
+//     2.43 removed the fastbins altogether (have_fastchunks and fastbinsY gone: top at +0x08);
 //   - heap_info gained `pagesize` in 2.35 (0x20 → 0x30 bytes); we measure it from the first heap;
-//   - tcache counts are u8 up to 2.29 (struct 0x240 bytes) and u16 from 2.30 (0x280 bytes);
+//   - tcache counts are u8 up to 2.29 (struct 0x240 bytes) and u16 from 2.30 (0x280 bytes); 2.42
+//     turned them into u16 `num_slots` (free slots left: count = tcache_count - num_slots) and
+//     added 12 large bins (76 in all, struct 0x2f8 bytes in a 0x300 chunk) whose bin i >= 64 holds
+//     chunk sizes [2^(i-54), 2^(i-53)) sorted ascending; the default fill is 7, 16 from 2.43;
 //   - fastbin and tcache `next` pointers are safe-linked from 2.32 ((pos >> 12) ^ ptr); when the
 //     version is unknown each pointer is decoded whichever way lands inside a heap.
+// When the version is unknown (or its layout finds nothing) every layout is tried.
 // Per-thread tcaches are found as the tcache_perthread_struct chunk (the first allocation an
 // arena hands a thread, validated by its counts/entries); which thread owns one is not knowable
 // without the thread's TLS, so they are labelled by arena and address.
@@ -40,19 +45,22 @@ export type GlibcEnv = {
 };
 
 export type ArenaLayout = {
-  name: string; fastbins: number; top: number; lastRemainder: number; bins: number;
+  /** field offsets and sizeof; `fastbins` (fastbinsY) is null when the arena has none (2.43+) */
+  name: string; fastbins: number | null; top: number; lastRemainder: number; bins: number;
   next: number; nextFree: number; attached: number; systemMem: number; maxSystemMem: number; size: number;
 };
 
-/** struct malloc_state, x86-64. */
-export const kArenaLayouts: Record<"2.27+" | "2.26", ArenaLayout> = {
+/** struct malloc_state, x86-64 ("2.27+" covers 2.27 to 2.42). */
+export const kArenaLayouts: Record<"2.43+" | "2.27+" | "2.26", ArenaLayout> = {
+  "2.43+": { name: "2.43+", fastbins: null, top: 0x08, lastRemainder: 0x10, bins: 0x18, next: 0x818, nextFree: 0x820, attached: 0x828, systemMem: 0x830, maxSystemMem: 0x838, size: 0x840 },
   "2.27+": { name: "2.27+", fastbins: 0x10, top: 0x60, lastRemainder: 0x68, bins: 0x70, next: 0x870, nextFree: 0x878, attached: 0x880, systemMem: 0x888, maxSystemMem: 0x890, size: 0x898 },
   "2.26": { name: "2.26", fastbins: 0x08, top: 0x58, lastRemainder: 0x60, bins: 0x68, next: 0x868, nextFree: 0x870, attached: 0x878, systemMem: 0x880, maxSystemMem: 0x888, size: 0x890 },
 };
 
 const NFASTBINS = 10;
 const NBINS = 128;
-const TCACHE_BINS = 64;
+/** tcache bins before 2.42 (all "small": one exact chunk size each) */
+const TCACHE_SMALL_BINS = 64;
 /** HEAP_MAX_SIZE on x86-64: 2 * DEFAULT_MMAP_THRESHOLD_MAX (32 MiB) */
 export const HEAP_MAX = 0x4000000n;
 const kListCap = 100_000;
@@ -71,6 +79,19 @@ export function glibcVersion(img: Uint8Array): GlibcVersion | null {
 }
 
 export const atLeast = (v: GlibcVersion | null | undefined, minor: number): boolean | undefined => (v ? v.major > 2 || (v.major === 2 && v.minor >= minor) : undefined);
+
+/** The malloc_state layout a glibc version uses. */
+export function arenaLayoutFor(v: GlibcVersion): ArenaLayout {
+  return atLeast(v, 43) ? kArenaLayouts["2.43+"] : atLeast(v, 27) ? kArenaLayouts["2.27+"] : kArenaLayouts["2.26"];
+}
+
+/** Layouts to try, most likely first: the version's, then the others (all, newest first, when unknown). */
+export function arenaLayoutOrder(v?: GlibcVersion | null): ArenaLayout[] {
+  const all = [kArenaLayouts["2.43+"], kArenaLayouts["2.27+"], kArenaLayouts["2.26"]];
+  if (!v) return all;
+  const want = arenaLayoutFor(v);
+  return [want, ...all.filter((L) => L !== want)];
+}
 
 /** Bin index → smallest chunk size it holds (x86-64 smallbin_index / largebin_index_64). */
 export function binChunkSize(b: number): number {
@@ -104,7 +125,7 @@ export type ArenaGuess = { address: bigint; layout: ArenaLayout; votes: number }
  * best candidate whose `next` ring closes, or null (malloc not initialised, or not glibc).
  */
 export async function findMainArena(mem: HeapMem, ranges: Region[], version?: GlibcVersion | null): Promise<ArenaGuess | null> {
-  const layouts = version ? [atLeast(version, 27) ? kArenaLayouts["2.27+"] : kArenaLayouts["2.26"]] : [kArenaLayouts["2.27+"], kArenaLayouts["2.26"]];
+  const layouts = arenaLayoutOrder(version);
   const votes = new Map<string, number>(); // `${layout}:${base}`
   for (const r of ranges) {
     const end = r.base + BigInt(r.size);
@@ -125,12 +146,14 @@ export async function findMainArena(mem: HeapMem, ranges: Region[], version?: Gl
       }
     }
   }
-  const ranked = [...votes].filter(([, n]) => n >= 16).sort((x, y) => y[1] - x[1]).slice(0, 16);
-  for (const [key, n] of ranked) {
-    const [name, b] = key.split(":");
-    const layout = name === "2.26" ? kArenaLayouts["2.26"] : kArenaLayouts["2.27+"];
-    const base = BigInt(b);
-    if (await ringCloses(mem, base, layout)) return { address: base, layout, votes: n };
+  // the best candidates of each layout, in the layouts' order (the version's own layout first)
+  const ranked = [...votes].filter(([, n]) => n >= 16).sort((x, y) => y[1] - x[1]);
+  for (const layout of layouts) {
+    const mine = ranked.filter(([key]) => key.startsWith(`${layout.name}:`)).slice(0, 16);
+    for (const [key, n] of mine) {
+      const base = BigInt(key.slice(layout.name.length + 1));
+      if (await ringCloses(mem, base, layout)) return { address: base, layout, votes: n };
+    }
   }
   return null;
 }
@@ -149,8 +172,7 @@ async function ringCloses(mem: HeapMem, base: bigint, L: ArenaLayout): Promise<b
 
 /** Layout of a known main_arena address: the one whose ring closes (prefers the version's). */
 export async function layoutAt(mem: HeapMem, base: bigint, version?: GlibcVersion | null): Promise<ArenaLayout | null> {
-  const order = atLeast(version, 27) === false ? [kArenaLayouts["2.26"], kArenaLayouts["2.27+"]] : [kArenaLayouts["2.27+"], kArenaLayouts["2.26"]];
-  for (const L of order) if (await ringCloses(mem, base, L)) return L;
+  for (const L of arenaLayoutOrder(version)) if (await ringCloses(mem, base, L)) return L;
   return null;
 }
 
@@ -166,6 +188,7 @@ export type Arena = {
   attached: bigint;
   systemMem: bigint;
   maxSystemMem: bigint;
+  /** fastbinsY (empty when the layout has none) */
   fastbins: bigint[];
   /** fd, bk of bins 1..127 */
   bins: [bigint, bigint][];
@@ -175,11 +198,12 @@ export async function readArena(mem: HeapMem, address: bigint, layout: ArenaLayo
   const b = await mem.bytes(address, layout.size);
   if (!b) return null;
   const q = (o: number) => u64At(b, o);
+  const fb = layout.fastbins;
   return {
     address, layout, main,
     top: q(layout.top), lastRemainder: q(layout.lastRemainder), next: q(layout.next), attached: q(layout.attached),
     systemMem: q(layout.systemMem), maxSystemMem: q(layout.maxSystemMem),
-    fastbins: Array.from({ length: NFASTBINS }, (_, i) => q(layout.fastbins + 8 * i)),
+    fastbins: fb === null ? [] : Array.from({ length: NFASTBINS }, (_, i) => q(fb + 8 * i)),
     bins: Array.from({ length: NBINS - 1 }, (_, i) => [q(layout.bins + 16 * i), q(layout.bins + 16 * i + 8)] as [bigint, bigint]),
   };
 }
@@ -286,7 +310,7 @@ export function revealPtr(pos: bigint, v: bigint, mode: LinkMode, valid: (a: big
 export async function fastbins(mem: HeapMem, a: Arena, heap: string, mode: LinkMode, inHeap: (x: bigint) => boolean): Promise<BinList[]> {
   const out: BinList[] = [];
   const valid = (x: bigint) => (x & 15n) === 0n && inHeap(x);
-  for (let i = 0; i < NFASTBINS; i++) {
+  for (let i = 0; i < a.fastbins.length; i++) {
     const want = BigInt((i + 2) * 16);
     const list: BinList = { heap, kind: "fastbin", index: i, chunkSize: Number(want), entries: [] };
     const seen = new Set<bigint>();
@@ -334,27 +358,67 @@ export async function arenaBins(mem: HeapMem, a: Arena, heap: string): Promise<B
   return out;
 }
 
-/** tcache_perthread_struct layout by chunk size: 0x290 (u16 counts, 2.30+) or 0x250 (u8 counts). */
-export function tcacheLayout(chunkSize: number): { counts: 1 | 2; entries: number } | null {
-  if (chunkSize === 0x290) return { counts: 2, entries: 0x80 };
-  if (chunkSize === 0x250) return { counts: 1, entries: 0x40 };
+export type TcacheLayout = {
+  /** bins in the struct: 64, or 76 from 2.42 (64 small + 12 large) */
+  bins: number;
+  /** bytes per count */
+  counts: 1 | 2;
+  /** offset of entries[] */
+  entries: number;
+  /** counts are num_slots (free slots left, 2.42+) rather than the number of entries */
+  slots: boolean;
+};
+
+/**
+ * tcache_perthread_struct layout by chunk size: 0x300 (2.42+: u16 num_slots[76], entries[76]),
+ * 0x290 (2.30 to 2.41: u16 counts[64]) or 0x250 (2.26 to 2.29: u8 counts[64]).
+ */
+export function tcacheLayout(chunkSize: number): TcacheLayout | null {
+  if (chunkSize === 0x300) return { bins: TCACHE_SMALL_BINS + 12, counts: 2, entries: 0x98, slots: true };
+  if (chunkSize === 0x290) return { bins: TCACHE_SMALL_BINS, counts: 2, entries: 0x80, slots: false };
+  if (chunkSize === 0x250) return { bins: TCACHE_SMALL_BINS, counts: 1, entries: 0x40, slots: false };
   return null;
 }
 
 /**
- * Reads and validates a tcache_perthread_struct at the chunk `c` (counts[i] == 0 exactly when
- * entries[i] == NULL, entries inside a heap). An all-empty struct is accepted only when `first`.
+ * Chunk sizes tcache bin `i` holds, [lo, hi): one size for the 64 small bins (0x20 + 16 i), a
+ * power-of-two range for the large bins of 2.42+ (large_csize2tidx: bin 64 is [0x400, 0x800), the
+ * last one [2 MiB, 4 MiB)).
  */
-export async function readTcache(mem: HeapMem, c: HeapChunk, heap: string, mode: LinkMode, inHeap: (x: bigint) => boolean, first: boolean): Promise<BinList[] | null> {
+export function tcacheBinSizes(i: number): { lo: number; hi: number } {
+  if (i < TCACHE_SMALL_BINS) return { lo: 0x20 + 16 * i, hi: 0x30 + 16 * i };
+  const lo = 2 ** (i - TCACHE_SMALL_BINS + 10);
+  return { lo, hi: 2 * lo };
+}
+
+/** Default tcache_count (glibc.malloc.tcache_count): 7, 16 from 2.43. */
+export const tcacheFill = (v?: GlibcVersion | null): number => (atLeast(v, 43) ? 16 : 7);
+
+/**
+ * Reads and validates a tcache_perthread_struct at the chunk `c` (a bin is empty exactly when its
+ * entries[i] is NULL, entries inside a heap). Before 2.42 an empty bin has counts[i] == 0; from
+ * 2.42 num_slots[i] starts at tcache_count and goes down per entry, so every empty bin shares one
+ * value (the fill, taken from them, `fill` when no bin is empty) and the others are below it. An
+ * all-empty struct is accepted only when `first`.
+ */
+export async function readTcache(mem: HeapMem, c: HeapChunk, heap: string, mode: LinkMode, inHeap: (x: bigint) => boolean, first: boolean, fill = 7): Promise<BinList[] | null> {
   const L = tcacheLayout(c.size);
   if (!L) return null;
-  const b = await mem.bytes(c.user, L.entries + 8 * TCACHE_BINS);
+  const b = await mem.bytes(c.user, L.entries + 8 * L.bins);
   if (!b) return null;
-  const dv = new DataView(b.buffer);
-  const counts = Array.from({ length: TCACHE_BINS }, (_, i) => (L.counts === 2 ? dv.getUint16(2 * i, true) : b[i]));
-  const heads = Array.from({ length: TCACHE_BINS }, (_, i) => dv.getBigUint64(L.entries + 8 * i, true));
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const raw = Array.from({ length: L.bins }, (_, i) => (L.counts === 2 ? dv.getUint16(2 * i, true) : b[i]));
+  const heads = Array.from({ length: L.bins }, (_, i) => dv.getBigUint64(L.entries + 8 * i, true));
+  let counts = raw;
+  if (L.slots) {
+    const empty = new Set(raw.filter((_, i) => heads[i] === 0n));
+    if (empty.size > 1) return null;
+    const n = empty.size ? [...empty][0] : fill;
+    if (raw.some((v, i) => heads[i] !== 0n && v >= n)) return null;
+    counts = raw.map((v) => n - v);
+  }
   let used = 0;
-  for (let i = 0; i < TCACHE_BINS; i++) {
+  for (let i = 0; i < L.bins; i++) {
     if ((counts[i] === 0) !== (heads[i] === 0n)) return null;
     if (heads[i] && ((heads[i] & 15n) !== 0n || !inHeap(heads[i] - 16n))) return null;
     if (counts[i]) used++;
@@ -362,19 +426,22 @@ export async function readTcache(mem: HeapMem, c: HeapChunk, heap: string, mode:
   if (!used && !first) return null;
   const valid = (x: bigint) => (x & 15n) === 0n && inHeap(x - 16n);
   const out: BinList[] = [];
-  for (let i = 0; i < TCACHE_BINS; i++) {
+  for (let i = 0; i < L.bins; i++) {
     if (!heads[i]) continue;
-    const want = BigInt(0x20 + 16 * i);
-    const list: BinList = { heap, kind: "tcache", index: i, chunkSize: Number(want), entries: [], count: counts[i], owner: c.address };
+    const { lo, hi } = tcacheBinSizes(i);
+    const list: BinList = { heap, kind: "tcache", index: i, chunkSize: lo, entries: [], count: counts[i], owner: c.address };
     const seen = new Set<bigint>();
-    let e = heads[i];
+    let e = heads[i], last = 0n;
     while (e) {
       if (list.entries.length >= Math.min(kListCap, counts[i] + 64)) { list.error = "longer than its count"; break; }
       if (seen.has(e)) { list.error = `loop at ${hex(e)}`; break; }
       if (!valid(e)) { list.error = `bad pointer ${hex(e)}`; break; }
       const hdr = await mem.bytes(e - 16n, 0x18);
       if (!hdr) { list.error = `${hex(e)} not readable`; break; }
-      if ((u64At(hdr, 8) & ~7n) !== want) { list.error = `${hex(e - 16n)} has size ${hex(u64At(hdr, 8) & ~7n)}, bin holds ${hex(want)}`; break; }
+      const size = u64At(hdr, 8) & ~7n;
+      if (size < BigInt(lo) || size >= BigInt(hi)) { list.error = `${hex(e - 16n)} has size ${hex(size)}, bin holds ${hi - lo === 16 ? hex(lo) : `${hex(lo)}..${hex(hi - 16)}`}`; break; }
+      if (size < last) { list.error = `${hex(e - 16n)} (size ${hex(size)}) is out of order: large tcache bins are sorted by size`; break; }
+      last = size;
       seen.add(e);
       list.entries.push(e - 16n);
       e = revealPtr(e, u64At(hdr, 16), mode, valid);
@@ -444,9 +511,11 @@ export async function exploreGlibc(env: GlibcEnv): Promise<HeapReport> {
     report.source = `main_arena ${hex(mainAddr)} by signature in ${env.libc.name} (empty-bin self-pointers, ${g.votes} votes, malloc_state ${g.layout.name} layout)`;
   }
   if (!layout) return report;
+  if (version && layout !== arenaLayoutFor(version)) notes.push(`glibc ${version.major}.${version.minor} normally uses the ${arenaLayoutFor(version).name} malloc_state layout; this arena matched the ${layout.name} layout`);
 
   const mode: LinkMode = atLeast(version, 32) === undefined ? "auto" : atLeast(version, 32) ? "safe" : "plain";
-  const tcacheSizes = atLeast(version, 30) === undefined ? [0x290, 0x250] : atLeast(version, 30) ? [0x290] : atLeast(version, 26) ? [0x250] : [];
+  const tcacheSizes = !version ? [0x300, 0x290, 0x250] : atLeast(version, 42) ? [0x300] : atLeast(version, 30) ? [0x290] : atLeast(version, 26) ? [0x250] : [];
+  const fill = tcacheFill(version);
 
   // arenas: main_arena, then its next ring
   const arenas: Arena[] = [];
@@ -495,7 +564,7 @@ export async function exploreGlibc(env: GlibcEnv): Promise<HeapReport> {
     const firsts = new Set(rs.map((r) => r.start));
     for (const c of mine) {
       if (c.state !== "in-use" || !tcacheSizes.includes(c.size)) continue;
-      const t = await readTcache(mem, c, id, mode, inHeap, firsts.has(c.address));
+      const t = await readTcache(mem, c, id, mode, inHeap, firsts.has(c.address), fill);
       if (t) {
         c.state = "internal";
         c.bin = "tcache_perthread_struct";
