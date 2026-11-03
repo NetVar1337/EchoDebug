@@ -84,6 +84,7 @@ describe.runIf(hasCc)("glibc heap explorer against a live process", () => {
   let child: ChildProcess | null = null;
   let addrs: Addrs;
   let report: HeapReport;
+  let mmDiag = "";
   const A = (s: string) => BigInt(s);
 
   beforeAll(async () => {
@@ -110,6 +111,13 @@ describe.runIf(hasCc)("glibc heap explorer against a live process", () => {
         }
       };
       const ml = maps(pid).filter((m) => m.readable);
+      {
+        // what the mmapped allocation looks like on this system, for the assertion message
+        const mm = A(addrs.mm);
+        const line = maps(pid).find((m) => mm >= m.start && mm < m.end);
+        const hdr = await read(mm - 16n, 16);
+        mmDiag = JSON.stringify({ mm: addrs.mm, map: line && { start: line.start.toString(16), end: line.end.toString(16), path: line.path, writable: line.writable }, header: hdr && [...hdr].map((b) => b.toString(16).padStart(2, "0")).join("") });
+      }
       const libcLines = ml.filter((m) => /\/libc[.-][^/]*$/.test(m.path));
       const libc = { name: "libc.so.6", base: libcLines[0].start, size: Number(libcLines[libcLines.length - 1].end - libcLines[0].start) };
       const mem = new HeapMem(read);
@@ -183,7 +191,7 @@ describe.runIf(hasCc)("glibc heap explorer against a live process", () => {
 
   it("finds the mmapped chunk", () => {
     const c = chunkOf(addrs.mm);
-    expect(c?.state).toBe("mmapped");
+    expect(c?.state, `${mmDiag} · mmapped chunks found: ${JSON.stringify(report.chunks.filter((x) => x.state === "mmapped").map((x) => x.address.toString(16)))} · heaps: ${JSON.stringify(report.heaps.map((h) => h.label))}`).toBe("mmapped");
     expect(c!.size).toBeGreaterThanOrEqual(0x40000);
   });
 
