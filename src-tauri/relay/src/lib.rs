@@ -409,11 +409,7 @@ impl Relay {
         } else {
             Value::Object(req)
         };
-        let sent = up_tx.send(frame.to_string());
-        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
-        if sent.is_err() {
-            return error(orig, 2004, "upstream disconnected");
-        }
+        // register the reply slot before sending: a fast upstream can answer before the insert
         self.lock().pending.insert(
             id,
             Pending {
@@ -423,6 +419,12 @@ impl Relay {
                 reply: tx,
             },
         );
+        let sent = up_tx.send(frame.to_string());
+        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
+        if sent.is_err() {
+            self.lock().pending.remove(&id);
+            return error(orig, 2004, "upstream disconnected");
+        }
 
         match tokio::time::timeout(self.0.timeout, &mut rx).await {
             Ok(Ok(reply)) => reply,
