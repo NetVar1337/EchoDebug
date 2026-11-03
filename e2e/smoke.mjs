@@ -274,6 +274,51 @@ await step("heap explorer walks the target's malloc arena (view and MCP tools)",
   expect(page1.total >= 1 && page1.chunks.length >= 1, `heap_chunks: ${JSON.stringify(page1).slice(0, 400)}`);
 });
 
+await step("MCP panel: test call, live clients, tool profiles, tester and a stdio client", async () => {
+  const modern = (id, method, params = {}) => ({
+    headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": method, ...(params.name ? { "mcp-name": params.name } : {}) },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params: { ...params, _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": { name: "e2e-client", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } }),
+  });
+  const rpc = async (id, method, params) => (await (await fetch(`http://127.0.0.1:${PORT}/mcp`, { method: "POST", ...modern(id, method, params) })).json());
+  const listed = async () => (await rpc(1, "tools/list")).result.tools.map((t) => t.name);
+  await page.locator(".rail-button[aria-label='MCP Server']").click();
+  // the first-run card's test call goes over the real HTTP endpoint with the token
+  await page.locator("button", { hasText: "Run a test call" }).click();
+  await until(async () => (await page.locator(".mcp-ok", { hasText: "MCP works" }).count()) > 0);
+  // an outside 2026-07-28 client appears in the connection list with its clientInfo
+  expect((await rpc(2, "server/discover")).result.supportedVersions[0] === "2026-07-28", "server/discover");
+  await until(async () => (await page.locator(".mcp-session", { hasText: "e2e-client" }).count()) > 0);
+  // the app window serves its tools: listed; a profile hides what it denies
+  expect((await listed()).includes("list_names"), "ui_* tools listed while the window is open");
+  await page.locator(".mcp-preset", { hasText: "Read-only analysis" }).click();
+  await until(async () => !(await listed()).includes("write_memory"));
+  expect((await listed()).includes("read_memory"), "read-only keeps reads");
+  await page.locator(".mcp-preset", { hasText: "Full control" }).click();
+  await until(async () => (await listed()).includes("write_memory"));
+  // the tester runs a tool through the MCP path and shows what a client gets
+  await page.locator(".panel-section input[placeholder='Filter…']").fill("list_modules");
+  await page.locator(".mcp-tool", { hasText: "list_modules" }).click();
+  await page.locator(".mcp-call button", { hasText: "Call tool" }).click();
+  await until(async () => (await page.locator(".mcp-call .mcp-result", { hasText: "e2e-target" }).count()) > 0);
+  // without the desktop app, client setup offers snippets
+  await page.locator(".mcp-snippets summary").click();
+  await until(async () => (await page.locator(".mcp-snippet pre", { hasText: "mcpServers" }).count()) > 0);
+  // a stdio client: echodebug-relay --stdio bridges to this relay
+  const child = spawn(relayBin, ["--stdio", String(PORT)], { env: { ...process.env, ECHODEBUG_TOKEN: TOKEN, XDG_CONFIG_HOME: work }, stdio: ["pipe", "pipe", "ignore"] });
+  procs.push(child);
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "e2e-stdio", version: "1" } } }) + "\n");
+  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "status", arguments: {} } }) + "\n");
+  await until(async () => out.split("\n").some((l) => l.includes('"id":2') && l.includes("structuredContent")));
+  await until(async () => (await page.locator(".mcp-session", { hasText: "e2e-stdio" }).count()) > 0);
+  // disconnect it from the panel
+  await page.locator(".mcp-session", { hasText: "e2e-stdio" }).locator("[data-tip^='Disconnect']").click();
+  await until(async () => (await page.locator(".mcp-session", { hasText: "e2e-stdio" }).count()) === 0);
+  child.kill("SIGKILL");
+  await page.locator(".rail-button[aria-label=Targets]").click();
+});
+
 await step("script console runs against the ed API", async () => {
   await tab("Script");
   await page.locator("textarea").first().fill('const m = ed.module(); ed.names.set(ed.addr(m.name + "+' + sym("classify") + '"), "classify_e2e"); return m.name;');

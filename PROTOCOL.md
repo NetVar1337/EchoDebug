@@ -23,7 +23,8 @@ are lowercase hex strings without a prefix (`"4883ec28"`). Sizes and counts are 
 | `/ext` | `echo_debug.as` via `ws::connect` | Relay sends ext requests and receives replies + id-less events. One at a time; a new one replaces the old. |
 | `/client` | UI, scripts, anything | Sends requests `{ "type", "id", ... }`, receives replies with the same `id`, plus broadcast events. Many clients. |
 | `/sync` | IDA / Ghidra / Binary Ninja plugins (`integrations/`) | Disassembler sync, token-protected like `/client`. See [Disassembler sync](#disassembler-sync-sync). Many peers. |
-| `POST /mcp` | MCP clients | Streamable HTTP, JSON responses only (no SSE). Tools are defined in `src/lib/tools.json`. |
+| `/mcp` | MCP clients | Streamable HTTP: `POST` (JSON or SSE answers), `GET` (a legacy session's event stream), `DELETE` (ends a legacy session). Token-protected. See [MCP surface](#mcp-surface). Tools are defined in `src/lib/tools.json`. |
+| `GET /mcp/health` | MCP clients that probe | `{ok, server, version, endpoint, protocolVersions, latest, transports, auth, authorized, appWindow, backend, tools}`; no token needed, `authorized` says whether a presented one is right (null when none) |
 | `GET /health` | anyone | `200 {"ok":true,"version":"x.y.z"}` |
 
 ## Routing
@@ -41,9 +42,10 @@ A `/client` request is routed by its `type`:
      (local process list of the machine running the app, sorted by name)
 3. **Everything else** → `/ext`.
 
-Two more local verbs feed the app's MCP panel: `mcp_log` → `{ "type":"mcp_log_result", ..., "entries":[...] }`
-(ring buffer of the last 200 `tools/call` requests the relay saw) and `mcp_meta` → serverInfo,
-capabilities, prompt and resource catalogs.
+More local verbs feed the app's MCP panel: `mcp_log` → `{ "type":"mcp_log_result", ..., "entries":[...] }`
+(ring buffer of the last 200 `tools/call` requests the relay saw), `mcp_meta` → serverInfo, protocol
+versions, prompt and resource catalogs, tool counts, `mcp_sessions` → the connected MCP clients,
+`mcp_disconnect {session}` and `mcp_test_call {name, arguments}` (see [MCP surface](#mcp-surface)).
 
 The relay replaces the client's `id` with a relay-unique integer before forwarding and restores the
 original `id` (any JSON value; default `0`) on the reply. If the needed upstream is not connected the relay
@@ -431,10 +433,15 @@ allocations). Everything is read through the `read` verb, so the Windows heaps w
 `/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
 WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
 (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere; created with mode 0600);
-`ECHODEBUG_TOKEN` overrides it and `ECHODEBUG_AUTH=0` disables the check. `/agent`, `/ext` and `/health`
-stay open (Echo cannot send headers; those endpoints only receive requests). The desktop app can
-regenerate the stored token (Settings or the MCP Server panel); the running relay switches to it at once
-(`Relay::set_token`), already-open sockets stay connected, and MCP clients must be re-added.
+`ECHODEBUG_TOKEN` overrides it and `ECHODEBUG_AUTH=0` disables the check. `/agent`, `/ext`, `/health`
+and `/mcp/health` stay open (Echo cannot send headers; those endpoints only receive requests or report
+status). MCP over stdio needs no token from the client: the stdio process reads it from the config
+directory itself. The desktop app can regenerate the stored token (Settings or the MCP Server panel);
+the running relay switches to it at once (`Relay::set_token`), already-open sockets stay connected, and
+HTTP MCP clients must be updated (MCP Server panel → Connect a client → Update).
+
+On start the desktop app deletes the API key the removed in-app assistant may have stored in that
+directory (`anthropic-key.dpapi` on Windows, `anthropic-key` elsewhere).
 
 ## Disassembler sync (`/sync`)
 
@@ -472,48 +479,167 @@ differs from the app version and (re)installs the bundled agent into `%APPDATA%\
 
 ## MCP surface
 
-`POST /mcp` speaks JSON-RPC 2.0 (single messages and batches; notifications get `202 Accepted`).
-Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (with `subscribe`),
-`completions` and `logging` capabilities plus `instructions`), `ping`, `tools/list`, `tools/call`,
-`prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`,
-`resources/subscribe`/`unsubscribe`, `completion/complete`, `logging/setLevel`.
+The relay is an MCP server on two transports: **Streamable HTTP** at `/mcp` (token-protected, see
+[authentication](#provider-verbs-ui_-and-authentication)) and **stdio** (`echodebug-relay --stdio [port]`,
+or `EchoDebug --mcp-stdio [port]` from the app executable). Code: `relay/src/mcp_server.rs` (protocol),
+`mcp.rs` (annotations, policy, templates, completion), `mcp_bridge.rs` (stdio bridge),
+`mcp_clients.rs` (the panel's client config writer).
+
+### Protocol versions
+
+| Version | Era | Notes |
+|---|---|---|
+| `2026-07-28` (latest) | stateless | every request carries `params._meta` with `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities` (required) and `…/clientInfo`, `…/logLevel` (optional) |
+| `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` | initialize-based | `initialize` negotiates: the requested version when it is one of these, else `2025-11-25` |
+
+A request with a `_meta` protocolVersion follows the 2026-07-28 rules; an unsupported version gets
+`-32022 Unsupported protocol version` with `data: {supported: [newest first], requested}` (HTTP 400).
+`server/discover` answers `{supportedVersions, capabilities, instructions, _meta: {serverInfo}, ttlMs,
+cacheScope}`, with or without `_meta` (the dual-era probe). Requests with neither `_meta` nor a session
+use the `MCP-Protocol-Version` header's version, else `2025-11-25` result shapes (they only add fields
+older clients ignore).
+
+Per version: `title` on tools, prompts and resources, `outputSchema`, `structuredContent`,
+`resource_link` results and elicitation exist from 2025-06-18; the elicitation `mode` field from
+2025-11-25. 2026-07-28 results carry `resultType` (`complete` or `input_required`) and
+`_meta["io.modelcontextprotocol/serverInfo"]`; list results and `resources/read` add `ttlMs` and
+`cacheScope`. Resource-not-found is `-32002` before 2026-07-28 and `-32602` (with `data.uri`) after.
+
+### HTTP
+
+| Request | Answer |
+|---|---|
+| `POST`, 2026-07-28 request | headers `MCP-Protocol-Version` (= the `_meta` version), `Mcp-Method` (= method) and, on `tools/call`, `prompts/get`, `resources/read`, `Mcp-Name` (= `params.name` / `params.uri`; `=?base64?…?=` allowed) are required: missing or different → 400 `-32020` HeaderMismatch. Missing clientCapabilities → 400 `-32602`. Unknown method (the initialize-era `initialize`, `logging/setLevel`, `resources/subscribe` too) → 404 `-32601` |
+| `POST initialize` | the result plus an `Mcp-Session-Id` header; the session's requests send it back (an ended or unknown session → 404: initialize again) |
+| `POST`, other legacy request | `MCP-Protocol-Version`, when sent, must be a supported version (else 400 `-32022`) |
+| `POST`, notification or client response | `202 Accepted` |
+| `POST`, batch (array) | legacy only: each request answered, 2026-07-28 messages refused (`-32600`) |
+| `GET` + `Accept: text/event-stream` | the event stream of the session named by `Mcp-Session-Id` (every event without one) |
+| `GET` without SSE accept | 405 with `Allow` and a pointer to `/mcp/health` |
+| `DELETE` + `Mcp-Session-Id` | ends the session (204; 404 when unknown) |
+| `OPTIONS` | CORS preflight for the origins the relay accepts (the app's web view, localhost dev servers); their responses carry `Access-Control-Allow-Origin` and expose `Mcp-Session-Id` |
+
+A request is answered as **SSE** (`text/event-stream`, `X-Accel-Buffering: no`) when the client accepts
+it and the request needs a stream: a `progressToken`, a 2026-07-28 `tools/call` with `logLevel`, a legacy
+`tools/call` that may need an elicitation, or `subscriptions/listen`; otherwise as one JSON object.
+JSON-RPC errors: `-32700` parse error (400), `-32600` invalid request (no `"jsonrpc":"2.0"`, a null or
+non-scalar id, an empty batch), `-32601`, `-32602` (bad params, unknown tool or prompt, a missing
+required prompt argument, an invalid cursor or requestState), `-32603` (a resource the backend could not
+read). HTTP refusals carry a JSON-RPC error without id: 401 (code `401`, a message that says whether the
+token is missing or wrong and where to copy it; `WWW-Authenticate: Bearer realm="EchoDebug"`) and 403
+(a foreign `Origin`).
+
+### Methods and features
+
+`ping`, `server/discover`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`,
+`resources/templates/list`, `resources/read`, `completion/complete`; legacy also `initialize`,
+`logging/setLevel`, `resources/subscribe` / `unsubscribe`; 2026-07-28 also `subscriptions/listen`.
+Capabilities: `tools {listChanged: true}`, `prompts {listChanged: false}`, `resources {subscribe: true,
+listChanged: false}`, `logging`, `completions`.
+
+**Pagination.** The four list methods take `cursor` and return `nextCursor` while more remain. A page
+holds 500 entries, so every list fits one page today and clients that ignore cursors still see
+everything; a cursor of another list or a malformed one is `-32602`.
+
+**Tool set.** `tools/list` lists what a client can use now: `ui_*` tools only while an app window is
+connected, the thread tools (`list_threads`, `thread_stack`, `list_handles`) not under the Echo backend,
+and nothing the call policy always refuses (the deny list, tools missing from a non-empty allow list,
+gated tools under `readonly`). When that set changes (window, backend, policy) the server sends
+`notifications/tools/list_changed`. `tools/call` still takes every tool name and explains a refusal.
 
 **Tools** carry `title`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
 `openWorldHint`, derived from the verb; `ui_load_symbols` is the one open-world tool: it may download from
 the symbol servers, while `ui_pdb_symbols`, `ui_pdb_types`, `ui_pdb_type` and `ui_pdb_lookup` only read local
-copies and `ui_import_pdb_type` changes the Structs catalog) and an object `outputSchema`; results add `structuredContent`
-(the reply object) next to the text block.
+copies and `ui_import_pdb_type` changes the Structs catalog) and an `outputSchema`: an object schema with
+the reply's fields (`status`, `list_processes`, `list_modules`, `read_memory`, `disassemble`,
+`dump_module` describe theirs) and none required, so error replies (`code`, `message`, `detail`) conform
+too. A result is the reply as pretty JSON text, `structuredContent` (the reply object), `isError`, and on
+success `resource_link` items: `read_memory` → `echodebug://memory/{address}/{size}`, `disassemble` →
+`echodebug://disasm/{address}`, `list_modules` → `echodebug://module/{name}/pe` (first 16 modules),
+`dump_module` → the dump's `file://` URI. A missing required argument is a tool error the model can fix.
+
+**Logging.** Legacy sessions set a level with `logging/setLevel` (`debug` … `emergency`; default
+`info`); their event stream carries `notifications/message` at or above it for agent and debugger events
+(`watch_event`, `patched`, `dbg_stop`, `module_loaded`, …; logger = event name). A 2026-07-28 request
+opts in with `_meta["io.modelcontextprotocol/logLevel"]`; its own SSE answer then carries the messages
+of that call (the relay's routing notes, backend events while it runs), never the listen stream.
+
+**Progress.** A request with `_meta.progressToken` answered as SSE gets `notifications/progress`
+(`progress` = `done`, `total`, `message` = the job) for each backend `progress` event while it runs,
+strictly increasing, then the result.
+
+**Cancellation.** `notifications/cancelled {requestId}` (a legacy HTTP session, the stdio bridge, stdio)
+and closing a request's SSE stream (2026-07-28) stop the call; a cancelled backend tool call also sends
+`cancel` to the backend so its scan, pointer scan or emulation stops. A cancelled plain-JSON request is
+answered `204`.
+
+**Change notifications.** Legacy: the session's `GET /mcp` stream (stdio: stdout after `initialize`)
+carries `notifications/tools/list_changed`, `notifications/resources/updated` for the URIs it subscribed
+(`echodebug://status` and `echodebug://target/modules` change on every status change and module event)
+and log messages; a `GET` without a session gets every update. 2026-07-28: `subscriptions/listen
+{notifications: {toolsListChanged, resourceSubscriptions}}` answers as a long-lived stream: first
+`notifications/subscriptions/acknowledged` with the filter the server honours (prompt and resource list
+changes never happen and are left out; only the two subscribable URIs are kept), then the matching
+notifications, each with `_meta["io.modelcontextprotocol/subscriptionId"]` = the request id.
+Disconnecting the client in the panel ends it with a `{resultType: "complete"}` result.
+
+**Sessions and clients.** The relay keeps a table of clients: each legacy session (id, transport
+`http` / `stdio` / `stdio (bridged)`, negotiated version, `clientInfo` and capabilities from
+`initialize`) and each 2026-07-28 client by its `clientInfo`. The `/client` verb `mcp_sessions` lists
+`{id, transport, era: session|stateless, protocolVersion, client, elicitation, created, last_seen, calls,
+last_call: {tool, ts, outcome}, streams, log_level}`; `mcp_disconnect {session}` ends one (its streams
+close, its in-flight calls stop, a legacy session id gets 404 afterwards). At most 64 are kept.
 
 **Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],
-"deny":[tool], "audit":bool }` (omitted fields keep their value; the reply echoes the policy and
-`audit_path`). Deny and allow lists apply to every tool. `ask` and `readonly` gate the calls that change
-the target (`write`, `freeze`, `ui_revert_patch`), `dump` and `trace_record` (its ptrace source runs the real thread): `readonly` refuses them, `ask` sends the app window a
-`ui_approve` provider call (`tool`, `verb`, `arguments` → `approved: bool`) and refuses when no window
-answers. Refusals are tool errors with code `4003`; the call log records `outcome: ok | error | denied`.
-With `audit` on, every call is appended to `<config>/EchoDebug/mcp-audit.jsonl`; `mcp_audit_export` returns
-the in-memory log as JSONL plus the audit file.
+"deny":[tool], "audit":bool, "elicit":bool }` (omitted fields keep their value; the reply echoes the
+policy and `audit_path`). The panel's tool profiles are policies: *Read-only analysis* = `readonly` with
+every tool that is not read-only denied except `attach`, `detach`, `cancel_job`; *Reverse engineering* =
+`ask`; *Full control* = `allow`. Deny and allow lists apply to every tool. `ask` and `readonly` gate the
+calls that change the target (`write`, `freeze`, `ui_revert_patch`), `dump` and `trace_record` (its
+ptrace source runs the real thread): `readonly` refuses them; `ask` asks the user:
+
+- when `elicit` is on (default) and the client declared form elicitation (2025-06-18 and later):
+  2026-07-28 → the call returns `{resultType: "input_required", inputRequests: {echodebug_approval:
+  {method: "elicitation/create", params: {mode: "form", message, requestedSchema: {allow: boolean}}}},
+  requestState}`; the client retries the same call with `inputResponses.echodebug_approval` and the
+  `requestState`, which is single-use, expires after 5 minutes and only matches the same tool and
+  arguments (else `-32602`). Earlier versions → an `elicitation/create` request on the call's SSE
+  stream (or stdout), answered by the client's response (POSTed, `202`); no answer within 100 s denies;
+- otherwise the app window gets a `ui_approve` provider call (`tool`, `verb`, `arguments` →
+  `approved: bool`); no window → refused.
+
+Refusals are tool errors with code `4003`; the call log records `outcome: ok | error | denied`, the
+client, session, transport and `approved_via`. With `audit` on, every call is appended to
+`<config>/EchoDebug/mcp-audit.jsonl`; `mcp_audit_export` returns the in-memory log as JSONL plus the
+audit file. `mcp_test_call {name, arguments}` runs one call exactly like a 2026-07-28 client without
+elicitation (policy and approval included, logged with transport `panel`) and returns `{result, ms}`.
 
 **Resource templates:** `echodebug://memory/{address}/{size}`, `echodebug://disasm/{address}`,
 `echodebug://module/{name}/pe|exports|strings`, `echodebug://names` (answered by the app window;
-`+` in a module-relative address may be sent as `%2B`).
+segments are percent-decoded, so `+` in a module-relative address may be sent as `%2B`).
 
 **Completion** (`completion/complete`): `module`/`name` arguments complete module names, address-like
 arguments complete named addresses (app window) and `module+0x`, `value_type` and `format` their enums.
 
-**stdio.** `echodebug-relay --stdio [port]` speaks newline-delimited JSON-RPC on stdin/stdout. If a relay
-already listens on the port it forwards to its `/mcp` with the token from the config directory; otherwise
-it becomes the relay on that port and also writes notifications to stdout.
+### stdio
 
-**Server-sent events.** `GET /mcp` with `Accept: text/event-stream` opens a notification stream:
-`notifications/resources/updated` for `echodebug://status` and `echodebug://target/modules` on every status
-change, and `notifications/message` (logger = event name) for agent and debugger events such as
-`watch_event`, `patched`, `dbg_stop`. A single `tools/call` sent with `Accept: text/event-stream` and
-`params._meta.progressToken` is answered as an event stream: `notifications/progress` for each agent
-`progress` event (scans, pointer scans), then the JSON-RPC result. Every tool in `src/lib/tools.json` maps one-to-one onto a verb
-above; the tool's `verb` becomes the request `type`, the tool's `input_schema` is passed through as
-the request body, and the reply is returned as pretty-printed JSON in a single text content block
-(`isError` is set when the relay replied with an error frame). Each `tools/call` is appended to a
-200-entry ring buffer, exposed as the `echodebug://mcp/log` resource and the local `mcp_log` verb.
+`echodebug-relay --stdio [port]` (and `EchoDebug --mcp-stdio [port]`) speaks newline-delimited JSON-RPC
+on stdin/stdout, both eras on one pipe. stdio is local, so the client's config holds no token:
+
+- **bridge**: a relay already listens on the port (the app, a headless relay). Each message is POSTed to
+  its `/mcp` with the token from `<config>/EchoDebug/relay-token` (or `ECHODEBUG_TOKEN`; re-read once on
+  a 401, then a clear error), the headers its version needs and `X-EchoDebug-Bridge` /
+  `X-EchoDebug-Transport: stdio`; JSON answers and every SSE event go to stdout; after a legacy
+  `initialize` the session's event stream is forwarded too, and stdin closing ends the session.
+- **embedded**: nothing listens, so the process becomes the relay on that port (Echo and the app
+  connect as usual) and serves stdio itself; the `ui_*` tools need an app window.
+
+### Catalog
+
+Every tool in `src/lib/tools.json` maps one-to-one onto a verb above; the tool's `verb` becomes the
+request `type` and its `input_schema` is passed through as the request body. Each `tools/call` is
+appended to a 200-entry ring buffer, exposed as the `echodebug://mcp/log` resource and the local
+`mcp_log` verb.
 
 Prompts (`prompts/get` returns ready-to-use user messages with arguments substituted):
 `explain_function` (address), `find_pattern` (pattern, module?), `find_string` (text, module?),
@@ -526,7 +652,7 @@ Prompts (`prompts/get` returns ready-to-use user messages with arguments substit
 exists in `src/lib/tools.json`.
 
 Resources: `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`,
-`echodebug://target/modules` (fails when no memory server is connected). Module monitor events also send
+`echodebug://target/modules` (`-32603` when no backend can list modules). Module monitor events also send
 `notifications/resources/updated` for `echodebug://target/modules`.
 
 The tool set covers the whole backend: process control (`status`, `list_processes`, `attach`,
