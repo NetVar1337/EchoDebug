@@ -14,6 +14,15 @@ const STATEFUL: &[&str] = &[
     "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
     "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
     "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment",
+    // the native debuggers (ptrace / Win32): execution control, the access finder, the API monitor
+    "dbg_attach", "dbg_detach", "dbg_break", "dbg_hwbreak", "dbg_continue", "dbg_step", "dbg_pause", "dbg_set_regs",
+    "dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear",
+];
+/// Stateful verbs the ask / read-only policies gate like `write`: they plant int3s in the target
+/// (`dbg_break`, `dbg_api_start`) or change how it executes (attaching a debugger, debug
+/// registers, registers, stepping).
+const GATED: &[&str] = &[
+    "dbg_attach", "dbg_break", "dbg_hwbreak", "dbg_set_regs", "dbg_step", "dbg_continue", "dbg_trace_start", "dbg_api_start",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.
@@ -25,7 +34,7 @@ pub fn annotations(verb: &str, title: &str) -> Value {
         "readOnlyHint": !destructive && !stateful,
         "destructiveHint": destructive,
         // the same write twice leaves the same bytes; attach/detach twice too
-        "idempotentHint": destructive || matches!(verb, "attach" | "detach" | "dbg_detach" | "watch" | "unwatch" | "ui_set_name" | "ui_set_comment"),
+        "idempotentHint": destructive || matches!(verb, "attach" | "detach" | "dbg_detach" | "dbg_trace_stop" | "dbg_api_stop" | "dbg_api_clear" | "watch" | "unwatch" | "ui_set_name" | "ui_set_comment"),
         "openWorldHint": verb == "ui_load_symbols",
     })
 }
@@ -35,9 +44,10 @@ pub fn is_read_only(verb: &str) -> bool {
 }
 
 /// What the ask / read-only policies gate: calls that change the target's memory, plus dumps
-/// (they write files). Attach, scans and the emulator change only EchoDebug's own state.
+/// (they write files), plus the debugger verbs that plant int3s or change execution (`GATED`).
+/// Attach, scans and the emulator change only EchoDebug's own state.
 pub fn is_gated(verb: &str) -> bool {
-    DESTRUCTIVE.contains(&verb) || verb == "dump"
+    DESTRUCTIVE.contains(&verb) || verb == "dump" || GATED.contains(&verb)
 }
 
 /// What MCP clients may call. Set by the app (Settings → MCP), kept in memory by the relay.
@@ -216,6 +226,31 @@ mod tests {
         assert_eq!((set["readOnlyHint"].as_bool(), set["destructiveHint"].as_bool(), set["idempotentHint"].as_bool()), (Some(false), Some(false), Some(true)));
         assert_eq!(annotations("ui_set_comment", "c")["readOnlyHint"], false);
         assert_eq!(annotations("ui_revert_patch", "r")["destructiveHint"], true);
+        // the debugger: reading results is read-only, starting / stopping monitors is stateful
+        for v in ["dbg_trace_results", "dbg_api_log", "dbg_api_signatures", "dbg_status", "dbg_regs", "dbg_disasm"] {
+            assert_eq!(annotations(v, "x")["readOnlyHint"], true, "{v}");
+        }
+        for v in ["dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear", "dbg_break", "dbg_continue"] {
+            assert_eq!(annotations(v, "x")["readOnlyHint"], false, "{v}");
+            assert_eq!(annotations(v, "x")["destructiveHint"], false, "{v}");
+        }
+        assert_eq!(annotations("dbg_api_stop", "x")["idempotentHint"], true);
+    }
+
+    #[test]
+    fn debugger_verbs_that_touch_the_target_are_gated() {
+        let mut p = Policy { mode: "readonly".into(), ..Policy::default() };
+        assert!(matches!(decide(&p, "api_monitor_start", "dbg_api_start"), Decision::Deny(_)));
+        assert!(matches!(decide(&p, "find_accesses_start", "dbg_trace_start"), Decision::Deny(_)));
+        assert!(matches!(decide(&p, "x", "dbg_break"), Decision::Deny(_)));
+        // reading and stopping stay allowed: stopping restores the target
+        assert_eq!(decide(&p, "api_monitor_log", "dbg_api_log"), Decision::Allow);
+        assert_eq!(decide(&p, "api_monitor_stop", "dbg_api_stop"), Decision::Allow);
+        assert_eq!(decide(&p, "find_accesses_stop", "dbg_trace_stop"), Decision::Allow);
+        assert_eq!(decide(&p, "find_accesses_results", "dbg_trace_results"), Decision::Allow);
+        p.mode = "ask".into();
+        assert_eq!(decide(&p, "api_monitor_start", "dbg_api_start"), Decision::Ask);
+        assert_eq!(decide(&p, "find_accesses_start", "dbg_trace_start"), Decision::Ask);
     }
 
     #[test]

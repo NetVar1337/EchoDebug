@@ -20,6 +20,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub mod auth;
+pub mod dbg_core;
 pub mod local;
 pub mod local_dbg;
 pub mod local_emu;
@@ -31,6 +32,7 @@ pub mod lift;
 pub mod mcp;
 pub mod monitor;
 pub mod symbols;
+pub mod windbg;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -213,6 +215,11 @@ impl Relay {
         self.0.token.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The pid of the attached target (any backend).
+    pub(crate) fn target_pid(&self) -> Option<u32> {
+        self.lock().target.get("pid").and_then(Value::as_u64).map(|p| p as u32)
+    }
+
     /// The local backend's attach/detach: other clients learn the target from status frames.
     pub(crate) fn set_target(&self, target: Value) {
         self.lock().target = target;
@@ -255,6 +262,9 @@ impl Relay {
             "target": s.target,
             "backend": backend,
             "local": backend == "local",
+            // which native debugger the dbg_* verbs reach: ptrace (Linux local backend) or the
+            // Win32 debug API (Windows, any process on this machine)
+            "debugger": if windbg::enabled() { json!("windows") } else if self.0.local_backend.load(Ordering::Relaxed) && local::available() && cfg!(target_os = "linux") { json!("ptrace") } else { Value::Null },
             // the relay can attach by itself (Linux /proc backend) when no Echo agent is loaded
             "local_available": s.ext.is_none() && self.0.local_backend.load(Ordering::Relaxed) && local::available(),
         });
@@ -363,6 +373,16 @@ impl Relay {
                     "policy": self.policy().to_json(),
                 });
             }
+            // The native Windows debugger: an optional local backend next to Echo (which has no
+            // debugger API), for a process on this machine.
+            v if v.starts_with("dbg_") && windbg::enabled() => {
+                let (relay, req2, target) = (self.clone(), req.clone(), self.target_pid());
+                let mut v = tokio::task::spawn_blocking(move || windbg::handle(&relay, &req2, target))
+                    .await
+                    .unwrap_or_else(|e| error(Value::Null, 3003, &e.to_string()));
+                v["id"] = orig;
+                return v;
+            }
             v if v.starts_with(PROVIDER_PREFIX) => Kind::Provider,
             v if NATIVE_VERBS.contains(&v) => Kind::Agent,
             _ => Kind::Ext,
@@ -394,6 +414,9 @@ impl Relay {
                 Kind::Ext | Kind::Provider => error(orig, 2002, "EchoDebug agent not connected"),
             };
         };
+        // reads of a process the native debugger has int3s in show the original bytes
+        let shadowed = matches!(verb.as_str(), "read" | "read_batch" | "disassemble") && windbg::shadows(self.target_pid());
+        let reread = (shadowed && verb == "disassemble").then(|| req.clone());
         let frame = if kind == Kind::Provider {
             req.remove("id");
             json!({ "type": "provider_call", "call": id, "verb": verb, "args": Value::Object(req) })
@@ -416,7 +439,18 @@ impl Relay {
         );
 
         match tokio::time::timeout(self.0.timeout, &mut rx).await {
-            Ok(Ok(reply)) => reply,
+            Ok(Ok(mut reply)) => {
+                if shadowed {
+                    local_dbg::unshadow_reply(&mut reply);
+                    if let Some(r) = reread.filter(|_| disasm_shows_int3(&reply)) {
+                        if let Some(mut v) = windbg::redisasm(&r) {
+                            v["id"] = reply["id"].clone();
+                            return v;
+                        }
+                    }
+                }
+                reply
+            }
             // Pending entry dropped: its upstream went away.
             Ok(Err(_)) => error(orig, 2004, "upstream disconnected"),
             Err(_) => {
@@ -1016,6 +1050,18 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
         _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],
     };
     json!({ "description": prompt["description"], "messages": msgs })
+}
+
+/// A `disassemble` reply that decoded one of the native debugger's int3s.
+fn disasm_shows_int3(reply: &Value) -> bool {
+    reply["results"].as_array().is_some_and(|rs| {
+        rs.iter().any(|r| {
+            let Some(a) = r["address"].as_str().and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()) else { return false };
+            let mut b = [0xccu8];
+            local_dbg::unshadow(a, &mut b);
+            b[0] != 0xcc
+        })
+    })
 }
 
 fn capabilities() -> Value {
