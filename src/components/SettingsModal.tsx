@@ -6,6 +6,7 @@ import { kMotionPrefs, useMotion } from "@/store/motion";
 import { attempt, log } from "@/store/output";
 import { useUi, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
+import { kDefaultServer, useSymbols } from "@/store/symbols";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
 import { isWindowsOs } from "@/lib/tauri";
 import { CopyChip, IconButton, useCopy } from "./ui";
@@ -27,6 +28,7 @@ export default function SettingsModal() {
   const motion = useMotion((s) => s.pref);
   const setMotion = useMotion((s) => s.setPref);
   const [copied, copy] = useCopy();
+  const sym = useSymbols();
   const close = () => ui.set({ settingsOpen: false });
   const reinstall = async () => {
     const r = await attempt("agent", installAgent());
@@ -110,6 +112,33 @@ export default function SettingsModal() {
             </Row>
             <Row label="Panel sizes" hint="Splitter positions are remembered between runs.">
               <button className="btn" onClick={() => { ui.set({ layout: {} }); for (const v of ["--left-w", "--scan-w", "--bottom-h", "--right-w"]) document.querySelector<HTMLElement>(".app")?.style.removeProperty(v); }}>Reset layout</button>
+            </Row>
+          </Section>
+
+          <Section title="Symbols">
+            <Row label="Symbol path" hint={<>Folders and stores searched for PDBs, <span className="mono">_NT_SYMBOL_PATH</span> syntax: <span className="mono">C:\pdbs;srv*C:\symbols*https://…;cache*D:\sym</span>. The image's folder and the app cache are always searched.</>}>
+              <input className="input mono" style={{ width: 260 }} placeholder="C:\pdbs;srv*C:\symbols*https://…" value={sym.symbolPath} onChange={(e) => sym.setSettings({ symbolPath: e.target.value })} />
+            </Row>
+            <Row label="Symbol servers" hint="One URL per line, asked in order when a PDB is downloaded.">
+              <textarea className="textarea" rows={2} style={{ width: 260 }} value={sym.servers.join("\n")} onChange={(e) => sym.setSettings({ servers: e.target.value.split("\n").map((x) => x.trim()) })} onBlur={() => sym.setSettings({ servers: sym.servers.filter(Boolean).length ? sym.servers.filter(Boolean) : [kDefaultServer] })} />
+            </Row>
+            <Row label="Use _NT_SYMBOL_PATH" hint="Also read the environment variables of the relay process.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={sym.useEnv} onChange={(e) => sym.setSettings({ useEnv: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Auto-download" hint="Network access: download missing PDBs from the servers whenever symbols are loaded, without a click. Off: only the Download button (or an MCP client's ui_load_symbols) goes online.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={sym.autoDownload} onChange={(e) => sym.setSettings({ autoDownload: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Load on attach" hint="Load the PDBs already on this machine (symbol path, cache) for every module after attaching; with auto-download, fetch the rest too.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={sym.autoLoad} onChange={(e) => sym.setSettings({ autoLoad: e.target.checked })} />
+                <span />
+              </label>
             </Row>
           </Section>
 

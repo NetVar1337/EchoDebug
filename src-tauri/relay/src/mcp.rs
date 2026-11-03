@@ -11,7 +11,7 @@ const DESTRUCTIVE: &[&str] = &["write", "freeze", "freeze_group", "ui_revert_pat
 /// Verbs that change state but not the target's memory: attach/detach, execution control, files.
 const STATEFUL: &[&str] = &[
     "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
-    "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
+    "ui_load_symbols", "ui_import_pdb_type", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
     "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
     "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment",
 ];
@@ -209,6 +209,12 @@ mod tests {
         assert_eq!(annotations("attach", "a")["readOnlyHint"], false);
         assert_eq!(annotations("attach", "a")["destructiveHint"], false);
         assert_eq!(annotations("ui_load_symbols", "s")["openWorldHint"], true);
+        assert_eq!(annotations("ui_load_symbols", "s")["readOnlyHint"], false);
+        // PDB queries stay offline and read-only; importing a type changes the Structs catalog
+        assert_eq!(annotations("ui_pdb_symbols", "s")["openWorldHint"], false);
+        assert_eq!(annotations("ui_pdb_type", "s")["readOnlyHint"], true);
+        assert_eq!(annotations("ui_import_pdb_type", "s")["readOnlyHint"], false);
+        assert_eq!(annotations("ui_import_pdb_type", "s")["openWorldHint"], false);
         // the app window's annotation tools
         assert_eq!(annotations("ui_list_names", "n")["readOnlyHint"], true);
         assert_eq!(annotations("ui_list_signatures", "s")["readOnlyHint"], true);
