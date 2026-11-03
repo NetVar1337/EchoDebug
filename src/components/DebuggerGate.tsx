@@ -6,7 +6,7 @@ import { useConn } from "@/store/conn";
 import { Empty } from "./ui";
 
 export function DebuggerGate({ children }: { children: ReactNode }) {
-  const { relay, debugger: dbg, backend, os } = useConn();
+  const { relay, debugger: dbg, backend, os, target } = useConn();
   if (!relay) return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="Relay not reachable." hint="The EchoDebug relay is not running. Restart the app or check the port in Settings." />;
   if (!dbg)
     return (
@@ -16,5 +16,7 @@ export function DebuggerGate({ children }: { children: ReactNode }) {
           : "The relay debugs local processes itself: with ptrace on Linux (local backend) and with the Win32 debug API in Windows builds. Echo's Universal API has no debugger."} />
     );
   if (dbg === "ptrace" && backend !== "local") return <Empty icon={<Bug size={26} strokeWidth={1.5} />} title="Attach to a process first." hint="Pick a process in the Targets panel; the ptrace debugger works on the attached process." />;
+  if (dbg === "ptrace" && target?.arch === "arm64")
+    return <Empty icon={<Bug size={26} strokeWidth={1.5} />} title="The native debugger is x86-64 only." hint={`${target.name ?? "The attached process"} is an ARM64 (AArch64) process. Breakpoints, stepping, the access finder and the API monitor need an x86-64 target; disassembly and the emulator work on ARM64.`} />;
   return <>{children}</>;
 }

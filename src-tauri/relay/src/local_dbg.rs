@@ -729,7 +729,7 @@ mod imp {
                     let Some(addr) = arg_addr(req, "address") else { return bad("dbg_break requires 'address'") };
                     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                     if enabled {
-                        if let Err(e) = self.plant(addr) {
+                        if let Err(e) = core::check_code(&self.mem, addr).and_then(|()| self.plant(addr)) {
                             return failed(e);
                         }
                         self.user.insert(addr);
@@ -747,6 +747,13 @@ mod imp {
                     };
                     if self.trace[slot] {
                         return failed(format!("DR{slot} is used by an access-finder trace; stop it first"));
+                    }
+                    if let Some((a, kind, _)) = &val {
+                        if kind == "exec" {
+                            if let Err(e) = core::check_code(&self.mem, *a) {
+                                return failed(e);
+                            }
+                        }
                     }
                     self.hw[slot] = val;
                     let was_running = self.running;
@@ -829,7 +836,7 @@ mod imp {
                                 continue;
                             }
                         };
-                        if let Err(e) = self.plant(addr) {
+                        if let Err(e) = core::check_code(&self.mem, addr).and_then(|()| self.plant(addr)) {
                             unresolved.push(json!({ "name": spec, "error": e }));
                             continue;
                         }
@@ -893,6 +900,10 @@ mod imp {
                 return;
             }
         };
+        if let Err(e) = core::check_process(&mem, crate::local::main_module(&mem)) {
+            let _ = ready.send(Err(e));
+            return;
+        }
         let mut d = Dbg {
             pid, mem, threads: BTreeMap::new(), signals: HashMap::new(), planted: BTreeMap::new(), user: BTreeSet::new(), retired: BTreeSet::new(),
             hw: [None, None, None, None], trace: [false; 4], running: false, focus: pid as i32, last: Value::Null, relay, auto: false,

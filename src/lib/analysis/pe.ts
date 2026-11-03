@@ -129,16 +129,25 @@ export function parsePe(img: Uint8Array): PeInfo {
   return { is64, machine, timestamp, entryRva, imageBase, sizeOfImage, subsystem, characteristics, dllCharacteristics, sections, dirs, exports, imports };
 }
 
-export type RuntimeFunction = { begin: number; end: number; unwind: number; chained: boolean };
+export type RuntimeFunction = {
+  begin: number;
+  end: number;
+  unwind: number;
+  chained: boolean;
+  /** ARM64 only: "packed" (the length is in the entry), "xdata" (it is in .xdata) */
+  unwindKind?: "packed" | "xdata";
+};
 
 /**
- * x64 exception directory (.pdata): one RUNTIME_FUNCTION {begin, end, unwind} per function or
+ * Exception directory (.pdata). x64: one RUNTIME_FUNCTION {begin, end, unwind} per function or
  * function fragment. Fragments whose UNWIND_INFO has UNW_FLAG_CHAININFO continue the function
  * before them, so they are flagged `chained` and are not function starts.
+ * ARM64 (Machine 0xAA64): 8-byte entries {begin, unwind data}; see parseArm64RuntimeFunctions.
  */
 export function parseRuntimeFunctions(img: Uint8Array, pe?: PeInfo): RuntimeFunction[] {
   const info = pe ?? parsePe(img);
   const dir = info.dirs.find((d) => d.name === "Exception");
+  if (info.machine === 0xaa64) return dir && dir.rva ? parseArm64RuntimeFunctions(img, dir.rva, dir.size) : [];
   if (!dir || !dir.rva || dir.size < 12) return [];
   const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
   const out: RuntimeFunction[] = [];
@@ -149,6 +158,37 @@ export function parseRuntimeFunctions(img: Uint8Array, pe?: PeInfo): RuntimeFunc
     if (!begin || end <= begin || end > img.length) continue;
     const flags = unwind > 0 && unwind < img.length ? img[unwind & ~1] >> 3 : 0;
     out.push({ begin, end, unwind, chained: (unwind & 1) === 0 && (flags & 4) !== 0 });
+  }
+  return out.sort((a, b) => a.begin - b.begin);
+}
+
+/**
+ * ARM64 .pdata: IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY {BeginAddress, UnwindData}. The low two bits of
+ * UnwindData are the Flag: 1 / 2 = packed unwind data (FunctionLength in bits 2-12, in 4-byte
+ * units; 2 is a function or fragment without a prologue), 0 = UnwindData is the RVA of an .xdata
+ * record whose first word holds FunctionLength in bits 0-17 (4-byte units), 3 = reserved.
+ * Only the ranges are decoded. Packed entries with Flag 2 are not flagged `chained`: they are as
+ * often prologue-less leaf functions as separated fragments.
+ */
+export function parseArm64RuntimeFunctions(img: Uint8Array, rva: number, size: number): RuntimeFunction[] {
+  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const out: RuntimeFunction[] = [];
+  for (let o = rva; o + 8 <= rva + size && o + 8 <= img.length; o += 8) {
+    const begin = dv.getUint32(o, true);
+    const unwind = dv.getUint32(o + 4, true);
+    if (!begin) continue;
+    const flag = unwind & 3;
+    let len = 0;
+    let unwindKind: RuntimeFunction["unwindKind"];
+    if (flag === 1 || flag === 2) {
+      len = ((unwind >>> 2) & 0x7ff) * 4;
+      unwindKind = "packed";
+    } else if (flag === 0 && unwind + 4 <= img.length) {
+      len = (dv.getUint32(unwind, true) & 0x3ffff) * 4;
+      unwindKind = "xdata";
+    }
+    if (!len || begin + len > img.length) continue;
+    out.push({ begin, end: begin + len, unwind, chained: false, unwindKind });
   }
   return out.sort((a, b) => a.begin - b.begin);
 }

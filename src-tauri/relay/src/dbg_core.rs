@@ -823,6 +823,34 @@ pub fn traces_json(abi: Abi) -> Value {
     with_mon(abi, |m| Value::Array(m.traces.iter().flatten().map(Trace::to_json).collect()))
 }
 
+// ---- architecture -------------------------------------------------------------------------------
+
+/// The debuggers are x86-64 only (int3, DR0-DR7, the x86 decoders, the Win64 / SysV tables): an
+/// AArch64 process or module is refused with this explanation.
+pub fn arm64_refusal(what: &str) -> String {
+    format!("{what} is ARM64 (AArch64) code: the native debugger, the access finder and the API monitor are x86-64 only")
+}
+
+fn refuse_arm64(arch: Option<crate::arch::Arch>, what: impl FnOnce() -> String) -> Result<(), String> {
+    match arch {
+        Some(crate::arch::Arch::Arm64) => Err(arm64_refusal(&what())),
+        _ => Ok(()),
+    }
+}
+
+/// `Err` when the process's main module (`name`, `base`) is AArch64, from its headers in memory.
+pub fn check_process(mem: &impl crate::local::MemIo, main: Option<(String, u64, u64)>) -> Result<(), String> {
+    let Some((name, base, _)) = main else { return Ok(()) };
+    refuse_arm64(crate::local::module_arch(mem, base), || format!("process image {name}"))
+}
+
+/// `Err` when `addr` lies in an AArch64 module (e.g. ARM64EC code loaded into an x64 process).
+pub fn check_code(mem: &impl crate::local::MemIo, addr: u64) -> Result<(), String> {
+    let mods = mem.modules().unwrap_or_default();
+    let Some((name, base, _)) = mods.into_iter().find(|(_, b, sz)| *b <= addr && addr < b.saturating_add(*sz)) else { return Ok(()) };
+    refuse_arm64(crate::local::module_arch(mem, base), || format!("{} (in {name})", hex(addr)))
+}
+
 // ---- session plumbing ---------------------------------------------------------------------------
 
 pub type Cmd = (Map<String, Value>, Sender<Value>);
@@ -1226,6 +1254,51 @@ mod tests {
         assert_eq!(pe_export(&read, base, "#1").unwrap(), Export::At(base + 0x1234));
         assert!(pe_export(&read, base, "Fo").is_err());
         assert!(pe_export(&read, base + 0x10, "Foo").is_err());
+    }
+
+    /// Two modules of a fake process: an x86-64 ELF at 0x1000, an AArch64 one at 0x9000.
+    struct TwoModules;
+
+    impl crate::local::MemIo for TwoModules {
+        fn read_at(&self, addr: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let machine: u16 = match addr {
+                0x1000 => 62,
+                0x9000 => 183,
+                _ => return Ok(0),
+            };
+            let mut head = [0u8; 64];
+            head[..4].copy_from_slice(b"\x7fELF");
+            head[4] = 2;
+            head[5] = 1;
+            head[18..20].copy_from_slice(&machine.to_le_bytes());
+            let n = buf.len().min(64);
+            buf[..n].copy_from_slice(&head[..n]);
+            Ok(n)
+        }
+        fn write_at(&self, _: u64, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn maps(&self) -> std::io::Result<Vec<crate::local::MapLine>> {
+            Ok(Vec::new())
+        }
+        fn modules(&self) -> std::io::Result<Vec<(String, u64, u64)>> {
+            Ok(vec![("x64.so".into(), 0x1000, 0x1000), ("a64.so".into(), 0x9000, 0x1000)])
+        }
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn arm64_code_is_refused() {
+        let m = TwoModules;
+        assert!(check_process(&m, Some(("x64".into(), 0x1000, 0x1000))).is_ok());
+        let e = check_process(&m, Some(("a64".into(), 0x9000, 0x1000))).unwrap_err();
+        assert!(e.contains("ARM64") && e.contains("x86-64 only"), "{e}");
+        assert!(check_code(&m, 0x1800).is_ok());
+        assert!(check_code(&m, 0x20000).is_ok(), "outside every module: not refused");
+        let e = check_code(&m, 0x9010).unwrap_err();
+        assert!(e.contains("0x9010") && e.contains("a64.so"), "{e}");
     }
 
     #[test]

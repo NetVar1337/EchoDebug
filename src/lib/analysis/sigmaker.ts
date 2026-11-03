@@ -1,16 +1,30 @@
 // IDA-style signature maker: wildcard position-dependent operands, grow until unique
 
 import { hexToBytes } from "../hex";
+import { a64Wildcards } from "./a64";
+import { parseArch, type Arch } from "./arch";
 
 export type Insn = { address: string; length: number; bytes: string; text: string };
 export type Pattern = (number | null)[];
 
 const kPrefixes = new Set([0x66, 0x67, 0xf2, 0xf3, 0x2e, 0x3e, 0x26, 0x64, 0x65, 0x36, 0xf0]);
 
-/** Pattern for one instruction: rel32 branch targets and [rip+disp32] displacements become wildcards. */
-export function insnPattern(bytesHex: string, text: string): Pattern {
+/**
+ * Pattern for one instruction: rel32 branch targets and [rip+disp32] displacements become
+ * wildcards. On arm64 the branch / adr / adrp / literal immediates do, and the imm12 of an add or
+ * load/store that completes an adrp pair (the relay annotates those with `; 0x...`).
+ */
+export function insnPattern(bytesHex: string, text: string, arch: Arch | string | null = "x86_64"): Pattern {
   const b = hexToBytes(bytesHex);
   const p: Pattern = Array.from(b);
+  if (parseArch(arch) === "arm64") {
+    const afterAdrp = text.includes(";");
+    for (let o = 0; o + 4 <= b.length; o += 4) {
+      const w = (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+      a64Wildcards(w, afterAdrp).forEach((x, k) => x && (p[o + k] = null));
+    }
+    return p;
+  }
   let i = 0;
   while (i < b.length && kPrefixes.has(b[i])) i++;
   if (i < b.length && b[i] >= 0x40 && b[i] <= 0x4f) i++; // REX
@@ -68,10 +82,12 @@ export async function makeSignature(
   insns: readonly Insn[],
   countHits: (ida: string) => Promise<number>,
   minBytes = 5,
+  /** the listing's architecture (a disassemble reply's `arch`); x86-64 by default */
+  arch: Arch | string | null = "x86_64",
 ): Promise<{ pattern: Pattern; hits: number } | null> {
   let p: Pattern = [];
   for (const insn of insns) {
-    p = p.concat(insnPattern(insn.bytes, insn.text));
+    p = p.concat(insnPattern(insn.bytes, insn.text, arch));
     const t = trim(p);
     if (t.filter((x) => x !== null).length < minBytes) continue;
     const hits = await countHits(toIda(t));

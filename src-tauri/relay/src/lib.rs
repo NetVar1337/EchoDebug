@@ -19,12 +19,15 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+pub mod a64;
+pub mod arch;
 pub mod assistant;
 pub mod auth;
 pub mod dbg_core;
 pub mod local;
 pub mod local_dbg;
 pub mod local_emu;
+pub mod local_emu_a64;
 pub mod local_emudbg;
 pub mod local_ext;
 pub mod local_more;
@@ -314,6 +317,17 @@ impl Relay {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        // AArch64 code behind the Echo backend: Echo's disassembler is x86-64 only, so the relay
+        // reads the bytes through `read` and decodes them itself (the local backend decodes arm64
+        // natively).
+        let a64_via_read = matches!(verb.as_str(), "disassemble" | "disasm_function")
+            && arch::from_req(&req) == Some(arch::Arch::Arm64)
+            && self.lock().agent.is_some();
+        if a64_via_read {
+            let mut v = self.a64_disassemble(&verb, &req).await;
+            v["id"] = orig;
+            return v;
+        }
         let kind = match verb.as_str() {
             "" => return error(orig, 2000, "missing type"),
             "status" => {
@@ -905,6 +919,56 @@ impl Relay {
         lift::Pages(pages)
     }
 
+    /// `disassemble` / `disasm_function` for AArch64 over any backend's `read`. Size 0 (and
+    /// `disasm_function`) decodes the function at `address`: up to the first ret, at most 64 KiB,
+    /// read page by page so a function near the end of a mapping still decodes.
+    async fn a64_disassemble(&self, verb: &str, req: &Map<String, Value>) -> Value {
+        let Some(addr) = req.get("address").and_then(Value::as_str).and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()) else {
+            return json!({ "type": "error", "code": 1002, "message": "invalid or missing arguments", "detail": "disassemble requires 'address'" });
+        };
+        let want = req.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let function_mode = want == 0 || verb == "disasm_function";
+        let read = |a: u64, n: u64| {
+            let mut r = Map::new();
+            r.insert("type".into(), json!("read"));
+            r.insert("address".into(), json!(format!("0x{a:x}")));
+            r.insert("size".into(), json!(n));
+            async move {
+                let v = Box::pin(self.request(Value::Object(r))).await;
+                v["data"].as_str().and_then(|h| (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()).filter(|b| !b.is_empty())
+            }
+        };
+        let mut v = if function_mode {
+            let mut code = Vec::new();
+            let mut a = addr;
+            while code.len() < 0x10000 {
+                let n = 0x1000 - (a & 0xfff);
+                let Some(chunk) = read(a, n).await else { break };
+                code.extend_from_slice(&chunk);
+                a += chunk.len() as u64;
+                if crate::a64::disasm(&chunk, 0).iter().any(|l| crate::a64::ends_function(&l.text)) {
+                    break;
+                }
+            }
+            if code.is_empty() {
+                return json!({ "type": "error", "code": 1005, "message": "memory read failed" });
+            }
+            local::a64_listing(&code, addr, true)
+        } else {
+            let n = want.clamp(1, 1_048_576);
+            match read(addr, n).await {
+                Some(code) if code.len() as u64 == n => local::a64_listing(&code, addr, false),
+                _ => return json!({ "type": "error", "code": 1005, "message": "memory read failed" }),
+            }
+        };
+        if verb == "disasm_function" {
+            let size: u64 = v["results"].as_array().map(|a| a.len() as u64 * 4).unwrap_or(0);
+            v["type"] = json!("disasm_function_result");
+            v["size"] = json!(size);
+        }
+        v
+    }
+
     /// lift_block / lift_trace / devirt. Traces come from `trace` (addresses) or from an emulated
     /// run (`start`, `end`, `max_insns`, `regs`), which the relay requests itself.
     async fn lift_verb(&self, verb: &str, req: &Map<String, Value>) -> Value {
@@ -1037,6 +1101,12 @@ fn disasm_bytes(req: &Map<String, Value>) -> Value {
     let Some(bytes) = bytes.filter(|b| !b.is_empty() && b.len() <= 1 << 20 && hex.len().is_multiple_of(2)) else {
         return json!({ "type": "error", "code": 2000, "message": "disasm_bytes needs hex 'data' (up to 1 MiB)" });
     };
+    if arch::from_req(req) == Some(arch::Arch::Arm64) {
+        let mut v = local::a64_listing(&bytes[..bytes.len() & !3], addr, false);
+        v["type"] = json!("disasm_bytes_result");
+        v["complete"] = json!(bytes.len().is_multiple_of(4));
+        return v;
+    }
     let mut out = Vec::new();
     let mut off = 0usize;
     while off < bytes.len() {

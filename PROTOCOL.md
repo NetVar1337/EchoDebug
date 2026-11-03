@@ -122,6 +122,25 @@ true`). Arguments follow the platform ABI at function entry (Win64: rcx, rdx, r8
 four raw argument registers. A thread passing a hooked function while another one single-steps over
 its int3 is not logged.
 
+**Architectures.** x86-64 is the default. `disassemble`, `disasm_function` and `disasm_bytes` take
+`arch` (`"x86_64"` | `"arm64"`, aliases `aarch64`, `x64`, …). The lines keep their shape
+(`address`, `length` = 4, `bytes`, `text`); PC-relative operands are printed as absolute addresses
+(`bl 0x210168`, `cbz x9, 0x210194`, `adrp x20, 0x220000`) and an `add`/`ldr`/`str` that completes an
+`adrp` pair ends in `  ; 0x<resolved address>`; undecodable words read `.inst 0x…`; the reply adds
+`"arch":"arm64"`. With an Echo upstream the relay serves `arch:"arm64"` itself (Echo's disassembler
+is x86-64 only): it reads the code with `read` and decodes it (size 0 / `disasm_function`: page by
+page up to the first ret, at most 64 KiB). The local backend detects the architecture from the
+module's ELF header when `arch` is omitted, reports `arch` per module in `modules_result` and on the
+attach target, and `emulate` with `arch:"arm64"` (or a start address inside an AArch64 module) runs
+Unicorn's AArch64 CPU: `regs` takes/returns `x0`…`x30` (`fp`, `lr` accepted), `sp`, `pc`, `nzcv`,
+`tpidr_el0`; `v` (`{"v0":"<32 hex>"}`) or `simd:true` adds `v0`…`v31` to the reply; `x30` starts at
+`end` so a `ret` ends the run; `mem_log` entries and `faults` carry `pc` instead of `rip`; `stubs`,
+`layers`, `trace_regs` and `xmm` are x86-64 only and refused. There is no ARM64 debugger backend:
+the native debuggers (`dbg_*`, ptrace and Win32, with the access finder and the API monitor) are
+x86-64 only and refuse an AArch64 process at attach, and a breakpoint, execute watchpoint or API
+hook inside an AArch64 module (ARM64EC code in an x64 process), with code `3003` and a detail that
+says so. The emulated debugger (`emu_*`) and lifter are x86-64 only.
+
 Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause"|"exception", "tid", "address", "regs", "slot?", "watch?", "signal?", "code?", "first_chance?", "description?" }`,
 `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`, `{ "event":"dbg_access", "slot", "watch", "kind", "address", "text" }`
 (a new accessing instruction), and on Windows `{ "event":"dbg_exception", "code", "description", … }` (routine first-chance

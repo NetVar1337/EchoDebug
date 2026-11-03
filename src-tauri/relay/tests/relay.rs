@@ -841,6 +841,39 @@ async fn annotation_tools_go_through_provider_and_policy() {
 }
 
 #[tokio::test]
+async fn arm64_disassembly_goes_through_read_on_the_echo_backend() {
+    let (addr, _) = start().await;
+    let mut agent = connect(addr, "/agent").await;
+    let mut client = client_when(addr, true, false).await;
+    send(&mut client, json!({ "type": "disassemble", "id": 7, "address": "0x14000104c", "size": 12, "arch": "arm64" })).await;
+    let req = recv_until(&mut agent, |_| true).await;
+    assert_eq!(req["type"], "read", "the relay reads the code instead of asking Echo's x86 decoder");
+    assert_eq!(req["size"], 12);
+    // adrp x0, 0x140002000 ; add x0, x0, #0x0 ; bl 0x14000100c
+    send(&mut agent, json!({ "type": "read_result", "id": req["id"], "success": true, "data": "000000b000000091eeffff97" })).await;
+    let reply = recv_until(&mut client, |v| v["type"] == "disassemble_result").await;
+    assert_eq!(reply["id"], 7);
+    assert_eq!(reply["arch"], "arm64");
+    let lines = reply["results"].as_array().unwrap();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["text"], "adrp x0, 0x140002000");
+    assert_eq!(lines[1]["text"], "add x0, x0, #0x0  ; 0x140002000");
+    assert_eq!(lines[2]["text"], "bl 0x14000100c");
+    assert_eq!(lines[2]["length"], 4);
+    assert_eq!(lines[2]["bytes"], "eeffff97");
+
+    // x86-64 (no arch) still goes to Echo verbatim
+    send(&mut client, json!({ "type": "disassemble", "id": 8, "address": "0x1000", "size": 4 })).await;
+    let req = recv_until(&mut agent, |_| true).await;
+    assert_eq!(req["type"], "disassemble");
+
+    // disasm_bytes decodes either architecture in the relay
+    send(&mut client, json!({ "type": "disasm_bytes", "id": 9, "data": "c0035fd6", "address": "0x0", "arch": "aarch64" })).await;
+    let reply = recv_until(&mut client, |v| v["type"] == "disasm_bytes_result").await;
+    assert_eq!(reply["results"][0]["text"], "ret");
+}
+
+#[tokio::test]
 async fn pdb_verbs_are_relay_local() {
     // no upstream at all: the relay answers PDB queries itself
     let (addr, _) = start().await;

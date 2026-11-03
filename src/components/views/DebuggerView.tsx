@@ -12,6 +12,7 @@ import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton } from "../ui";
 import { DebuggerGate } from "../DebuggerGate";
+import { useModuleArch } from "../ArchBadge";
 
 type Regs = Record<string, string>;
 type Status = {
@@ -42,7 +43,10 @@ export function describeStop(f: Frame, modules: Parameters<typeof symAddr>[1]): 
 }
 
 function AttachPanel({ onAttached }: { onAttached: () => void }) {
-  const { debugger: dbg, target } = useConn();
+  const { debugger: dbg, target, modules } = useConn();
+  // the Echo target's image: an ARM64 process is refused by the (x86-64 only) debugger
+  const image = useMemo(() => (target?.base ? modules.find((m) => m.base === target.base) : undefined), [target?.base, modules]);
+  const imageArch = useModuleArch(image);
   const [procs, setProcs] = useState<Proc[]>([]);
   const [filter, setFilter] = useState("");
   const [pid, setPid] = useState<number | null>(target?.pid ?? null);
@@ -85,6 +89,7 @@ function AttachPanel({ onAttached }: { onAttached: () => void }) {
         {target?.pid && !shown.some((p) => p.pid === target.pid) && <option value={target.pid}>{target.name ?? "Echo target"} ({target.pid})</option>}
         {shown.map((p) => <option key={p.pid} value={p.pid}>{p.name} ({p.pid}){p.pid === target?.pid ? " · Echo target" : ""}</option>)}
       </select>
+      {pid === target?.pid && imageArch === "arm64" && <div className="warn">{target?.name ?? "This process"} is an ARM64 process; the native debugger is x86-64 only and will refuse it.</div>}
       <div className="row">
         <button className="btn small primary" disabled={!pid} onClick={() => void attach()}><Bug size={13} /> Attach to {pid ?? "…"}</button>
       </div>

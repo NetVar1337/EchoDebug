@@ -43,14 +43,16 @@ export default function SignaturesView() {
     setBusy(true);
     setFound(null);
     let insns: Insn[] = [];
+    let arch: string | undefined;
     if (mode === "code") {
-      const r = await attempt("sig", request<{ results: Insn[] }>("disassemble", { address: fmtAddr(addr), size: 0x200 }));
+      const r = await attempt("sig", request<{ results: Insn[]; arch?: string }>("disassemble", { address: fmtAddr(addr), size: 0x200 }));
       insns = r?.results ?? [];
+      arch = r?.arch;
     } else {
       const b = await attempt("sig", readBytes(addr, 128));
       insns = b ? Array.from(b, (x, i) => ({ address: fmtAddr(addr + BigInt(i)), length: 1, bytes: x.toString(16).padStart(2, "0"), text: "" })) : [];
     }
-    const r = await attempt("sig", makeSignature(insns, async (p) => (await hits(p, mod.name)).length));
+    const r = await attempt("sig", makeSignature(insns, async (p) => (await hits(p, mod.name)).length, 5, arch));
     setBusy(false);
     if (!r) return log("warn", "sig", "no unique signature within the scanned range");
     setPattern(r.pattern);

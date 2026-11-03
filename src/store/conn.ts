@@ -4,10 +4,11 @@ import { client, request, type Frame } from "@/lib/client";
 import { hexDump, type Module } from "@/lib/hex";
 import { hostOs, regenerateToken, relayInfo, type RelayInfo } from "@/lib/tauri";
 import { clearImages } from "@/lib/memory";
+import { clearArchCache, installArchHook } from "@/lib/archlive";
 import { log } from "./output";
 import pkg from "../../package.json";
 
-export type Target = { pid: number; base: string; peb?: string; name?: string };
+export type Target = { pid: number; base: string; peb?: string; name?: string; arch?: string };
 export type Progress = { job: string; done: number; total: number } | null;
 
 type ConnStore = {
@@ -143,7 +144,8 @@ export const useConn = create<ConnStore>((set, get) => ({
     const r = await request<Target & { native_socket?: boolean }>("attach", by);
     log("info", "attach", `attached ${r.name ?? by.name ?? r.pid} pid ${r.pid} base ${r.base}${r.native_socket === false ? " (memory server already open)" : ""}`);
     clearImages();
-    set({ target: { pid: r.pid, base: r.base, peb: r.peb, name: r.name ?? by.name }, splash: false });
+    clearArchCache();
+    set({ target: { pid: r.pid, base: r.base, peb: r.peb, name: r.name ?? by.name, arch: r.arch }, splash: false });
     setTimeout(() => void get().refreshStatus().then(() => get().refreshModules()), 600);
   },
 
@@ -159,6 +161,9 @@ export const useConn = create<ConnStore>((set, get) => ({
     log("info", "mcp", "token regenerated; re-add MCP clients with the new header");
   },
 }));
+
+// arm64 modules: disassembly requests carry the module's arch (see archlive.ts)
+installArchHook(() => useConn.getState().modules);
 
 /** A fired conditional alert: one Output line, its memory snapshot as the clickable detail. */
 function logAlert(f: Frame): void {
@@ -178,6 +183,7 @@ function applyStatus(f: Frame): void {
   useConn.setState({ debugger: debuggerKind, agent, mem: agent || backend === "local", extOk: Boolean(f.ext) || backend === "local", provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
   if (changed) {
     clearImages();
+    clearArchCache();
     void s.refreshModules();
   }
 }

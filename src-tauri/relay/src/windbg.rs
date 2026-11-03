@@ -1049,7 +1049,7 @@ mod imp {
                     let Some(addr) = arg_addr(req, "address") else { return bad("dbg_break requires 'address'") };
                     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                     if enabled {
-                        if let Err(e) = self.plant(addr) {
+                        if let Err(e) = core::check_code(&self.io, addr).and_then(|()| self.plant(addr)) {
                             return failed(e);
                         }
                         self.user.insert(addr);
@@ -1067,6 +1067,13 @@ mod imp {
                     };
                     if self.trace[slot] {
                         return failed(format!("DR{slot} is used by an access-finder trace; stop it first"));
+                    }
+                    if let Some((a, kind, _)) = &val {
+                        if kind == "exec" {
+                            if let Err(e) = core::check_code(&self.io, *a) {
+                                return failed(e);
+                            }
+                        }
                     }
                     self.hw[slot] = val;
                     let was_running = self.running();
@@ -1151,7 +1158,7 @@ mod imp {
                                 continue;
                             }
                         };
-                        if let Err(e) = self.plant(addr) {
+                        if let Err(e) = core::check_code(&self.io, addr).and_then(|()| self.plant(addr)) {
                             unresolved.push(json!({ "name": spec, "error": e }));
                             continue;
                         }
@@ -1207,6 +1214,11 @@ mod imp {
         };
         if io.wow64() {
             let _ = ready.send(Err("32-bit (WOW64) processes are not supported by the native debugger".into()));
+            return;
+        }
+        // the first module of the snapshot is the process image
+        if let Err(e) = core::check_process(&io, io.modules().ok().and_then(|m| m.into_iter().next())) {
+            let _ = ready.send(Err(e));
             return;
         }
         // SAFETY: plain Win32 calls on this (the debugger) thread.

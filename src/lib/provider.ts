@@ -203,12 +203,12 @@ provide("ui_make_signature", async (args) => {
   const a = addrArg(args);
   const m = moduleOf(a, modules());
   if (!m) throw new Error("address is outside every module");
-  const r = await request<{ results: { address: string; length: number; bytes: string; text: string }[] }>("disassemble", { address: fmtAddr(a), size: 0x200 });
+  const r = await request<{ results: { address: string; length: number; bytes: string; text: string }[]; arch?: string }>("disassemble", { address: fmtAddr(a), size: 0x200 });
   const count = async (ida: string) => {
     const hits = await request<{ results: string[] }>("sig_scan_ida", { pattern: ida, module: m.name, find_all: true }, true);
     return hits.results?.length ?? 0;
   };
-  const sig = await makeSignature(r.results, count);
+  const sig = await makeSignature(r.results, count, 5, r.arch);
   if (!sig) throw new Error("no unique signature within 512 bytes");
   return { address: fmtAddr(a), module: m.name, ida: toIda(sig.pattern), ...toCode(sig.pattern), hits: sig.hits };
 });
