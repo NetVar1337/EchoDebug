@@ -13,7 +13,7 @@ const STATEFUL: &[&str] = &[
     "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
     "ui_load_symbols", "ui_import_pdb_type", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
     "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
-    "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment",
+    "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment", "trace_record",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.
@@ -35,9 +35,10 @@ pub fn is_read_only(verb: &str) -> bool {
 }
 
 /// What the ask / read-only policies gate: calls that change the target's memory, plus dumps
-/// (they write files). Attach, scans and the emulator change only EchoDebug's own state.
+/// (they write files), and trace recording (its ptrace source runs the real thread). Attach, scans
+/// and the emulator change only EchoDebug's own state.
 pub fn is_gated(verb: &str) -> bool {
-    DESTRUCTIVE.contains(&verb) || verb == "dump"
+    DESTRUCTIVE.contains(&verb) || verb == "dump" || verb == "trace_record"
 }
 
 /// What MCP clients may call. Set by the app (Settings → MCP), kept in memory by the relay.
@@ -226,6 +227,10 @@ mod tests {
         assert_eq!((set["readOnlyHint"].as_bool(), set["destructiveHint"].as_bool(), set["idempotentHint"].as_bool()), (Some(false), Some(false), Some(true)));
         assert_eq!(annotations("ui_set_comment", "c")["readOnlyHint"], false);
         assert_eq!(annotations("ui_revert_patch", "r")["destructiveHint"], true);
+        // time-travel traces: recording changes state, the queries only read
+        assert_eq!(annotations("trace_record", "t")["readOnlyHint"], false);
+        assert_eq!(annotations("trace_query", "t")["readOnlyHint"], true);
+        assert_eq!(annotations("trace_info", "t")["readOnlyHint"], true);
     }
 
     #[test]
@@ -240,6 +245,9 @@ mod tests {
         assert_eq!(decide(&p, "disassemble", "disassemble"), Decision::Allow);
         assert_eq!(decide(&p, "emu_step", "emu_step"), Decision::Allow);
         assert!(matches!(decide(&p, "dump_module", "dump"), Decision::Deny(_)));
+        // recording a ptrace trace runs the real thread; querying a trace is always fine
+        assert!(matches!(decide(&p, "trace_record", "trace_record"), Decision::Deny(_)));
+        assert_eq!(decide(&p, "trace_query", "trace_query"), Decision::Allow);
         // reverting a patch writes target memory; naming only touches EchoDebug's own stores
         assert!(matches!(decide(&p, "revert_patch", "ui_revert_patch"), Decision::Deny(_)));
         assert_eq!(decide(&p, "set_name", "ui_set_name"), Decision::Allow);

@@ -438,6 +438,32 @@ mod imp {
                     let stop = run(&mut uc, max, until, timeout, trace);
                     { let st = state(&mut uc, stop); with_extras(&mut uc, st) }
                 }
+                // time-travel recording of the session (trace_record source "emu", see trace_emu.rs)
+                "emu_record" => {
+                    let lim = crate::trace_rec::Limits::from_req(&req);
+                    let until = lim.until.unwrap_or(0);
+                    let run_timeout = req.get("timeout_us").and_then(Value::as_u64).unwrap_or(120_000_000).min(3_600_000_000);
+                    let meta = crate::trace::Meta {
+                        name: req.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                        source: "emu".into(),
+                        created_ms: crate::trace_rec::now_ms(),
+                        pid: if uc.get_data().mem.is_some() { crate::local::attached_pid() } else { None },
+                        ..Default::default()
+                    };
+                    let save = req.get("save").and_then(Value::as_bool).unwrap_or(true);
+                    match crate::trace_emu::record(&mut uc, meta, &lim, |uc, a, buf| match &uc.get_data().mem {
+                        Some(m) => m.read_at(a, buf).map(|n| n == buf.len()).unwrap_or(false),
+                        None => { buf.fill(0); true }
+                    }, |uc, n| run(uc, n, until, run_timeout, false)) {
+                        Ok((t, stop)) => {
+                            let summary = crate::trace_rec::deposit(t, save);
+                            let mut v = state(&mut uc, stop);
+                            v["trace"] = summary;
+                            v
+                        }
+                        Err(e) => failed(&e),
+                    }
+                }
                 "emu_watch" => {
                     if req.get("clear").and_then(Value::as_bool) == Some(true) {
                         uc.get_data_mut().wps.clear();

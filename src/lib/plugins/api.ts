@@ -22,7 +22,7 @@ export const kStateful = new Set([
   "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
   "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
   "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
-  "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove",
+  "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove", "trace_record",
 ]);
 /** Verbs that change names, comments and the struct catalog. Need `annotate`. */
 export const kAnnotate = new Set(["ui_set_name", "ui_set_comment", "ui_import_pdb_type"]);

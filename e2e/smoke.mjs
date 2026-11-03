@@ -183,6 +183,22 @@ await step("emulated debugger steps classify and runs it to its return", async (
   await until(async () => (await page.locator("text=the function returned").count()) > 0);
 });
 
+await step("trace records classify in the emulator and scrubs back through it", async () => {
+  await tab("Trace");
+  await page.locator('input[placeholder="empty: the current session"]').fill(`e2e-target+${sym("classify")}`);
+  await page.getByRole("button", { name: "Record", exact: true }).click();
+  await until(async () => (await page.locator("text=stopped: returned").count()) > 0, 20000);
+  const n = Number(await page.locator("input[type=range]").getAttribute("max"));
+  expect(n > 3, `too few steps: ${n}`);
+  expect((await page.locator("table tbody tr").count()) > 3, "the instruction list is empty");
+  // scrub: to the end with the slider, then one step back
+  await page.locator("input[title=position]").fill(String(n));
+  await page.locator("[aria-label='Step back (←)']").click();
+  await until(async () => (await page.locator(".label", { hasText: `Registers at ${n - 1}` }).count()) > 0);
+  await page.locator(".kv span[title='Where did this value come from?']").first().click();
+  await until(async () => (await page.locator("text=/Where did \\w+ come from/").count()) > 0);
+});
+
 await step("page monitor sees the counter's page change", async () => {
   await tab("Monitors");
   await page.locator('input[placeholder="address · module+0x…"]').last().fill(`e2e-target+${sym("counter")}`);

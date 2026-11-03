@@ -302,6 +302,54 @@ from the changed registers and the memory left behind (stack slots below the fin
 Instructions outside the model turn their outputs into fresh unknowns and are counted in `unsupported`.
 The local emulators map a zeroed TLS block for `fs:`/`gs:` (`fs_base`/`gs_base` are settable registers).
 
+### Time-travel traces (relay)
+
+Recorded and stored by the relay for every backend (`trace.rs`, `trace_rec.rs`, `trace_emu.rs`). A trace is
+one thread's run, step by step: step `i` executed the instruction at `pc(i)`, changed some registers and
+read / wrote memory (reads keep the bytes read, writes the bytes before and after). **Position** `p`
+(0..=`steps`) is the state *before* step `p`; `p == steps` is the end. Registers: rax…r15, rip, eflags,
+fs_base, gs_base. Trace ids travel as `trace` in requests and `trace_id` in replies (the relay owns `id`).
+
+| verb | request | reply |
+|---|---|---|
+| `trace_record` | `source` (`emu` default \| `ptrace`), `max_steps?` (10000, ≤ 5M), `until?` (address), `max_mb?` (64, ≤ 1024), `keyframe?` (256), `name?`, `save?` (true), `tid?` (ptrace), `start?`/`code?`/`regs?`/`write?` (emu: `emu_start` first), `timeout_us?` | `trace:{trace_id, name, source, steps, stop_reason (count, until, returned, size limit, cancelled, fault, breakpoint, signal …), truncated, keyframe, unique_pcs, accesses, writes, initial_regs, final_regs, saved}` plus, for `emu`, the session state as `emu_*` replies carry it |
+| `trace_cancel` / `trace_status` | — | `cancelling` / `recording`, `steps` |
+| `trace_list` | — | `traces:[summary + file_size]`, `current`, `dir` |
+| `trace_info` | `trace?` | the summary (default the current trace; the list when there is none) |
+| `trace_query` | `trace?`, `kind`, `pos?` (default the end), kind arguments | see below |
+| `trace_export` / `trace_import` | `trace?` / `data` (base64 `.edt`), `name?` | `data`, `size` / the imported summary |
+| `trace_delete` | `trace` | `removed` |
+
+`trace_query` kinds: `reg_at` (`reg?` → `value`, else `regs`), `mem_at` (`address`, `size` ≤ 64 KiB → `data`, hex
+with `??` for bytes the trace never touched; a byte's value is the newest write before `pos`, else what its
+first access saw), `last_write` (`address`, `size?`, `changed_only?` (true: skip writes that stored the same
+bytes) → `write:{step, pc, address, size, old, new, text}` or null), `writes_to` / `reads_of` (`address`, `size?`,
+`limit?` → `writes` / `reads`, `total`), `executions_of` (`address` → `steps`, `total`), `seek` (`address`,
+`direction` forward\|back → the next / previous `step` from `pos`), `reg_series` (`reg`, `from?`, `to?`, `max?` →
+`points:[[pos, value]]`, every change or a sampled step function), `step` (`pos` → `pc`, `bytes`, `text`, `changes`,
+`accesses`, `regs_before`), `steps` (`from`, `count` ≤ 5000 → listing), `taint` (`reg`, or `address`+`size`,
+`max_hops?` → `hops:[{id, parent, step, pc, text, loc, value, kind, sources}]`: the producer of the value, then
+the producers of its sources; `kind` `mov` / `arith` / `const` (immediate, `xor r,r`) / `initial` (there before the
+trace) / `unmodeled` (an instruction the walk does not follow)), `touched` (merged ranges with read/write counts).
+
+Sources. **emu**, local backend: the Emu Debugger's Unicorn thread records with code and memory hooks
+(`emu_record`; breakpoints, watchpoints, stand-ins and `cancel` keep working). **emu**, Windows agent: the relay
+drives the agent's session with `emu_step {count:1}` and reads each instruction's memory operands (decoded with
+iced-x86 from the step's registers) with `emu_read` before and after: same trace, a few round trips per
+instruction. **ptrace** (Linux, after `dbg_attach`): `dbg_record` on the debugger thread single-steps the focused (or
+`tid`) thread the same way, stepping over int3 breakpoints with their original bytes; writes the kernel makes
+during a system call are not seen, and a thread blocked in a call ends the recording. While recording the relay
+broadcasts `{event:"trace_progress", steps, max_steps}` every 250 ms and `{event:"trace_done", trace_id, steps,
+stop_reason}` at the end. MCP: `trace_record` is stateful and gated by the ask / read-only policies (the ptrace
+source runs the real thread); `trace_info` and `trace_query` are read-only.
+
+**`.edt` file format** (little-endian, LEB128 varints, signed values zigzag): `"EDTRACE1"`, version `1`,
+JSON header (length-prefixed: name, source, created_ms, pid, tid, stop_reason, truncated, steps, keyframe,
+regs), the initial register file (20 × u64), the step count, then per step: Δpc (signed), a register change
+mask, `new XOR old` for each changed register, the access count and per access `len << 1 | write`, Δaddress
+(signed), the bytes (old, plus new for writes); then the instruction bytes per pc, the keyframes (full register
+file every `keyframe` steps, XOR-chained; checked against the steps on load) and an FNV-1a 64 checksum.
+
 ### Relay monitors
 
 Built on `modules` / `read`, so they work with every backend:
@@ -458,7 +506,7 @@ copies and `ui_import_pdb_type` changes the Structs catalog) and an object `outp
 **Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],
 "deny":[tool], "audit":bool }` (omitted fields keep their value; the reply echoes the policy and
 `audit_path`). Deny and allow lists apply to every tool. `ask` and `readonly` gate the calls that change
-the target (`write`, `freeze`, `ui_revert_patch`) and `dump`: `readonly` refuses them, `ask` sends the app window a
+the target (`write`, `freeze`, `ui_revert_patch`), `dump` and `trace_record` (its ptrace source runs the real thread): `readonly` refuses them, `ask` sends the app window a
 `ui_approve` provider call (`tool`, `verb`, `arguments` → `approved: bool`) and refuses when no window
 answers. Refusals are tool errors with code `4003`; the call log records `outcome: ok | error | denied`.
 With `audit` on, every call is appended to `<config>/EchoDebug/mcp-audit.jsonl`; `mcp_audit_export` returns

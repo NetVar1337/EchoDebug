@@ -38,6 +38,9 @@ pub mod monitor;
 pub mod pdbinfo;
 pub mod symbols;
 pub mod sync;
+pub mod trace;
+pub mod trace_emu;
+pub mod trace_rec;
 pub mod unwind;
 #[cfg(windows)]
 pub mod win_threads;
@@ -357,6 +360,12 @@ impl Relay {
                 v["id"] = orig;
                 return v;
             }
+            // Time-travel traces: recorded from the emulator or ptrace, stored and queried here.
+            v if crate::trace_rec::VERBS.contains(&v) => {
+                let mut v = crate::trace_rec::handle(self, req).await;
+                v["id"] = orig;
+                return v;
+            }
             // Monitors built on modules/read, so they work with every backend.
             "module_monitor" | "page_monitor" | "module_timeline" | "page_monitor_list" => {
                 let mut v = match verb.as_str() {
@@ -473,11 +482,7 @@ impl Relay {
         } else {
             Value::Object(req)
         };
-        let sent = up_tx.send(frame.to_string());
-        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
-        if sent.is_err() {
-            return error(orig, 2004, "upstream disconnected");
-        }
+        // register the reply slot before sending: a fast upstream can answer before the insert
         self.lock().pending.insert(
             id,
             Pending {
@@ -487,6 +492,12 @@ impl Relay {
                 reply: tx,
             },
         );
+        let sent = up_tx.send(frame.to_string());
+        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
+        if sent.is_err() {
+            self.lock().pending.remove(&id);
+            return error(orig, 2004, "upstream disconnected");
+        }
 
         match tokio::time::timeout(self.0.timeout, &mut rx).await {
             Ok(Ok(reply)) => reply,
