@@ -66,6 +66,7 @@ import { annotationHandlers } from "./annotations";
 import { analyzeCallees, directCallees, liveOptions, loadFunction, notDecompilable, type LiveFunction } from "./decomplive";
 import { decompile, irGraph, type Decompiled } from "./analysis/decompile";
 import { useDecomp, varTypesOf } from "@/store/decomp";
+import { heapHandlers } from "./heaptools";
 import { sehForMcp, tlsReport } from "./threadslive";
 
 export type Args = Record<string, unknown>;
@@ -468,6 +469,7 @@ provide("ui_approve", (args) => new Promise((resolve) => {
 
 // Names, comments, the patch journal and saved signatures (MCP tools list_names, set_name, …).
 for (const [verb, h] of Object.entries(annotationHandlers)) provide(verb, h);
+for (const [verb, h] of Object.entries(heapHandlers)) provide(verb, h);
 
 // Resource templates and completion (echodebug://names, memory/{address}/{size}, disasm/{address}, module/{name}/exports).
 provide("ui_names", async () => ({

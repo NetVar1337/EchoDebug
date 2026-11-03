@@ -428,6 +428,19 @@ Vectored exception handlers are not listed: ntdll keeps them in the private `Ldr
 with pointers encoded by `RtlEncodePointer` (a per-process cookie), so they cannot be enumerated reliably
 without undocumented internals.
 
+Heap explorer verbs (read-only; the walk is cached per process, `refresh:true` walks again):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_heaps` (`heaps`) | `refresh?` | `platform` (`glibc`/`windows`), `source` (how the heaps were found), `version?`, `heaps:[{id,kind,label,address,committed,reserved?,in_use,in_use_count,free,free_count,largest_free,fragmentation,chunks,counters,ranges,notes}]`, `bins:[{heap,kind,index,chunk_size,length,count?,total?,owner?,error?}]` (non-empty only), `errors:[{heap,address,message}]`, `notes`, `truncated` |
+| `ui_heap_chunks` (`heap_chunks`) | `heap?`, `state?` (a state, `free` or `used`), `min_size?`, `max_size?`, `offset?`, `limit?` (≤ 2000, default 200), `rtti?`, `refresh?` | `total`, `offset`, `limit`, `next_offset`, `chunks:[{address,user,size,user_size,state,flags,heap,bin?,note?,preview?,type?}]` |
+| `ui_heap_find` (`heap_find`) | `address`, `refresh?` | `found`, `chunk`, `offset_in_chunk`, `offset_in_user`, `heap`, `bins:[{kind,index,position,length}]` |
+
+Chunk states: `in-use`, `free`, `top`, `fencepost`, `mmapped`, `internal` (the allocator's own, e.g.
+`tcache_perthread_struct`), `tcache`, `fastbin`, `unsorted`, `smallbin`, `largebin` (glibc), `lfh` (a backend
+block holding an LFH subsegment; `note` has its busy count) and `large` (VirtualAlloc / segment-heap large
+allocations). Everything is read through the `read` verb, so the Windows heaps work on the Echo backend.
+
 `/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
 WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
 (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere; created with mode 0600);
