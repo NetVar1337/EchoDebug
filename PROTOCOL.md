@@ -293,6 +293,25 @@ stay open (Echo cannot send headers; those endpoints only receive requests). The
 regenerate the stored token (Settings or the MCP Server panel); the running relay switches to it at once
 (`Relay::set_token`), already-open sockets stay connected, and MCP clients must be re-added.
 
+## In-app assistant (desktop app, not the relay)
+
+The Assistant panel talks to the Anthropic Messages API (`POST https://api.anthropic.com/v1/messages`,
+`anthropic-version: 2026-10-21`, streamed). It is **not** a relay verb and is not reachable over
+`/client` or `/mcp`: the web view calls Tauri commands of the desktop app (`src-tauri/src/lib.rs`),
+which own the user's API key.
+
+| Command | Does |
+|---|---|
+| `assistant_key_status` | `{present, storage, path, note}`; never the key |
+| `assistant_set_key` / `assistant_clear_key` | store or remove the key: DPAPI-encrypted (`anthropic-key.dpapi`) on Windows, a mode-0600 file (`anthropic-key`) elsewhere, in the config directory above |
+| `assistant_send` | `id`, `body`, a channel that receives every SSE event; `relay/src/assistant.rs::prepare_body` refuses unknown top-level fields (e.g. `mcp_servers`), server tools, and any tool that does not map through `tools.json` to a verb that is read-only (`mcp::is_read_only`) and not on `ASSISTANT_DENY` (emulation, alerts, symbol downloads, …); `dbg_*`/`emu_*` are refused by prefix |
+| `assistant_cancel` | `id`: stops reading that stream |
+
+The assistant's tool calls run in the app window with the same verbs MCP uses (`ui_*` through the
+provider, everything else through `/client`), after the app checks the tool is allowed and the input
+matches its schema. Two app-local tools, `submit_name_suggestions` and `submit_struct_fields`, only fill
+review lists; names and fields change when the user accepts each entry.
+
 ## Versioning
 
 `protocol` is bumped on incompatible changes. The app shows a warning when the agent's `version`
