@@ -8,3 +8,5 @@ src-tauri/gen/
 !.vscode/extensions.json
 tsconfig.tsbuildinfo
 build/
+__pycache__/
+*.pyc

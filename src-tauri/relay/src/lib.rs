@@ -27,14 +27,23 @@ pub mod local_emu;
 pub mod local_emudbg;
 pub mod local_ext;
 pub mod local_more;
+pub mod local_threads;
 pub mod emux;
 pub mod lift;
 pub mod mcp;
 pub mod monitor;
+pub mod pdbinfo;
 pub mod symbols;
+pub mod sync;
+pub mod unwind;
+#[cfg(windows)]
+pub mod win_threads;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Reply (code 2006) to `threads` / `stack` / `handles` while the Echo agent is the backend.
+pub const THREADS_ECHO_UNSUPPORTED: &str = "the Echo backend can't list threads, call stacks or handles: Echo's script API has no thread enumeration, thread context or handle access (they work on the local Linux backend and natively on Windows without Echo)";
 
 const NATIVE_VERBS: &[&str] = &[
     "ping",
@@ -175,6 +184,8 @@ struct Inner {
     policy: Mutex<mcp::Policy>,
     /// module / page monitors (monitor.rs)
     monitors: Mutex<monitor::Monitors>,
+    /// IDA / Ghidra / Binary Ninja sync hub (sync.rs)
+    sync: Mutex<sync::Hub>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -198,6 +209,7 @@ impl Relay {
             token: Mutex::new(None),
             policy: Mutex::new(mcp::Policy::default()),
             monitors: Mutex::new(monitor::Monitors::default()),
+            sync: Mutex::new(sync::Hub::default()),
         }))
     }
 
@@ -306,9 +318,10 @@ impl Relay {
                     .unwrap_or_default();
                 return json!({ "type": "processes_result", "id": orig, "success": true, "processes": processes });
             }
-            // PDB symbols from a symbol server (or a local file), any backend.
-            "pdb_symbols" => {
-                let r = tokio::task::spawn_blocking(move || symbols::handle(&req)).await;
+            // PDB symbols, types and lines: local files, symbol stores and servers, any backend.
+            "pdb_symbols" | "pdb_fetch" | "pdb_progress" | "pdb_image" | "pdb_types" | "pdb_type" | "pdb_lines" => {
+                let v2 = verb.clone();
+                let r = tokio::task::spawn_blocking(move || symbols::handle_verb(&v2, &req)).await;
                 let mut v = r.unwrap_or_else(|e| error(Value::Null, 3003, &e.to_string()));
                 v["id"] = orig;
                 return v;
@@ -338,6 +351,12 @@ impl Relay {
                     "module_timeline" => monitor::module_timeline(self),
                     _ => monitor::page_monitor_list(self),
                 };
+                v["id"] = orig;
+                return v;
+            }
+            // Disassembler sync hub (IDA / Ghidra / Binary Ninja on /sync); see sync.rs.
+            "sync_status" | "sync_config" | "sync_send" | "sync_log" => {
+                let mut v = self.sync_verb(&verb, &req);
                 v["id"] = orig;
                 return v;
             }
@@ -373,6 +392,35 @@ impl Relay {
                     "tools": TOOLS.len(),
                     "policy": self.policy().to_json(),
                 });
+            }
+            // Threads / call stacks / handles: Echo's script API has no thread enumeration,
+            // thread context or handle access, so the Echo agent cannot answer them. Without Echo the
+            // relay serves them itself (Linux local backend, or natively on Windows).
+            "threads" | "stack" | "handles" => {
+                let (ext_up, target_pid) = {
+                    let s = self.lock();
+                    (s.ext.is_some(), s.target.get("pid").and_then(Value::as_u64))
+                };
+                if ext_up {
+                    return error(orig, 2006, THREADS_ECHO_UNSUPPORTED);
+                }
+                #[cfg(windows)]
+                {
+                    let pid = req.get("pid").and_then(Value::as_u64).or(target_pid).map(|p| p as u32);
+                    let Some(pid) = pid else {
+                        return error(orig, 3001, "not attached: pass 'pid' or attach to a process first");
+                    };
+                    let mut r = tokio::task::spawn_blocking(move || win_threads::handle(&req, pid))
+                        .await
+                        .unwrap_or_else(|e| error(json!(0), 3003, &e.to_string()));
+                    r["id"] = orig;
+                    return r;
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = target_pid;
+                    Kind::Ext
+                }
             }
             v if v.starts_with(PROVIDER_PREFIX) => Kind::Provider,
             v if NATIVE_VERBS.contains(&v) => Kind::Agent,
@@ -1150,6 +1198,22 @@ async fn client_ws(
     ws.on_upgrade(move |s| relay.client(s))
 }
 
+/// `/sync`: disassembler plugins (IDA, Ghidra, Binary Ninja). Token-protected like `/client`.
+async fn sync_ws(
+    State(relay): State<Relay>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !auth::authorized(relay.token().as_deref(), &headers, query.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    ws.on_upgrade(move |s| relay.sync_socket(s))
+}
+
 fn upstream_ws(relay: Relay, kind: Kind, headers: &HeaderMap, ws: WebSocketUpgrade) -> Response {
     // Echo connects without an Origin; anything with one is a browser page. No token here: Echo's
     // `process::open_socket(url)` and the agent's `ws::connect` dial a fixed URL baked into the agent
@@ -1298,6 +1362,7 @@ pub fn router(relay: Relay) -> Router {
         .route("/agent", get(agent_ws))
         .route("/ext", get(ext_ws))
         .route("/client", get(client_ws))
+        .route("/sync", get(sync_ws))
         .route("/health", get(health))
         .route("/mcp", post(mcp).get(mcp_events))
         .with_state(relay)

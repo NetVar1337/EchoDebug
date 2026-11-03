@@ -6,7 +6,8 @@
 // which addresses are the busiest hubs in the module.
 import { useEffect, useMemo, useState } from "react";
 import { ArrowDownToLine, ArrowUpFromLine, Crosshair, Search } from "lucide-react";
-import { fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
+import { fmtAddr, parseAddress, toBig } from "@/lib/hex";
+import { symAddr } from "@/lib/pdb";
 import { loadImage } from "@/lib/memory";
 import { buildXrefIndex, executableRanges, type Xref, type XrefIndex } from "@/lib/analysis/xrefindex";
 import { useConn } from "@/store/conn";
@@ -84,7 +85,7 @@ export default function XrefView() {
   const shownHubs = useMemo(() => {
     const f = filter.toLowerCase();
     if (!f) return hubs;
-    return hubs.filter((h) => labelAddr("0x" + (base + BigInt(h.rva)).toString(16), modules).toLowerCase().includes(f));
+    return hubs.filter((h) => symAddr("0x" + (base + BigInt(h.rva)).toString(16), modules).toLowerCase().includes(f));
   }, [hubs, filter, base, modules]);
 
   const goto = (rva: number) => {
@@ -112,7 +113,7 @@ export default function XrefView() {
               {wide.map((w) => (
                 <div key={w.address} className="fn-row" onClick={() => (w.kind === "pointer" ? ui.goMemory(w.address) : ui.goDisasm(w.address))}>
                   <span className="tag">{w.kind}</span>
-                  <span className="mono grow ellipsis">{labelAddr(w.address, modules)}</span>
+                  <span className="mono grow ellipsis">{symAddr(w.address, modules)}</span>
                   {w.text && <span className="faint mono ellipsis" style={{ maxWidth: 180 }}>{w.text}</span>}
                 </div>
               ))}
@@ -134,7 +135,7 @@ export default function XrefView() {
                 <div key={`${x.fromRva}-${i}`} className="fn-row" onClick={() => goto(x.fromRva)}>
                   <span className="tag">{x.kind}</span>
                   <span className="mono grow ellipsis">{fmtAddr(base + BigInt(x.fromRva))}</span>
-                  <span className="faint mono ellipsis" style={{ maxWidth: 150 }}>{labelAddr("0x" + (base + BigInt(x.toRva)).toString(16), modules)}</span>
+                  <span className="faint mono ellipsis" style={{ maxWidth: 150 }}>{symAddr("0x" + (base + BigInt(x.toRva)).toString(16), modules)}</span>
                 </div>
               ))
             )}
@@ -159,7 +160,7 @@ export default function XrefView() {
                   return (
                     <tr key={h.rva}>
                       <td className="link" onClick={() => goto(h.rva)}>{fmtAddr(base + BigInt(h.rva))}</td>
-                      <td className="ellipsis" style={{ maxWidth: 220 }}>{labelAddr(a, modules)}</td>
+                      <td className="ellipsis" style={{ maxWidth: 220 }}>{symAddr(a, modules)}</td>
                       <td className="right dim">{h.count}</td>
                       <td>
                         <button className="row-action" title="Use as the xref target" onClick={() => { setAddr(a); setDir("to"); }}><Crosshair size={12} /></button>

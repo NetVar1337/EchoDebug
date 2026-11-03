@@ -409,6 +409,17 @@ html[data-motion="off"] *::after {
 .vtrace .pill { padding: 0 5px; font-size: 11px; }
 .toolbar.wrap { flex-wrap: wrap; height: auto; padding-top: 6px; padding-bottom: 6px; }
 
+/* Sync panel */
+.sync-peer { display: flex; flex-direction: column; gap: 3px; padding: 4px 0; border-bottom: 1px solid var(--border-soft); }
+.sync-peer:last-of-type { border-bottom: none; }
+
+/* Plugins */
+.address-menu { z-index: 200; }
+.plugin-view { min-height: 100%; padding: var(--pad-md); font-size: var(--type-small); }
+.plugin-analysis { border-bottom: 1px solid var(--border-soft); }
+.plugin-consent { flex-basis: 100%; display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; font-size: var(--type-small); background: var(--bg-0); border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-radius: var(--radius-sm); }
+.plugin-consent ul { margin: 0; padding-left: 18px; color: var(--text-dim); }
+
 /* value graphs */
 .btn[data-active="true"] { border-color: var(--accent); color: var(--accent); }
 .vgraph { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: auto; }

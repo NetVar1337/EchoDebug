@@ -14,6 +14,8 @@ import { pseudocode } from "@/lib/analysis/pseudocode";
 import { resolveSwitch } from "@/lib/analysis/jumptables";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
+import { useSymbols } from "@/store/symbols";
+import { protoAt, symAddr } from "@/lib/pdb";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { IconButton, NeedsAgent, Progress } from "../ui";
@@ -28,6 +30,7 @@ export default function CfgView() {
   const modules = useConn((s) => s.modules);
   const backend = useConn((s) => s.backend);
   const names = useNames();
+  const symVersion = useSymbols((s) => s.version);
   const [mode, setMode] = useState<"graph" | "pseudo">("graph");
   const root = ui.disasmAt;
   const [cfg, setCfg] = useState<Cfg | null>(null);
@@ -114,7 +117,7 @@ export default function CfgView() {
           <span className="panel-title">CFG</span>
           <button className="btn small" data-active={mode === "graph"} onClick={() => setMode("graph")}>Graph</button>
           <button className="btn small" data-active={mode === "pseudo"} onClick={() => setMode("pseudo")}>Pseudocode</button>
-          <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || labelAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges · ${structure?.loops.length ?? 0} loops` : ""}</span>
+          <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || symAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges · ${structure?.loops.length ?? 0} loops` : ""}</span>
           {mode === "graph" && (
             <>
               <span className="faint" style={{ fontSize: 12 }}><span style={{ color: "var(--success)" }}>taken</span> · <span style={{ color: "var(--danger)" }}>fall-through</span> · <span style={{ color: "var(--accent)" }}>jump / case</span> · <span style={{ color: "var(--warning)" }}>loop</span></span>
@@ -128,7 +131,7 @@ export default function CfgView() {
         {busy && <Progress value={0.5} />}
         {mode === "pseudo" ? (
           structure && structure.blocks.length ? (
-            <Pseudo structure={structure} abi={backend === "local" ? "sysv" : "win64"} nameOf={names.nameOf} onGo={ui.goDisasm} />
+            <Pseudo structure={structure} abi={backend === "local" ? "sysv" : "win64"} nameOf={names.nameOf} symbols={symVersion} onGo={ui.goDisasm} />
           ) : (
             <div className="empty"><div className="empty-title">{busy ? "Disassembling…" : root ? "No instructions." : "Open a function in the disassembly."}</div></div>
           )
@@ -188,12 +191,13 @@ export default function CfgView() {
   );
 }
 
-function Pseudo({ structure, abi, nameOf, onGo }: { structure: ReturnType<typeof buildStructure>; abi: "win64" | "sysv"; nameOf: (a: string) => string; onGo: (a: string) => void }) {
-  const out = useMemo(() => pseudocode(structure, { abi, nameOf }), [structure, abi, nameOf]);
+function Pseudo({ structure, abi, nameOf, symbols, onGo }: { structure: ReturnType<typeof buildStructure>; abi: "win64" | "sysv"; nameOf: (a: string) => string; symbols: number; onGo: (a: string) => void }) {
+  // `symbols` changes when a PDB loads: its prototypes name the arguments and the return
+  const out = useMemo(() => pseudocode(structure, { abi, nameOf, protoOf: protoAt }), [structure, abi, nameOf, symbols]);
   return (
     <div className="vlist listing pseudo">
       <div className="pseudo-note">
-        structured pseudocode (experimental) · registers stay registers, no types are recovered, calls show the {abi === "win64" ? "rcx/rdx/r8/r9" : "rdi/rsi/rdx/rcx/r8/r9"} arguments
+        structured pseudocode (experimental) · registers stay registers, types come only from a loaded PDB (signature and callee arguments), calls show the {abi === "win64" ? "rcx/rdx/r8/r9" : "rdi/rsi/rdx/rcx/r8/r9"} arguments
         written before them, switch jump tables are not structured, anything unrecognised is kept as the asm line in a comment
       </div>
       {out.map((l, i) => (
