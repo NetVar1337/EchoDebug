@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { health, locate } from "./sigrepair";
+import { classify, countRelocation, health, locate } from "./sigrepair";
 
 describe("signature repair", () => {
   it("classifies hit counts", () => {
@@ -27,5 +27,19 @@ describe("signature repair", () => {
     const p = [1, 2, 3, 4, 5, 6, 7, 8];
     expect((await locate(p, async (ida) => (ida.split(" ").length <= 7 ? ["0x1", "0x2"] : []))).status).toBe("ambiguous");
     expect((await locate(p, async () => [])).status).toBe("lost");
+  });
+});
+
+describe("relocation / health classification", () => {
+  it("classifies scan results against the saved RVA", () => {
+    expect(classify(0x10n, [0x10n])).toEqual({ status: "ok", rva: 0x10n });
+    expect(classify(0x10n, [0x20n])).toEqual({ status: "moved", rva: 0x20n });
+    expect(classify(undefined, [0x20n])).toEqual({ status: "ok", rva: 0x20n });
+    expect(classify(0x10n, [0x10n, 0x20n])).toEqual({ status: "ambiguous" });
+    expect(classify(0x10n, [])).toEqual({ status: "missing" });
+  });
+
+  it("counts matched / moved / lost", () => {
+    expect(countRelocation(["ok", "moved", "moved", "ambiguous", "missing", "nosig"])).toEqual({ matched: 1, moved: 2, lost: 3 });
   });
 });
