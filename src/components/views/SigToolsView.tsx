@@ -5,14 +5,14 @@ import { fmtAddr, labelAddr, moduleOf, toBig, type Module } from "@/lib/hex";
 import { genInput, moduleFunctions } from "@/lib/flirtlive";
 import { saveBinary, saveText } from "@/lib/save";
 import { makeSignature, toCode, toIda, type Insn, type Pattern } from "@/lib/analysis/sigmaker";
-import { health, locate, type Health } from "@/lib/analysis/sigrepair";
+import { classify, health, locate, type Located } from "@/lib/analysis/sigrepair";
 import { parseFlirt } from "@/lib/analysis/flirt";
 import { toPatEntry, toPatFile, writeSig, type PatEntry } from "@/lib/analysis/flirtgen";
 import { useConn } from "@/store/conn";
 import { useFlirt } from "@/store/flirt";
 import { useNames } from "@/store/names";
 import { log } from "@/store/output";
-import { useSigs } from "@/store/sigs";
+import { useSigs, type Signature } from "@/store/sigs";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { NeedsAgent, Progress, Tabs } from "../ui";
@@ -33,21 +33,55 @@ function HealthTab() {
   const modules = useConn((s) => s.modules);
   const ui = useUi();
   const catalog = useSigs();
-  const [state, setState] = useState<Record<string, { health: Health; hits: number; note?: string; candidates?: string[] }>>({});
+  const [state, setState] = useState<Record<string, { health: Located["status"]; hits: number; note?: string; candidates?: string[]; oldRva?: string; newRva?: string }>>({});
   const [busy, setBusy] = useState(0);
   const mainName = () => modules.find((m) => m.base === useConn.getState().target?.base)?.name ?? modules[0]?.name ?? "";
+  const modNamed = (name: string) => modules.find((m) => m.name.toLowerCase() === name.toLowerCase());
+  /** the RVA a signature was saved at: its recorded rva, else its address if that lies in the module */
+  const savedRva = (s: Signature, m: Module): bigint | undefined => {
+    if (s.rva) return toBig(s.rva);
+    const a = s.address ? toBig(s.address) : null;
+    return a !== null && moduleOf(a, modules)?.base === m.base ? a - toBig(m.base) : undefined;
+  };
 
   const check = async () => {
     const out: typeof state = {};
     setBusy(0.05);
     // one sig_scan_batch per module instead of a request per signature
     const hits = await scanGrouped(catalog.sigs.map((s) => ({ ida: s.ida, module: s.module || mainName() })), 1);
-    catalog.sigs.forEach((s, i) => (out[s.id] = { health: health(hits[i].count), hits: hits[i].count }));
+    catalog.sigs.forEach((s, i) => {
+      const m = modNamed(s.module || mainName());
+      const at = hits[i].count === 1 && hits[i].results[0] && m ? toBig(hits[i].results[0]) - toBig(m.base) : undefined;
+      const old = m ? savedRva(s, m) : undefined;
+      // a unique match away from the saved RVA has moved (a plain ASLR rebase keeps the RVA)
+      const c = at !== undefined ? classify(old, [at]) : { status: health(hits[i].count) };
+      out[s.id] = { health: c.status, hits: hits[i].count, oldRva: old !== undefined ? fmtAddr(old) : undefined, newRva: at !== undefined ? fmtAddr(at) : undefined };
+      if (c.status === "ok" && at !== undefined && m && (!s.rva || s.address !== fmtAddr(toBig(m.base) + at)))
+        catalog.update(s.id, { rva: fmtAddr(at), address: fmtAddr(toBig(m.base) + at), hits: 1 });
+    });
     setState(out);
     setBusy(0);
-    const bad = Object.values(out).filter((x) => x.health !== "ok").length;
-    log(bad ? "warn" : "info", "sigs", `${catalog.sigs.length - bad} of ${catalog.sigs.length} signatures match exactly once`);
+    const n = (k: Located["status"]) => Object.values(out).filter((x) => x.health === k).length;
+    log(n("ok") === catalog.sigs.length ? "info" : "warn", "sigs", `${n("ok")} of ${catalog.sigs.length} signatures match exactly once where they were saved${n("moved") ? `, ${n("moved")} moved` : ""}${n("missing") ? `, ${n("missing")} missing` : ""}${n("ambiguous") ? `, ${n("ambiguous")} ambiguous` : ""}`);
   };
+  /** Points every moved signature at its new match. */
+  const updateMoved = () => {
+    const next = { ...state };
+    for (const s of catalog.sigs) {
+      const st = state[s.id];
+      const m = modNamed(s.module || mainName());
+      if (st?.health !== "moved" || !st.newRva || !m) continue;
+      catalog.update(s.id, { address: fmtAddr(toBig(m.base) + toBig(st.newRva)), rva: st.newRva, hits: 1 });
+      next[s.id] = { ...st, health: "ok", oldRva: st.newRva, note: `moved from ${st.oldRva ?? "?"}` };
+    }
+    setState(next);
+  };
+  const report = () =>
+    void saveText("echodebug-signature-health.json", JSON.stringify({
+      checkedAt: new Date().toISOString(),
+      signatures: catalog.sigs.filter((s) => state[s.id]).map((s) => ({ id: s.id, name: s.name, module: s.module || mainName(), ida: s.ida, ...state[s.id] })),
+    }, null, 2), { name: "Signature health report", extensions: ["json"] });
+  const moved = Object.values(state).filter((x) => x.health === "moved").length;
   const repair = async (id: string) => {
     const s = catalog.sigs.find((x) => x.id === id);
     if (!s) return;
@@ -56,7 +90,8 @@ function HealthTab() {
     if (r.status === "repaired" && r.at) {
       const fresh = await uniqueAt(r.at, mod);
       if (!fresh) return setState((st) => ({ ...st, [id]: { ...st[id], note: `found at ${labelAddr(r.at!, modules)}, but no new unique signature there` } }));
-      catalog.update(id, { pattern: fresh.pattern, address: r.at, hits: 1, note: `${s.note ? s.note + " · " : ""}repaired ${new Date().toISOString().slice(0, 10)} (was ${s.address})` });
+      const m = modNamed(mod);
+      catalog.update(id, { pattern: fresh.pattern, address: r.at, rva: m ? fmtAddr(toBig(r.at) - toBig(m.base)) : undefined, hits: 1, note: `${s.note ? s.note + " · " : ""}repaired ${new Date().toISOString().slice(0, 10)} (was ${s.address})` });
       setState((st) => ({ ...st, [id]: { health: "ok", hits: 1, note: `repaired: now at ${labelAddr(r.at!, modules)}` } }));
       log("info", "sigs", `${s.name}: repaired at ${labelAddr(r.at, modules)}`);
     } else if (r.status === "ambiguous") {
@@ -68,7 +103,9 @@ function HealthTab() {
     <>
       <div className="toolbar">
         <button className="btn small primary" disabled={!catalog.sigs.length || busy > 0} onClick={() => void check()}>Check all {catalog.sigs.length} signatures</button>
-        <span className="faint" style={{ fontSize: 12 }}>Each saved signature is scanned in its module: it must match exactly once. Repair shortens a broken pattern until it finds the function again, then derives a new unique one there.</span>
+        <button className="btn small" disabled={!moved} onClick={updateMoved}>Update {moved} moved</button>
+        <button className="btn small" disabled={!Object.keys(state).length} onClick={report}>Report</button>
+        <span className="faint" style={{ fontSize: 12 }}>Each saved signature is scanned in its module: it must match exactly once, at the RVA it was saved at (moved ones can be updated in one click). Repair shortens a broken pattern until it finds the function again, then derives a new unique one there.</span>
       </div>
       {busy > 0 && <Progress value={busy} />}
       <div className="vlist">
@@ -81,12 +118,12 @@ function HealthTab() {
                 <tr key={s.id}>
                   <td>{s.name}</td>
                   <td className="faint">{s.module || "main"}</td>
-                  <td className={st?.health === "ok" ? "ok" : st ? "danger" : "faint"} title={st?.note}>
-                    {st ? `${st.health}${st.health !== "ok" ? ` (${st.hits})` : ""}` : "—"}{st?.note ? <div className="faint" style={{ fontSize: 11 }}>{st.note}</div> : null}
+                  <td className={st?.health === "ok" ? "ok" : st?.health === "moved" ? "warn" : st ? "danger" : "faint"} title={st?.note}>
+                    {st ? `${st.health}${st.health === "moved" ? ` ${st.oldRva ?? "?"} → ${st.newRva}` : st.health !== "ok" ? ` (${st.hits})` : ""}` : "—"}{st?.note ? <div className="faint" style={{ fontSize: 11 }}>{st.note}</div> : null}
                     {st?.candidates?.slice(0, 6).map((c) => <div key={c} className="link" style={{ fontSize: 11 }} onClick={() => ui.goDisasm(c)}>{labelAddr(c, modules)}</div>)}
                   </td>
                   <td className="ellipsis" title={s.ida}>{s.ida}</td>
-                  <td>{st && st.health !== "ok" && <button className="row-action" onClick={() => void repair(s.id)}>repair</button>}</td>
+                  <td>{st && st.health !== "ok" && st.health !== "moved" && <button className="row-action" onClick={() => void repair(s.id)}>repair</button>}</td>
                 </tr>
               );
             })}
