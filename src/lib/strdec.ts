@@ -60,6 +60,38 @@ export function decryptScore(lines: readonly ListingLine[]): { score: number; re
 
 const kCall = /\bcall\s+(?:qword\s+\[\s*)?(?:0x([0-9a-fA-F]+)|([A-Za-z_][\w.]*))/i;
 
+export type DisasmOf = (addr: string, size: number) => Promise<ListingLine[]>;
+
+/**
+ * Auto-detects the decryption routine called from a function: disassembles the function, plans a
+ * campaign (fetching each call target's body through `disasmOf`, bounded), and returns the
+ * best-scoring target — or null when nothing looks like a decryptor.
+ */
+export async function detectDecryptRoutine(
+  funcLines: readonly ListingLine[],
+  disasmOf: DisasmOf,
+  opts: { maxTargets?: number; bodySize?: number; minScore?: number } = {},
+): Promise<DecryptCandidate | null> {
+  const maxTargets = opts.maxTargets ?? 24;
+  const bodySize = opts.bodySize ?? 0x400;
+  const direct = funcLines
+    .map((l) => l.text.match(kCall))
+    .filter((m): m is RegExpMatchArray => !!m && !!m[1])
+    .map((m) => `0x${m[1]!.toLowerCase()}`)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .slice(0, maxTargets);
+  const bodies = new Map<string, ListingLine[]>();
+  await Promise.all(
+    direct.map(async (t) => {
+      bodies.set(t.toLowerCase(), await disasmOf(t, bodySize).catch(() => []));
+    }),
+  );
+  const campaign = planDecryptionCampaign(funcLines, bodies);
+  const top = campaign.candidates[0];
+  if (!top || top.score < (opts.minScore ?? 5)) return null;
+  return top;
+}
+
 /**
  * Plans a decryption campaign for a function: every direct `call 0x…` target that has a body in
  * `bodies` (addr → lines) is scored; indirect calls (`call rax` etc.) are listed separately.

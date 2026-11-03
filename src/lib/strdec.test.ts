@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decryptScore, planDecryptionCampaign } from "./strdec";
+import { detectDecryptRoutine, decryptScore, planDecryptionCampaign } from "./strdec";
 import type { ListingLine } from "./analysis/listing";
 
 const decryptor: ListingLine[] = [
@@ -39,5 +39,38 @@ describe("decryption campaign", () => {
     expect(c.candidates[0].callSite).toBe("0x1000");
     expect(c.plan[0]).toBe("0x5000");
     expect(c.candidates.find((x) => x.target === "0x7000")?.reasons).toEqual(["external/unknown body"]);
+  });
+});
+
+describe("detectDecryptRoutine (#16)", () => {
+  const disasmOf = async (addr: string, _size: number): Promise<ListingLine[]> => {
+    if (addr === "0x5000") return decryptor;
+    if (addr === "0x6000") return plain;
+    return [];
+  };
+
+  it("picks the high-scoring decryptor among the function's calls", async () => {
+    const top = await detectDecryptRoutine(func, disasmOf);
+    expect(top?.target).toBe("0x5000");
+    expect(top!.score).toBeGreaterThanOrEqual(5);
+  });
+
+  it("returns null when nothing scores like a decryptor", async () => {
+    const boring: ListingLine[] = [
+      { address: "0x1000", bytes: "", text: "call 0x6000" },
+      { address: "0x1005", bytes: "", text: "ret" },
+    ];
+    expect(await detectDecryptRoutine(boring, disasmOf)).toBeNull();
+  });
+
+  it("bounds the number of target bodies fetched", async () => {
+    let fetched = 0;
+    const many: ListingLine[] = Array.from({ length: 50 }, (_, i) => ({ address: `0x${(0x8000 + i * 5).toString(16)}`, bytes: "", text: `call 0x${(0x9000 + i * 0x100).toString(16)}` }));
+    const counting = async (addr: string, size: number) => {
+      fetched++;
+      return disasmOf(addr, size);
+    };
+    await detectDecryptRoutine(many, counting, { maxTargets: 10 });
+    expect(fetched).toBe(10);
   });
 });

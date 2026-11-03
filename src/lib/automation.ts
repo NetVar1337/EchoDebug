@@ -8,7 +8,10 @@
 // "$event.<field>" placeholders in args are substituted from the event frame.
 import { globMatch } from "./audit";
 
-export type TriggerEvent = "alert" | "watch" | "page_changed" | "module_loaded" | "module_unloaded" | "scan_done" | "breakpoint";
+export type TriggerEvent =
+  | "alert" | "watch" | "page_changed" | "module_loaded" | "module_unloaded" | "scan_done" | "breakpoint"
+  // relay event names as they arrive on /client
+  | "alert_event" | "freeze_error" | "progress" | "log" | "hello" | "attached" | "detached";
 
 export type Action =
   | { kind: "verb"; verb: string; args?: Record<string, unknown> }
