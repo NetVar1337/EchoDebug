@@ -1,0 +1,19 @@
+{
+  "pluginmetadataversion": 2,
+  "name": "EchoDebug sync",
+  "type": ["ui", "helper"],
+  "api": ["python3"],
+  "description": "Live two-way sync of the cursor, names and comments with EchoDebug, plus struct types pushed from EchoDebug.",
+  "longdescription": "Connects to the EchoDebug relay (ws://127.0.0.1:47110/sync) with the relay token from the EchoDebug config folder. Locations travel as module name + RVA, so rebased views line up with the live module. See integrations/README.md in the EchoDebug repository.",
+  "license": { "name": "GPL-3.0", "text": "Part of EchoDebug, licensed under the GNU General Public License v3.0." },
+  "platforms": ["Windows", "Linux", "Darwin"],
+  "installinstructions": {
+    "Windows": "Copy this folder into the plugins folder and put echodebug_sync.py (integrations/python) next to __init__.py.",
+    "Linux": "Copy this folder into the plugins folder and put echodebug_sync.py (integrations/python) next to __init__.py.",
+    "Darwin": "Copy this folder into the plugins folder and put echodebug_sync.py (integrations/python) next to __init__.py."
+  },
+  "dependencies": {},
+  "version": "1.0.0",
+  "author": "EchoDebug",
+  "minimumbinaryninjaversion": 3164
+}
