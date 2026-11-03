@@ -73,6 +73,7 @@ mod imp {
     };
 
     use crate::dbg_core::{self as core, arg_addr, bad, failed, hex, with_mon, Abi, Backend, Cmd, Export, Gprs, Hook, HwSlot};
+    use crate::dbg_ext::{self as ext, Host};
     use crate::local::{MapLine, MemIo};
     use crate::local_dbg::{shadow_set, unshadow};
 
@@ -336,6 +337,31 @@ mod imp {
         pause_silent: bool,
         attach_done: bool,
         exited: bool,
+        /// the module list for expressions, re-read at most every 2 s
+        mods: ext::ModCache,
+    }
+
+    impl Host for Dbg {
+        fn host_read(&self, addr: u64, buf: &mut [u8]) -> usize {
+            self.read(addr, buf)
+        }
+        fn host_modules(&self) -> Vec<(String, u64, u64)> {
+            let mut c = self.mods.borrow_mut();
+            if let Some((t, m)) = c.as_ref() {
+                if t.elapsed() < Duration::from_secs(2) {
+                    return m.clone();
+                }
+            }
+            let m = self.io.modules().unwrap_or_default();
+            *c = Some((Instant::now(), m.clone()));
+            m
+        }
+        fn host_maps(&self) -> Vec<MapLine> {
+            self.io.maps().unwrap_or_default()
+        }
+        fn host_pid(&self) -> u32 {
+            self.pid
+        }
     }
 
     // SAFETY: the handles are only used from the debugger thread that owns this value.
@@ -372,7 +398,15 @@ mod imp {
         }
 
         fn needed(&self, addr: u64) -> bool {
-            self.user.contains(&addr) || with_mon(ABI, |m| m.api.is_site(addr))
+            self.user.contains(&addr) || with_mon(ABI, |m| m.api.is_site(addr) || m.breaks.is_temp(addr))
+        }
+
+        /// A user or temporary breakpoint at `at` was hit: evaluate its condition and log text.
+        fn bp_hit(&self, at: u64, user: bool, tid: u32, regs: &Gprs) -> ext::Outcome {
+            let modules = self.host_modules();
+            let read = |a: u64, b: &mut [u8]| self.read(a, b);
+            let mut ctx = ext::Ctx { regs, read: &read, abi: ABI, tid: tid as u64, pid: self.pid, hits: 0, modules: &modules };
+            with_mon(ABI, |m| m.breaks.hit(at, user, &mut ctx))
         }
 
         fn plant(&mut self, addr: u64) -> Result<(), String> {
@@ -461,6 +495,10 @@ mod imp {
         }
 
         fn stop_event(&mut self, tid: u32, reason: &str, extra: Value) -> Value {
+            // any stop ends a step over / step out / run to
+            for a in with_mon(ABI, |m| m.breaks.take_temps()) {
+                self.unplant_if_unused(a);
+            }
             let regs = self.regs(tid).unwrap_or_default();
             let mut ev = json!({ "type": "event", "event": "dbg_stop", "reason": reason, "tid": tid, "address": hex(regs.rip), "regs": regs.to_json() });
             if let (Value::Object(e), Value::Object(x)) = (&mut ev, extra) {
@@ -507,10 +545,32 @@ mod imp {
             if let Some(site) = ret_site {
                 let _ = self.plant(site);
             }
-            if user {
-                set_ctx(h, &c);
-                let ev = self.stop_event(tid, "breakpoint", json!({}));
-                return Next::Hold(DBG_CONTINUE, ev);
+            if user || with_mon(ABI, |m| m.breaks.is_temp(addr)) {
+                let out = self.bp_hit(addr, user, tid, &regs);
+                for ev in out.events {
+                    self.relay.emit(ev);
+                }
+                if out.stop {
+                    set_ctx(h, &c);
+                    if out.remove {
+                        // single-shot
+                        self.user.remove(&addr);
+                        with_mon(ABI, |m| m.breaks.opts.remove(&addr));
+                        self.unplant_if_unused(addr);
+                    }
+                    let ev = self.stop_event(tid, out.reason, out.extra);
+                    return Next::Hold(DBG_CONTINUE, ev);
+                }
+                // condition false / another thread / a deeper frame: step past the int3 with the
+                // other threads suspended (none may slip past it meanwhile) and run on
+                if let Some(orig) = self.planted.get(&addr).copied() {
+                    let _ = self.write_byte(addr, orig);
+                    c.0.EFlags |= TF;
+                    self.rearm.insert(tid, Rearm::Int3(addr));
+                    set_ctx(h, &c);
+                    self.suspend_others(tid);
+                    return Next::Go(DBG_CONTINUE, None);
+                }
             }
             // API monitor: log and run on (other threads keep running; one passing the
             // function during the single step is not logged)
@@ -761,7 +821,7 @@ mod imp {
                 if let Some(mut c) = get_ctx(h) {
                     let rip = c.0.Rip;
                     let mut step = false;
-                    if self.user.contains(&rip) {
+                    if self.user.contains(&rip) || with_mon(ABI, |m| m.breaks.is_temp(rip)) {
                         if let Some(orig) = self.planted.get(&rip).copied() {
                             let _ = self.write_byte(rip, orig);
                             self.rearm.insert(tid, Rearm::Int3(rip));
@@ -803,7 +863,8 @@ mod imp {
             }).collect();
             json!({ "type": "dbg_status_result", "success": true, "active": true, "backend": "windows", "pid": self.pid,
                 "state": if stopped { "stopped" } else { "running" }, "focus": self.focus, "threads": threads,
-                "breakpoints": self.user.iter().map(|a| hex(*a)).collect::<Vec<_>>(), "hardware": hw, "last": self.last,
+                "breakpoints": self.user.iter().map(|a| hex(*a)).collect::<Vec<_>>(), "breakpoint_info": with_mon(ABI, |m| m.breaks.list_json(self.user.iter().copied())),
+                "hardware": hw, "last": self.last,
                 "auto": self.auto, "api_hooks": with_mon(ABI, |m| m.api.hooks.len()), "traces": core::traces_json(ABI) })
         }
 
@@ -818,6 +879,7 @@ mod imp {
             with_mon(ABI, |m| {
                 m.api.stop();
                 m.traces.iter_mut().flatten().for_each(|t| t.active = false);
+                m.breaks.reset();
             });
             self.user.clear();
             for (a, b) in std::mem::take(&mut self.planted) {
@@ -924,6 +986,27 @@ mod imp {
             }
             let mods = self.io.modules().map_err(|e| format!("cannot list modules: {e}"))?;
             self.resolve_in(&mods, module, name, 0).map_err(|e| format!("{spec}: {e}"))
+        }
+
+        /// Plants a temporary breakpoint and continues; with `wait_ms`, pumps events until the
+        /// process stops again (or exits) and returns that stop.
+        fn run_temp(&mut self, verb: &str, t: ext::Temp, mut plan: Value, req: &Map<String, Value>) -> Value {
+            if let Err(e) = core::check_code(&self.io, t.addr).and_then(|()| self.plant(t.addr)) {
+                return failed(e);
+            }
+            plan["target"] = json!(hex(t.addr));
+            plan["reason"] = json!(t.reason);
+            with_mon(ABI, |m| m.breaks.temps.push(t));
+            self.resume();
+            let mut reply = json!({ "type": format!("{verb}_result"), "success": true, "state": "running", "plan": plan });
+            let wait = req.get("wait_ms").and_then(Value::as_u64).unwrap_or(0).min(15_000);
+            if wait > 0 && self.pump_until_held(Duration::from_millis(wait)) {
+                reply["state"] = json!("stopped");
+                reply["stop"] = self.last.clone();
+            } else if self.exited {
+                reply["state"] = json!("exited");
+            }
+            reply
         }
 
         /// A dbg_step that did not complete: clear the trap flag, put the breakpoint back.
@@ -1049,16 +1132,27 @@ mod imp {
                     let Some(addr) = arg_addr(req, "address") else { return bad("dbg_break requires 'address'") };
                     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                     if enabled {
+                        let opts = match with_mon(ABI, |m| ext::parse_opts(req, m.breaks.opts.get(&addr))) {
+                            Ok(o) => o,
+                            Err(e) => return bad(&e),
+                        };
                         if let Err(e) = core::check_code(&self.io, addr).and_then(|()| self.plant(addr)) {
                             return failed(e);
                         }
                         self.user.insert(addr);
-                    } else if self.user.remove(&addr) && !self.needed(addr) {
-                        if let Err(e) = self.unplant(addr) {
-                            return failed(e);
+                        if let Some(o) = opts {
+                            with_mon(ABI, |m| m.breaks.opts.insert(addr, o));
+                        }
+                    } else if self.user.remove(&addr) {
+                        with_mon(ABI, |m| m.breaks.opts.remove(&addr));
+                        if !self.needed(addr) {
+                            if let Err(e) = self.unplant(addr) {
+                                return failed(e);
+                            }
                         }
                     }
-                    json!({ "type": "dbg_break_result", "success": true, "breakpoints": self.user.iter().map(|a| hex(*a)).collect::<Vec<_>>() })
+                    json!({ "type": "dbg_break_result", "success": true, "breakpoints": self.user.iter().map(|a| hex(*a)).collect::<Vec<_>>(),
+                        "breakpoint_info": with_mon(ABI, |m| m.breaks.list_json(self.user.iter().copied())) })
                 }
                 "dbg_hwbreak" => {
                     let (slot, val) = match core::parse_hwbreak(req) {
@@ -1195,6 +1289,56 @@ mod imp {
                     let total = with_mon(ABI, |m| m.api.log_json(u64::MAX, 1, "")["total"].clone());
                     self.finish(json!({ "type": "dbg_api_stop_result", "success": true, "calls": total }), was_running)
                 }
+                // x64dbg's command bar (`? expr`), log-format preview and stack pane
+                "dbg_eval" | "dbg_format" | "dbg_stack" => {
+                    let was_running = self.running();
+                    if !self.need_stopped() {
+                        return failed("cannot stop the process");
+                    }
+                    let tid = self.tid_arg(req);
+                    let r = match self.regs(tid) {
+                        Some(g) => ext::inspect(self, ABI, req, &g, tid as u64),
+                        None => failed(format!("cannot read the context of thread {tid}")),
+                    };
+                    if was_running {
+                        self.resume();
+                    }
+                    r
+                }
+                // step over (F8), step out / execute till return (Ctrl+F9), run to cursor (F4)
+                "dbg_step_over" | "dbg_step_out" | "dbg_run_to" => {
+                    if !self.need_stopped() {
+                        return failed("cannot stop the process");
+                    }
+                    let tid = self.tid_arg(req);
+                    let Some(regs) = self.regs(tid) else { return failed(format!("cannot read the context of thread {tid}")) };
+                    let read = |a: u64, b: &mut [u8]| self.read(a, b);
+                    let (temp, plan) = match verb {
+                        "dbg_step_over" => match ext::step_over_target(&read, &regs, tid as u64) {
+                            Some(t) => (t, json!({})),
+                            None => {
+                                // not a call: a plain single step
+                                let mut step = req.clone();
+                                step.insert("type".into(), json!("dbg_step"));
+                                let mut r = self.command(&step);
+                                if r["type"] == "dbg_step_result" {
+                                    r["type"] = json!("dbg_step_over_result");
+                                    r["state"] = json!("stopped");
+                                }
+                                return r;
+                            }
+                        },
+                        "dbg_step_out" => match ext::step_out_target(&read, &regs, tid as u64, &self.host_modules()) {
+                            Ok(x) => x,
+                            Err(e) => return failed(e),
+                        },
+                        _ => {
+                            let Some(a) = arg_addr(req, "address") else { return bad("dbg_run_to requires 'address'") };
+                            (ext::Temp { addr: a, tid: None, min_rsp: None, reason: "run_to" }, json!({}))
+                        }
+                    };
+                    self.run_temp(verb, temp, plan, req)
+                }
                 "dbg_detach" => {
                     self.detach();
                     json!({ "type": "dbg_detach_result", "success": true })
@@ -1234,6 +1378,7 @@ mod imp {
             pid, io, hproc: std::ptr::null_mut(), threads: BTreeMap::new(), main_tid: 0, planted: BTreeMap::new(), user: BTreeSet::new(), retired: BTreeSet::new(),
             hw: [None, None, None, None], trace: [false; 4], held: None, focus: 0, last: Value::Null, relay, auto: false, rearm: HashMap::new(),
             user_step: None, suspended: Vec::new(), hw_stopped: BTreeSet::new(), breakins: 0, pause_wanted: false, pause_silent: false, attach_done: false, exited: false,
+            mods: Default::default(),
         };
         if !d.pump_until_held(Duration::from_secs(10)) {
             // SAFETY: undoes the attach above.
@@ -1246,6 +1391,7 @@ mod imp {
             with_mon(ABI, |m| {
                 m.api.stop();
                 m.traces.iter_mut().flatten().for_each(|t| t.active = false);
+                m.breaks.reset();
             });
             for a in std::mem::take(&mut d.planted).into_keys() {
                 shadow_set(a, None);

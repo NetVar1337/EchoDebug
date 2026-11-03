@@ -808,13 +808,15 @@ pub fn pe_export(read: ReadFn, base: u64, name: &str) -> Result<Export, String> 
 pub struct Monitors {
     pub traces: [Option<Trace>; 4],
     pub api: ApiMon,
+    /// conditional / logging breakpoints and the step-over / step-out / run-to targets
+    pub breaks: crate::dbg_ext::Breaks,
 }
 
 pub static MON: Mutex<Option<Monitors>> = Mutex::new(None);
 
 pub fn with_mon<R>(abi: Abi, f: impl FnOnce(&mut Monitors) -> R) -> R {
     let mut g = MON.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(|| Monitors { traces: [None, None, None, None], api: ApiMon::new(abi) });
+    let m = g.get_or_insert_with(|| Monitors { traces: [None, None, None, None], api: ApiMon::new(abi), breaks: Default::default() });
     m.api.abi = abi;
     f(m)
 }
@@ -935,6 +937,19 @@ pub fn handle(relay: &Relay, req: &Map<String, Value>, default_pid: Option<u32>,
         "dbg_api_clear" => {
             with_mon(b.abi, |m| m.api.clear_log());
             return json!({ "type": "dbg_api_clear_result", "success": true });
+        }
+        // what logging breakpoints printed (kept after the session ends)
+        "dbg_bp_log" => {
+            let since = req.get("since").and_then(Value::as_u64).unwrap_or(0);
+            let limit = req.get("limit").and_then(Value::as_u64).unwrap_or(1000).clamp(1, 10_000) as usize;
+            let mut v = with_mon(b.abi, |m| m.breaks.log_json(since, limit));
+            v["type"] = json!("dbg_bp_log_result");
+            v["success"] = json!(true);
+            return v;
+        }
+        "dbg_bp_log_clear" => {
+            with_mon(b.abi, |m| m.breaks.clear_log());
+            return json!({ "type": "dbg_bp_log_clear_result", "success": true });
         }
         "dbg_disasm" => {
             let Some(pid) = session_pid().or_else(pid_arg) else { return failed("no debug session; call dbg_attach first") };

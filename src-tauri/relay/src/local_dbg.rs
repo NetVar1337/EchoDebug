@@ -114,7 +114,8 @@ mod imp {
     use nix::unistd::Pid;
 
     use crate::dbg_core::{self as core, bad, failed, with_mon, Abi, Backend, Cmd, Gprs, Hook, HwSlot};
-    use crate::local::{arg_addr, hex_addr, MemIo, ProcIo};
+    use crate::dbg_ext::{self as ext, Host};
+    use crate::local::{arg_addr, hex_addr, MapLine, MemIo, ProcIo};
 
     /// offsetof(struct user, u_debugreg) on x86-64
     const DR_OFFSET: usize = 848;
@@ -163,6 +164,33 @@ mod imp {
         relay: Relay,
         /// started by the access finder / API monitor: detach when they stop
         auto: bool,
+        /// a breakpoint `fast_trap` decided to stop on: (address, reason, extra, single-shot)
+        pending_stop: Option<(u64, &'static str, Value, bool)>,
+        /// the module list for expressions, re-read at most every 2 s
+        mods: ext::ModCache,
+    }
+
+    impl Host for Dbg {
+        fn host_read(&self, addr: u64, buf: &mut [u8]) -> usize {
+            self.read(addr, buf)
+        }
+        fn host_modules(&self) -> Vec<(String, u64, u64)> {
+            let mut c = self.mods.borrow_mut();
+            if let Some((t, m)) = c.as_ref() {
+                if t.elapsed() < Duration::from_secs(2) {
+                    return m.clone();
+                }
+            }
+            let m = self.mem.modules().unwrap_or_default();
+            *c = Some((Instant::now(), m.clone()));
+            m
+        }
+        fn host_maps(&self) -> Vec<MapLine> {
+            self.mem.maps().unwrap_or_default()
+        }
+        fn host_pid(&self) -> u32 {
+            self.pid
+        }
     }
 
     fn tids_of(pid: u32) -> Vec<i32> {
@@ -293,7 +321,22 @@ mod imp {
 
         /// Whether an int3 at `addr` is still wanted (user breakpoint, API entry or return site).
         fn needed(&self, addr: u64) -> bool {
-            self.user.contains(&addr) || with_mon(ABI, |m| m.api.is_site(addr))
+            self.user.contains(&addr) || with_mon(ABI, |m| m.api.is_site(addr) || m.breaks.is_temp(addr))
+        }
+
+        /// A user or temporary breakpoint at `at` was hit: evaluate its condition and log text.
+        fn bp_hit(&self, at: u64, user: bool, tid: i32, regs: &Gprs) -> ext::Outcome {
+            let modules = self.host_modules();
+            let read = |a: u64, b: &mut [u8]| self.read(a, b);
+            let mut ctx = ext::Ctx { regs, read: &read, abi: ABI, tid: tid as u64, pid: self.pid, hits: 0, modules: &modules };
+            with_mon(ABI, |m| m.breaks.hit(at, user, &mut ctx))
+        }
+
+        /// Drops a single-shot user breakpoint.
+        fn drop_user(&mut self, at: u64) {
+            self.user.remove(&at);
+            with_mon(ABI, |m| m.breaks.opts.remove(&at));
+            self.unplant_if_unused(at);
         }
 
         fn plant(&mut self, addr: u64) -> Result<(), String> {
@@ -330,7 +373,7 @@ mod imp {
         /// an API-monitor int3 is not stepped: it traps again after the resume and gets logged.
         fn step_over_bp(&mut self, tid: i32) -> Result<(), String> {
             let at = rip(tid);
-            if !self.user.contains(&at) {
+            if !self.user.contains(&at) && !with_mon(ABI, |m| m.breaks.is_temp(at)) {
                 return Ok(());
             }
             let Some(orig) = self.planted.get(&at).copied() else { return Ok(()) };
@@ -392,6 +435,10 @@ mod imp {
         }
 
         fn stop_event(&mut self, tid: i32, reason: &str, extra: Value) -> Value {
+            // any stop ends a step over / step out / run to
+            for a in with_mon(ABI, |m| m.breaks.take_temps()) {
+                self.unplant_if_unused(a);
+            }
             let mut ev = json!({ "type": "event", "event": "dbg_stop", "reason": reason, "tid": tid, "address": hex_addr(rip(tid)), "regs": regs_json(tid) });
             if let (Value::Object(e), Value::Object(x)) = (&mut ev, extra) {
                 e.extend(x);
@@ -433,7 +480,22 @@ mod imp {
                 return None; // a user hardware breakpoint
             }
             let at = rip(tid).wrapping_sub(1);
-            if self.planted.contains_key(&at) && !self.user.contains(&at) {
+            let user = self.user.contains(&at);
+            if self.planted.contains_key(&at) && (user || with_mon(ABI, |m| m.breaks.is_temp(at))) {
+                // conditional / logging breakpoints and step targets on other threads or deeper
+                // frames are decided here, without stopping the other threads
+                let mut regs = gprs(tid)?;
+                regs.rip = at;
+                let out = self.bp_hit(at, user, tid, &regs);
+                for ev in out.events {
+                    self.relay.emit(ev);
+                }
+                if out.stop {
+                    self.pending_stop = Some((at, out.reason, out.extra, out.remove));
+                    return None;
+                }
+            }
+            if self.planted.contains_key(&at) {
                 set_rip(tid, at);
                 let regs = gprs(tid)?;
                 let ret_site = {
@@ -547,7 +609,14 @@ mod imp {
                                     let _ = self.plant(s);
                                 }
                             }
-                            return Ok(Some(self.stop_event(tid, "breakpoint", json!({}))));
+                            let (reason, extra, once) = match self.pending_stop.take() {
+                                Some((a, r, x, once)) if a == at => (r, x, once),
+                                _ => ("breakpoint", json!({}), false),
+                            };
+                            if once {
+                                self.drop_user(at);
+                            }
+                            return Ok(Some(self.stop_event(tid, reason, extra)));
                         }
                         let d6 = dr6(tid);
                         if let Some(slot) = (0..4).find(|i| d6 & (1 << i) != 0) {
@@ -589,7 +658,8 @@ mod imp {
             }).collect();
             let api = with_mon(ABI, |m| m.api.hooks.len());
             json!({ "type": "dbg_status_result", "success": true, "active": true, "backend": "ptrace", "pid": self.pid, "state": if self.running { "running" } else { "stopped" },
-                "focus": self.focus, "threads": threads, "breakpoints": bps, "hardware": hw, "last": self.last, "auto": self.auto,
+                "focus": self.focus, "threads": threads, "breakpoints": bps, "breakpoint_info": with_mon(ABI, |m| m.breaks.list_json(self.user.iter().copied())),
+                "hardware": hw, "last": self.last, "auto": self.auto,
                 "api_hooks": api, "traces": core::traces_json(ABI) })
         }
 
@@ -602,6 +672,7 @@ mod imp {
             with_mon(ABI, |m| {
                 m.api.stop();
                 m.traces.iter_mut().flatten().for_each(|t| t.active = false);
+                m.breaks.reset();
             });
             self.user.clear();
             for (a, b) in std::mem::take(&mut self.planted) {
@@ -624,6 +695,61 @@ mod imp {
                 reply["detached"] = json!(true);
             } else if was_running {
                 let _ = self.resume_all();
+            }
+            reply
+        }
+
+        /// The process is gone: results stay readable, the session ends.
+        fn exit_cleanup(&mut self) {
+            with_mon(ABI, |m| {
+                m.api.stop();
+                m.traces.iter_mut().flatten().for_each(|t| t.active = false);
+                m.breaks.reset();
+            });
+            for a in std::mem::take(&mut self.planted).into_keys() {
+                shadow_set(a, None);
+            }
+            core::end_session();
+        }
+
+        /// Plants a temporary breakpoint and runs; with `wait_ms`, waits for the stop it causes
+        /// (or any other) and returns it.
+        fn run_temp(&mut self, verb: &str, t: ext::Temp, mut plan: Value, req: &Map<String, Value>) -> Value {
+            if let Err(e) = core::check_code(&self.mem, t.addr).and_then(|()| self.plant(t.addr)) {
+                return failed(e);
+            }
+            plan["target"] = json!(hex_addr(t.addr));
+            plan["reason"] = json!(t.reason);
+            with_mon(ABI, |m| m.breaks.temps.push(t));
+            if let Err(e) = self.resume_all() {
+                return failed(e);
+            }
+            let mut reply = json!({ "type": format!("{verb}_result"), "success": true, "state": "running", "plan": plan });
+            let wait = req.get("wait_ms").and_then(Value::as_u64).unwrap_or(0).min(15_000);
+            if wait > 0 {
+                let t0 = Instant::now();
+                while self.running && t0.elapsed() < Duration::from_millis(wait) {
+                    match self.poll() {
+                        Err(()) => std::thread::sleep(Duration::from_millis(1)),
+                        Ok(None) => {}
+                        Ok(Some(ev)) => {
+                            let (stop, exit) = (ev["event"] == "dbg_stop", ev["event"] == "dbg_exit");
+                            self.relay.emit(ev.clone());
+                            if exit {
+                                self.exit_cleanup();
+                                reply["state"] = json!("exited");
+                                reply["detached"] = json!(true);
+                                reply["stop"] = ev;
+                                break;
+                            }
+                            if stop {
+                                reply["state"] = json!("stopped");
+                                reply["stop"] = ev;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             reply
         }
@@ -730,16 +856,27 @@ mod imp {
                     let Some(addr) = arg_addr(req, "address") else { return bad("dbg_break requires 'address'") };
                     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                     if enabled {
+                        let opts = match with_mon(ABI, |m| ext::parse_opts(req, m.breaks.opts.get(&addr))) {
+                            Ok(o) => o,
+                            Err(e) => return bad(&e),
+                        };
                         if let Err(e) = core::check_code(&self.mem, addr).and_then(|()| self.plant(addr)) {
                             return failed(e);
                         }
                         self.user.insert(addr);
-                    } else if self.user.remove(&addr) && !self.needed(addr) {
-                        if let Err(e) = self.unplant(addr) {
-                            return failed(e);
+                        if let Some(o) = opts {
+                            with_mon(ABI, |m| m.breaks.opts.insert(addr, o));
+                        }
+                    } else if self.user.remove(&addr) {
+                        with_mon(ABI, |m| m.breaks.opts.remove(&addr));
+                        if !self.needed(addr) {
+                            if let Err(e) = self.unplant(addr) {
+                                return failed(e);
+                            }
                         }
                     }
-                    json!({ "type": "dbg_break_result", "success": true, "breakpoints": self.user.iter().map(|a| hex_addr(*a)).collect::<Vec<_>>() })
+                    json!({ "type": "dbg_break_result", "success": true, "breakpoints": self.user.iter().map(|a| hex_addr(*a)).collect::<Vec<_>>(),
+                        "breakpoint_info": with_mon(ABI, |m| m.breaks.list_json(self.user.iter().copied())) })
                 }
                 "dbg_hwbreak" => {
                     let (slot, val) = match core::parse_hwbreak(req) {
@@ -905,6 +1042,52 @@ mod imp {
                     }
                     json!({ "type": "dbg_all_regs_result", "success": true, "threads": threads, "was_running": was_running })
                 }
+                // x64dbg's command bar (`? expr`), log-format preview and stack pane
+                "dbg_eval" | "dbg_format" | "dbg_stack" => {
+                    let was_running = self.running;
+                    self.need_stopped();
+                    let tid = self.tid_arg(req);
+                    let r = match gprs(tid) {
+                        Some(g) => ext::inspect(self, ABI, req, &g, tid as u64),
+                        None => failed(format!("cannot read the registers of thread {tid}")),
+                    };
+                    if was_running {
+                        let _ = self.resume_all();
+                    }
+                    r
+                }
+                // step over (F8), step out / execute till return (Ctrl+F9), run to cursor (F4)
+                "dbg_step_over" | "dbg_step_out" | "dbg_run_to" => {
+                    self.need_stopped();
+                    let tid = self.tid_arg(req);
+                    let Some(regs) = gprs(tid) else { return failed(format!("cannot read the registers of thread {tid}")) };
+                    let read = |a: u64, b: &mut [u8]| self.read(a, b);
+                    let (temp, plan) = match verb {
+                        "dbg_step_over" => match ext::step_over_target(&read, &regs, tid as u64) {
+                            Some(t) => (t, json!({})),
+                            None => {
+                                // not a call: a plain single step
+                                let mut step = req.clone();
+                                step.insert("type".into(), json!("dbg_step"));
+                                let mut r = self.command(&step);
+                                if r["type"] == "dbg_step_result" {
+                                    r["type"] = json!("dbg_step_over_result");
+                                    r["state"] = json!("stopped");
+                                }
+                                return r;
+                            }
+                        },
+                        "dbg_step_out" => match ext::step_out_target(&read, &regs, tid as u64, &self.host_modules()) {
+                            Ok(x) => x,
+                            Err(e) => return failed(e),
+                        },
+                        _ => {
+                            let Some(a) = arg_addr(req, "address") else { return bad("dbg_run_to requires 'address'") };
+                            (ext::Temp { addr: a, tid: None, min_rsp: None, reason: "run_to" }, json!({}))
+                        }
+                    };
+                    self.run_temp(verb, temp, plan, req)
+                }
                 "dbg_detach" => {
                     self.detach();
                     json!({ "type": "dbg_detach_result", "success": true })
@@ -983,6 +1166,7 @@ mod imp {
         let mut d = Dbg {
             pid, mem, threads: BTreeMap::new(), signals: HashMap::new(), planted: BTreeMap::new(), user: BTreeSet::new(), retired: BTreeSet::new(),
             hw: [None, None, None, None], trace: [false; 4], running: false, focus: pid as i32, last: Value::Null, relay, auto: false,
+            pending_stop: None, mods: Default::default(),
         };
         match d.attach_all() {
             Ok(t) => {
@@ -1019,14 +1203,7 @@ mod imp {
                         let exit = ev["event"] == "dbg_exit";
                         d.relay.emit(ev);
                         if exit {
-                            with_mon(ABI, |m| {
-                                m.api.stop();
-                                m.traces.iter_mut().flatten().for_each(|t| t.active = false);
-                            });
-                            for a in std::mem::take(&mut d.planted).into_keys() {
-                                shadow_set(a, None);
-                            }
-                            core::end_session();
+                            d.exit_cleanup();
                             return;
                         }
                     }
@@ -1100,6 +1277,138 @@ mod imp {
             assert_eq!(call(json!({ "type": "dbg_status" }))["active"], false);
             let _ = child.kill();
             let _ = child.wait();
+        }
+
+        fn addr(v: &Value) -> u64 {
+            u64::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
+        }
+
+        /// The x64dbg features on a real program: conditional + logging breakpoints, a
+        /// single-shot breakpoint, step out, run to, step over, eval and the stack view. Skipped
+        /// without a C compiler or when ptrace is not permitted.
+        #[test]
+        fn x64dbg_features_on_a_compiled_child() {
+            let dir = std::env::temp_dir().join(format!("echodebug-x64dbg-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let src = dir.join("t.c");
+            let exe = dir.join("t");
+            std::fs::write(&src, r#"
+                volatile long counter;
+                __attribute__((noinline)) long leaf(long x) { counter += x; return counter; }
+                __attribute__((noinline)) long mid(long x) { long r = leaf(x); return r + 1; }
+                int main(void) { for (long i = 0;; i++) mid(i); }
+            "#).unwrap();
+            let built = std::process::Command::new("cc").args(["-O1", "-fno-inline", "-no-pie", "-o"]).arg(&exe).arg(&src).status();
+            if !built.is_ok_and(|s| s.success()) {
+                eprintln!("no C compiler, skipping");
+                return;
+            }
+            let nm = std::process::Command::new("nm").arg(&exe).output().expect("nm");
+            let sym = |name: &str| -> u64 {
+                let out = String::from_utf8_lossy(&nm.stdout);
+                let line = out.lines().find(|l| l.split_whitespace().nth(2) == Some(name)).unwrap_or_else(|| panic!("{name} not in nm"));
+                u64::from_str_radix(line.split_whitespace().next().unwrap(), 16).unwrap()
+            };
+            let (leaf, mid) = (sym("leaf"), sym("mid"));
+            // killed on drop, so a failed assertion does not leave it holding the test's pipes
+            struct Kill(std::process::Child);
+            impl Drop for Kill {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = Kill(std::process::Command::new(&exe).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("spawn"));
+            let pid = child.0.id();
+            let relay = Relay::new("t", Duration::from_secs(1));
+            let mut events = relay.0.events.subscribe();
+            let call = |v: Value| {
+                let Value::Object(m) = v else { unreachable!() };
+                handle(&relay, &m)
+            };
+            let r = call(json!({ "type": "dbg_attach", "pid": pid }));
+            if r["type"] == "error" {
+                eprintln!("ptrace not permitted here, skipping: {r}");
+                return;
+            }
+            fn next_event(events: &mut tokio::sync::broadcast::Receiver<String>, want: &str) -> Value {
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(10) {
+                    match events.try_recv() {
+                        Ok(s) => {
+                            let v: Value = serde_json::from_str(&s).unwrap();
+                            if v["event"] == want {
+                                return v;
+                            }
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                    }
+                }
+                panic!("no {want} event");
+            }
+
+            // a breakpoint that logs every hit but breaks only on the fifth (.5 = decimal)
+            let b = call(json!({ "type": "dbg_break", "address": hex_addr(leaf), "condition": "$hits == .5", "log": "x={d:rdi} hit {d:$hits}" }));
+            assert_eq!(b["breakpoint_info"][0]["condition"], "$hits == .5", "{b}");
+            assert_eq!(call(json!({ "type": "dbg_break", "address": hex_addr(leaf), "condition": "((" }))["type"], "error");
+            call(json!({ "type": "dbg_continue" }));
+            let logs: Vec<String> = (0..4).map(|_| next_event(&mut events, "dbg_log")["text"].as_str().unwrap().to_owned()).collect();
+            assert!(logs[0].ends_with("hit 1") && logs[3].ends_with("hit 4"), "{logs:?}");
+            let stop = next_event(&mut events, "dbg_stop");
+            assert_eq!(stop["reason"], "breakpoint", "{stop}");
+            assert_eq!(stop["hits"], 5);
+            assert_eq!(addr(&stop["address"]), leaf);
+            let log = call(json!({ "type": "dbg_bp_log" }));
+            assert!(log["entries"].as_array().unwrap().len() >= 5, "{log}");
+
+            // eval and the stack: at leaf's entry [rsp] is the return address into mid
+            let ev = call(json!({ "type": "dbg_eval", "expr": "rip == leaf_unused || rip" }));
+            assert_eq!(ev["type"], "error", "unknown symbols are reported: {ev}");
+            let ev = call(json!({ "type": "dbg_eval", "expr": format!("rip == {leaf:x} && [rsp] > {mid:x}") }));
+            assert_eq!(ev["value"], "0x1", "{ev}");
+            let st = call(json!({ "type": "dbg_stack", "count": 4 }));
+            assert_eq!(st["entries"][0]["kind"], "return", "{st}");
+            assert_eq!(st["entries"][0]["rsp"], true);
+
+            // step out lands in mid, right after the call
+            let so = call(json!({ "type": "dbg_step_out", "wait_ms": 5000 }));
+            assert_eq!(so["state"], "stopped", "{so}");
+            assert_eq!(so["stop"]["reason"], "step_out", "{so}");
+            let back = addr(&so["stop"]["address"]);
+            assert_eq!(back, addr(&so["plan"]["target"]));
+            assert!(back > mid && back < mid + 0x40, "{back:#x} not in mid {mid:#x}");
+            // the temporary breakpoint is gone, the user one stays
+            assert_eq!(call(json!({ "type": "dbg_status" }))["breakpoints"].as_array().unwrap().len(), 1);
+            call(json!({ "type": "dbg_break", "address": hex_addr(leaf), "enabled": false }));
+
+            // run to mid, then step over until the call to leaf has been stepped over
+            let rt = call(json!({ "type": "dbg_run_to", "address": hex_addr(mid), "wait_ms": 5000 }));
+            assert_eq!(rt["stop"]["reason"], "run_to", "{rt}");
+            assert_eq!(addr(&rt["stop"]["address"]), mid);
+            let mut over = None;
+            for _ in 0..12 {
+                let s = call(json!({ "type": "dbg_step_over", "wait_ms": 5000 }));
+                assert_eq!(s["state"], "stopped", "{s}");
+                if s["plan"]["reason"] == "step_over" {
+                    over = Some(s);
+                    break;
+                }
+            }
+            let s = over.expect("mid calls leaf");
+            assert_eq!(s["stop"]["reason"], "step_over", "{s}");
+            assert_eq!(addr(&s["stop"]["address"]), addr(&s["plan"]["target"]));
+
+            // single-shot: breaks once, then it is gone
+            call(json!({ "type": "dbg_break", "address": hex_addr(leaf), "once": true }));
+            while events.try_recv().is_ok() {}
+            call(json!({ "type": "dbg_continue" }));
+            let stop = next_event(&mut events, "dbg_stop");
+            assert_eq!(addr(&stop["address"]), leaf, "{stop}");
+            assert_eq!(call(json!({ "type": "dbg_status" }))["breakpoints"].as_array().unwrap().len(), 0);
+
+            assert_eq!(call(json!({ "type": "dbg_detach" }))["success"], true);
+            drop(child);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

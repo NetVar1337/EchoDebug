@@ -21,6 +21,7 @@ pub mod a64;
 pub mod arch;
 pub mod auth;
 pub mod dbg_core;
+pub mod dbg_ext;
 pub mod local;
 pub mod local_dbg;
 pub mod local_emu;

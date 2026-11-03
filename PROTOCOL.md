@@ -102,7 +102,7 @@ status frame's `"debugger"` field says which one this relay has (`"ptrace"`, `"w
 | `dbg_attach` | `pid?` (default: attached process) | `pid`, `threads`, `state:"stopped"`, `backend` |
 | `dbg_detach` | – | – (breakpoints and DR7 restored first; on Linux `detach` also ends the session) |
 | `dbg_status` | – | `active`, `backend`, `state` (`running`\|`stopped`), `focus`, `threads:[{tid, state, rip?}]`, `breakpoints`, `hardware:[{slot, address, kind, len, trace}]`, `last`, `auto`, `api_hooks`, `traces` |
-| `dbg_break` | `address`, `enabled?` | `breakpoints` — int3 |
+| `dbg_break` | `address`, `enabled?`, `condition?`, `log?`, `log_condition?`, `once?`, `reset_hits?` | `breakpoints`, `breakpoint_info:[{address, condition, log, log_condition, once, hits}]` — int3. Options not given keep their value; a bad expression is refused (3002). See *x64dbg-style breakpoints and stepping* below |
 | `dbg_hwbreak` | `slot` (0-3), `address`, `kind` (`exec`\|`write`\|`rw`), `len` (1/2/4/8), `enabled?` | status — DR0-DR3/DR7 on every thread |
 | `dbg_continue` / `dbg_pause` | – | `state` (steps over a breakpoint under rip first) |
 | `dbg_step` | `tid?` | `tid`, `from`, `address`, `regs`. A thread blocked in a system call only finishes the step when the call returns: the step is cancelled with an explanation instead of hanging |
@@ -116,6 +116,13 @@ status frame's `"debugger"` field says which one this relay has (`"ptrace"`, `"w
 | `dbg_api_log` | `since?` (seq), `limit?` (≤ 10000), `filter?` | `entries:[{seq, t, tid, function, address, caller, args:[{name, value, text}], ret, ret_text, returned}]`, `next`, `total`, `dropped`, `pending_returns`, `hooks:[{address, name, hits}]`, `active` |
 | `dbg_api_stop` / `dbg_api_clear` | – | `calls` / – (the log stays until cleared; 20,000 calls are kept) |
 | `dbg_api_signatures` | – | `abi` (`win64`\|`sysv`), `signatures:[{name, args:[{name, type}], ret}]` |
+| `dbg_step_over` | `tid?`, `wait_ms?` (≤ 15000) | a `call` or `rep` string instruction: `state` (`running`, or `stopped` with `stop`: the `dbg_stop` event when it came within `wait_ms`), `plan:{target, reason}`; anything else: a plain `dbg_step` reply |
+| `dbg_step_out` | `tid?`, `wait_ms?` | as `dbg_step_over`; `plan` also has `return_to`, `return_to_text`, `method` (`pdata`\|`cfi`\|`leaf`\|`frame-pointer`\|`stack-scan`), `guessed` — x64dbg's *execute till return*: runs to the caller found by the unwinder |
+| `dbg_run_to` | `address`, `tid?`, `wait_ms?` | as `dbg_step_over` — run to cursor: stops when any thread reaches `address` |
+| `dbg_eval` | `expr`, `tid?` | `value`, `unsigned`, `signed`, `symbol` (module+offset), or `string` — x64dbg's command bar |
+| `dbg_format` | `text`, `tid?` | `text` — a log format string rendered against the thread's registers |
+| `dbg_stack` | `count?` (≤ 1024, default 64), `address?` (an expression; default rsp), `tid?` | `rsp`, `rbp`, `entries:[{address, value, offset, kind?, text?, frame?, rsp?, rbp?}]`, `kind` `return` (a frame's return address from the unwinder, or a value that follows a `call`), `code`, `stack` or `string` |
+| `dbg_bp_log` / `dbg_bp_log_clear` | `since?`, `limit?` / – | `entries:[{seq, t, tid, address, hits, text}]`, `next`, `total` — what logging breakpoints printed (5,000 kept, readable after the session) |
 
 `dbg_trace_start` and `dbg_api_start` attach the debugger when no session is active (`auto: true`)
 and resume the process; when the last monitor of such a session stops, it detaches (`detached:
@@ -143,14 +150,49 @@ x86-64 only and refuse an AArch64 process at attach, and a breakpoint, execute w
 hook inside an AArch64 module (ARM64EC code in an x64 process), with code `3003` and a detail that
 says so. The emulated debugger (`emu_*`) and lifter are x86-64 only.
 
-Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause"|"exception", "tid", "address", "regs", "slot?", "watch?", "signal?", "code?", "first_chance?", "description?" }`,
+Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"step_over"|"step_out"|"run_to"|"signal"|"trap"|"pause"|"exception", "tid", "address", "regs", "hits?", "condition_error?", "slot?", "watch?", "signal?", "code?", "first_chance?", "description?" }`,
 `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`, `{ "event":"dbg_access", "slot", "watch", "kind", "address", "text" }`
 (a new accessing instruction), and on Windows `{ "event":"dbg_exception", "code", "description", … }` (routine first-chance
 exceptions such as C++ throws, passed on without stopping) and `{ "event":"dbg_output", "tid", "text" }` (OutputDebugString).
 
-MCP: `find_accesses_start` / `_results` / `_stop` and `api_monitor_start` / `_log` / `_stop` / `_signatures`.
+#### x64dbg-style breakpoints and stepping
+
+A software breakpoint can carry x64dbg's options: a **break condition** (stop only when it is
+non-zero; empty: always), **log text** printed on every hit as a `dbg_log` event, a **log
+condition** (log only when non-zero; empty: every hit), a hit counter and **single-shot** (`once`:
+removed the first time it breaks). Conditions are evaluated on the debugger thread when the int3
+traps, without stopping the other threads; a condition that cannot be evaluated breaks and the stop
+carries `condition_error`. Breakpoint stops carry `hits`.
+
+Step over, step out and run to plant a temporary int3 bound to a thread and a stack depth (`rsp`
+at least the depth it was planted for), so another thread or a recursive call passing the same
+address runs on. Any stop (a user breakpoint, an exception, a pause) cancels it, as in x64dbg. The
+stop reason is `step_over`, `step_out` or `run_to`.
+
+**Expressions** (`condition`, `log_condition`, `dbg_eval`, the fields of log text): numbers are hex
+by default (`10` is 0x10, `.10` decimal ten, `0x` allowed); registers and sub-registers (`rax`,
+`eax`, `ax`, `al`, `ah`, `r8d`, `r8w`, `r8b`, `cip` / `csp` / `cax`…, `eflags`); flags (`zf`,
+`_cf`, …); `[expr]` reads a qword, `byte:` / `word:` / `dword:` / `qword:[expr]`; `+ - * / % & | ^ ~
+! << >> == != < <= > >= && ||` with C precedence, unsigned (`&&` / `||` short-circuit, so
+`rcx && [rcx] == 1` is safe); `$hits` (`$breakpointcounter`), `$tid`, `$pid`; a module name is its
+base (`game.exe+1000`); string literals; functions `arg(n)` / `arg.get(n)` (argument n at function
+entry, per the ABI), `ReadByte` / `ReadWord` / `ReadDword` / `ReadQword` / `ReadPtr` (also `byte()` …),
+`mem.valid(a)`, `mod.base(a)` (the module holding an address, or `mod.base("name")` for names such as
+`e2e-target` that an expression cannot spell), `utf8(a)` / `ansi(a)` / `utf16(a)` / `str(a)` (string at
+an address), `strlen`, `streq`, `strieq`, `strstr`, `stristr` (a number argument is read as a string).
+Strings compare with `==` / `!=`.
+
+**Log text**: `{expr}` and `{x:expr}` hex, `{p:expr}` 16-digit pointer, `{d:expr}` signed and
+`{u:expr}` unsigned decimal, `{s:expr}` the string at the address, `{a:expr}` module+offset,
+`{i:expr}` the instruction there; `{{` and `}}` are braces. A field that fails prints `{error: …}`.
+
+`{ "type":"event", "event":"dbg_log", "seq", "t", "tid", "address", "hits", "text" }`.
+
+MCP: `find_accesses_start` / `_results` / `_stop` and `api_monitor_start` / `_log` / `_stop` / `_signatures`;
+`debugger_eval`, `debugger_stack` and `debugger_breakpoint_log` (read-only).
 The debugger verbs that plant int3s or change execution (`dbg_attach`, `dbg_break`, `dbg_hwbreak`,
-`dbg_set_regs`, `dbg_step`, `dbg_continue`, `dbg_trace_start`, `dbg_api_start`) are stateful and gated by
+`dbg_set_regs`, `dbg_step`, `dbg_step_over`, `dbg_step_out`, `dbg_run_to`, `dbg_continue`, `dbg_trace_start`,
+`dbg_api_start`) are stateful and gated by
 the ask / read-only policy like `write`; reading results and stopping are not.
 
 ### Threads, call stacks, handles (relay)
