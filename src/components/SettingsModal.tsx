@@ -1,14 +1,17 @@
 import { useProjects } from "@/lib/projects";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Check, X } from "lucide-react";
 import { mcpAddCommand, useConn } from "@/store/conn";
 import { kMotionPrefs, useMotion } from "@/store/motion";
 import { attempt, log } from "@/store/output";
 import { useUi, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
+import { kDefaultServer, useSymbols } from "@/store/symbols";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
 import { isWindowsOs } from "@/lib/tauri";
 import { CopyChip, IconButton, useCopy } from "./ui";
+import * as assistantApi from "@/lib/assistant/api";
+import { useAssistant } from "@/store/assistant";
 
 const kAccents = ["", "#2eb8a6", "#88c0d0", "#f26b38", "#a78bfa", "#f472b6", "#facc15"];
 const kThemes: { id: Theme; label: string }[] = [
@@ -25,6 +28,7 @@ export default function SettingsModal() {
   const motion = useMotion((s) => s.pref);
   const setMotion = useMotion((s) => s.setPref);
   const [copied, copy] = useCopy();
+  const sym = useSymbols();
   const close = () => ui.set({ settingsOpen: false });
   const reinstall = async () => {
     const r = await attempt("agent", installAgent());
@@ -91,6 +95,8 @@ export default function SettingsModal() {
             )}
           </Section>
 
+          <AssistantSection />
+
           <Section title="Workspace">
             <Row label="Reattach on start" hint={ui.lastTarget ? `Attach to ${ui.lastTarget} again when the app starts, if it is running.` : "Attach to the last target again when the app starts."}>
               <label className="switch">
@@ -106,6 +112,33 @@ export default function SettingsModal() {
             </Row>
             <Row label="Panel sizes" hint="Splitter positions are remembered between runs.">
               <button className="btn" onClick={() => { ui.set({ layout: {} }); for (const v of ["--left-w", "--scan-w", "--bottom-h", "--right-w"]) document.querySelector<HTMLElement>(".app")?.style.removeProperty(v); }}>Reset layout</button>
+            </Row>
+          </Section>
+
+          <Section title="Symbols">
+            <Row label="Symbol path" hint={<>Folders and stores searched for PDBs, <span className="mono">_NT_SYMBOL_PATH</span> syntax: <span className="mono">C:\pdbs;srv*C:\symbols*https://…;cache*D:\sym</span>. The image's folder and the app cache are always searched.</>}>
+              <input className="input mono" style={{ width: 260 }} placeholder="C:\pdbs;srv*C:\symbols*https://…" value={sym.symbolPath} onChange={(e) => sym.setSettings({ symbolPath: e.target.value })} />
+            </Row>
+            <Row label="Symbol servers" hint="One URL per line, asked in order when a PDB is downloaded.">
+              <textarea className="textarea" rows={2} style={{ width: 260 }} value={sym.servers.join("\n")} onChange={(e) => sym.setSettings({ servers: e.target.value.split("\n").map((x) => x.trim()) })} onBlur={() => sym.setSettings({ servers: sym.servers.filter(Boolean).length ? sym.servers.filter(Boolean) : [kDefaultServer] })} />
+            </Row>
+            <Row label="Use _NT_SYMBOL_PATH" hint="Also read the environment variables of the relay process.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={sym.useEnv} onChange={(e) => sym.setSettings({ useEnv: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Auto-download" hint="Network access: download missing PDBs from the servers whenever symbols are loaded, without a click. Off: only the Download button (or an MCP client's ui_load_symbols) goes online.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={sym.autoDownload} onChange={(e) => sym.setSettings({ autoDownload: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Load on attach" hint="Load the PDBs already on this machine (symbol path, cache) for every module after attaching; with auto-download, fetch the rest too.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={sym.autoLoad} onChange={(e) => sym.setSettings({ autoLoad: e.target.checked })} />
+                <span />
+              </label>
             </Row>
           </Section>
 
@@ -129,6 +162,38 @@ export default function SettingsModal() {
         </div>
       </div>
     </div>
+  );
+}
+
+/** The assistant's Anthropic API key: set, replace or remove it. The key is never shown again. */
+function AssistantSection() {
+  const [info, setInfo] = useState<assistantApi.KeyInfo | null>(null);
+  const [key, setKey] = useState("");
+  const refresh = useAssistant((s) => s.refreshKey);
+  useEffect(() => { void assistantApi.keyStatus().then(setInfo).catch(() => setInfo(null)); }, []);
+  const save = async () => {
+    const r = await attempt("assistant", assistantApi.setKey(key));
+    setKey("");
+    if (r) { setInfo(r); log("info", "assistant", "API key saved"); void refresh(); }
+  };
+  const remove = async () => {
+    const r = await attempt("assistant", assistantApi.clearKey());
+    if (r) { setInfo(r); log("info", "assistant", "API key removed"); void refresh(); }
+  };
+  if (!isTauri()) {
+    return <Section title="Assistant"><div className="settings-note">The assistant and its API key live in the desktop app.</div></Section>;
+  }
+  return (
+    <Section title="Assistant">
+      <Row label="Anthropic API key" hint={info?.present ? <>A key is stored. {info.note}</> : <>Needed for the Assistant panel. Create one at console.anthropic.com. It is only ever sent to api.anthropic.com and is never shown again or logged.</>}>
+        <div className="row">
+          <input className="input mono" type="password" autoComplete="off" spellCheck={false} placeholder={info?.present ? "replace with a new key" : "sk-ant-..."} value={key} onChange={(e) => setKey(e.target.value)} onKeyDown={(e) => e.key === "Enter" && key.trim() && void save()} style={{ width: 200 }} />
+          <button className="btn" disabled={!key.trim()} onClick={() => void save()}>Save</button>
+          {info?.present && <button className="btn" onClick={() => void remove()}>Remove</button>}
+        </div>
+      </Row>
+      {info && <div className="settings-note">Stored at <span className="mono">{info.path}</span>. {info.storage === "file" ? "No OS keychain is used here: the file is readable only by your user account." : ""} What you send from the Assistant panel (code, memory, names, tool results) goes to Anthropic.</div>}
+    </Section>
   );
 }
 

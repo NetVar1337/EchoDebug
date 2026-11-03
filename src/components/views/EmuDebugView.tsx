@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Play, StepForward, Square, SkipForward, X } from "lucide-react";
 import { request } from "@/lib/client";
 import { fmtAddr, labelAddr, parseAddress } from "@/lib/hex";
+import { symAddr } from "@/lib/pdb";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useNames } from "@/store/names";
@@ -139,7 +140,7 @@ export default function EmuDebugView() {
   };
   const label = (a: string) => {
     const n = nameOf(a.replace(/^0x/, "").padStart(16, "0"));
-    return n ? `${labelAddr(a, modules)} <${n}>` : labelAddr(a, modules);
+    return n ? `${labelAddr(a, modules)} <${n}>` : symAddr(a, modules);
   };
 
   return (

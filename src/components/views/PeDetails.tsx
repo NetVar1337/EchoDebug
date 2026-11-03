@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { fmtAddr, labelAddr, toBig, type Module } from "@/lib/hex";
 import { loadImage } from "@/lib/memory";
-import { loadPdbSymbols, readModuleFileBytes } from "@/lib/modfile";
+import { readModuleFileBytes } from "@/lib/modfile";
+import { loadPdb } from "@/lib/pdb";
 import { parsePe, type PeInfo } from "@/lib/analysis/pe";
 import { imphash, parseDebug, parseRelocs, parseRich, parseTls } from "@/lib/analysis/peextra";
 import { authenticodeHash, parseSignature, type SignatureInfo } from "@/lib/analysis/authenticode";
@@ -42,9 +43,10 @@ export function PeDetails({ m }: { m: Module }) {
 
   const loadSymbols = async () => {
     setBusy("symbols");
-    const r = await attempt("symbols", loadPdbSymbols(m));
+    // a click here is the user's go-ahead to ask the symbol servers
+    const r = await attempt("symbols", loadPdb(m, { download: true }));
     setBusy("");
-    if (r) log("info", "symbols", `${r.path}: ${r.count} symbols, ${r.named} new names in ${m.name}`);
+    if (r && r.status !== "loaded") log("warn", "symbols", `${m.name}: ${r.error ?? r.status}`);
   };
   const checkSig = async () => {
     setBusy("sig");
@@ -71,8 +73,9 @@ export function PeDetails({ m }: { m: Module }) {
           {cv && <><span>PDB</span><span className="mono">{cv.path}</span><span>GUID / age</span><span className="mono">{cv.guid} / {cv.age}</span><span>symbol key</span><span className="mono selectable">{cv.symbolKey}</span></>}
         </div>
         <div className="row">
-          <button className="btn small" disabled={!cv || busy !== ""} onClick={() => void loadSymbols()}>{busy === "symbols" ? "Fetching…" : "Load PDB symbols"}</button>
-          <span className="faint" style={{ fontSize: 12 }}>from the Microsoft symbol server (or ECHODEBUG_SYMBOL_SERVERS), cached; names every public and function</span>
+          <button className="btn small" disabled={!cv || busy !== ""} onClick={() => void loadSymbols()}>{busy === "symbols" ? "Loading…" : "Load PDB symbols"}</button>
+          <button className="btn small" onClick={() => ui.setTab("symbols")}>Symbols view</button>
+          <span className="faint" style={{ fontSize: 12 }}>local copies first (symbol path, cache), then the configured symbol servers; names every function and data symbol</span>
         </div>
       </div>
 

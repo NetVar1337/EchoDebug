@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildStructure, type Insn } from "./structure";
-import { conditionOf, condText, normalize, pseudocode, translate } from "./pseudocode";
+import { argRegs, conditionOf, condText, normalize, protoHeader, pseudocode, translate, type Proto } from "./pseudocode";
 
 const listing = (rows: [number, string][]): Insn[] =>
   rows.map(([a, text], i) => ({ address: "0x" + a.toString(16), length: (rows[i + 1]?.[0] ?? a + 2) - a, text }));
@@ -194,5 +194,33 @@ describe("structuring", () => {
     expect(out[out.length - 1].trim()).toBe("return rax;");
     // the lone `jg` reuses the flags of the cmp in the block before it
     expect(out).toContain("if (eax > edx) {");
+  });
+});
+
+describe("prototypes from debug info", () => {
+  const score: Proto = { name: "entity_score", ret: "int", params: [{ name: "e", type: "Entity*" }, { name: "bonus", type: "int" }] };
+  const init: Proto = { name: "entity_init", ret: "void", params: [{ name: "e", type: "Entity*" }, { name: "id", type: "unsigned __int64" }] };
+  const protoOf = (a: string) => (a === "0x401000" ? score : a === "0x402000" ? init : undefined);
+
+  it("places arguments per ABI", () => {
+    const mixed: Proto = { name: "f", ret: "double", params: [{ name: "a", type: "int" }, { name: "x", type: "double" }, { name: "b", type: "char*" }] };
+    expect(argRegs(mixed, "win64")).toEqual(["rcx", "xmm1", "r8"]);
+    expect(argRegs(mixed, "sysv")).toEqual(["rdi", "xmm0", "rsi"]);
+    expect(argRegs({ name: "g", ret: "int", params: Array.from({ length: 5 }, (_, i) => ({ name: `p${i}`, type: "int" })) }, "win64")[4]).toBe("arg_5");
+    expect(protoHeader(score)).toEqual(["int entity_score(Entity* e, int bonus)", "// e = rcx, bonus = rdx"]);
+  });
+
+  it("uses the callee's argument count and void returns", () => {
+    const w = new Set<string>(["rcx", "rdx", "r8", "r9"]);
+    expect(translate({ address: "0x1", length: 5, text: "call 0x401000" }, "win64", w, undefined, protoOf)).toBe("rax = sub_401000(rcx, rdx);");
+    expect(translate({ address: "0x6", length: 5, text: "call 0x402000" }, "win64", new Set(), (a) => (a === "0x402000" ? "entity_init" : ""), protoOf)).toBe("entity_init(rcx, rdx);");
+    expect(translate({ address: "0xb", length: 5, text: "jmp 0x402000" }, "sysv", new Set(), undefined, protoOf)).toBe("return sub_402000(rdi, rsi); // tail call");
+  });
+
+  it("heads the function with its signature", () => {
+    const out = pseudocode(buildStructure(listing([[0x401000, "mov eax, ecx"], [0x401002, "ret"]])), { protoOf });
+    expect(out[0]).toMatchObject({ indent: 0, text: "int entity_score(Entity* e, int bonus)" });
+    expect(out[1].text).toBe("// e = rcx, bonus = rdx");
+    expect(out.at(-1)!.text).toBe("return rax;");
   });
 });
