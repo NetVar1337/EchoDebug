@@ -3,11 +3,7 @@ import { request } from "./client";
 import { hexToBytes, toBig, type Module } from "./hex";
 import { invoke } from "@tauri-apps/api/core";
 import { isTauri } from "./tauri";
-import { loadImage } from "./memory";
-import { parsePe } from "./analysis/pe";
-import { parseDebug } from "./analysis/peextra";
 import { useConn } from "@/store/conn";
-import { useNames } from "@/store/names";
 
 const files = new Map<string, Promise<{ bytes: Uint8Array; path: string }>>();
 
@@ -53,25 +49,4 @@ export async function readModuleFileBytes(m: Module): Promise<{ bytes: Uint8Arra
   if (!isTauri()) throw new Error("reading module files needs the desktop app");
   const bytes = await invoke<number[]>("read_binary_file", { path });
   return { bytes: new Uint8Array(bytes), path };
-}
-
-export type SymbolLoad = { path: string; guid: string; count: number; named: number };
-
-/** Fetches the module's PDB (by its CodeView identity) and names every function and data symbol. */
-export async function loadPdbSymbols(m: Module, opts: { overwrite?: boolean; servers?: string[] } = {}): Promise<SymbolLoad> {
-  const img = await loadImage(m);
-  const cv = parseDebug(img, parsePe(img)).find((d) => d.codeview)?.codeview;
-  if (!cv) throw new Error(`${m.name} has no CodeView debug entry (no PDB reference)`);
-  const pdb = cv.path.split(/[\\/]/).pop() ?? cv.path;
-  const r = await request<{ path: string; guid: string; symbols: { rva: number; name: string; kind: string }[] }>("pdb_symbols", { pdb, key: cv.symbolKey, ...(opts.servers ? { servers: opts.servers } : {}) });
-  const names = useNames.getState();
-  const base = toBig(m.base);
-  let named = 0;
-  for (const s of r.symbols) {
-    const a = "0x" + (base + BigInt(s.rva)).toString(16);
-    if (!opts.overwrite && names.nameOf(a)) continue;
-    names.rename(a, s.name);
-    named++;
-  }
-  return { path: r.path, guid: r.guid, count: r.symbols.length, named };
 }

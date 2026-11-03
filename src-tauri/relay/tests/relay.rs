@@ -817,3 +817,20 @@ async fn annotation_tools_go_through_provider_and_policy() {
     let (_, r) = pending.await.unwrap();
     assert!(text(&r).contains("denied"), "{r}");
 }
+
+#[tokio::test]
+async fn pdb_verbs_are_relay_local() {
+    // no upstream at all: the relay answers PDB queries itself
+    let (addr, _) = start().await;
+    let mut client = connect(addr, "/client").await;
+    let pdb = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdbtypes/types.pdb").display().to_string();
+    send(&mut client, json!({ "type": "pdb_symbols", "id": "s", "path": pdb })).await;
+    let r = recv_until(&mut client, |v| v["id"] == "s").await;
+    assert_eq!((r["type"].as_str(), r["key"].as_str()), (Some("pdb_symbols_result"), Some("3204B8A9E64144054C4C44205044422E1")), "{r}");
+    send(&mut client, json!({ "type": "pdb_type", "id": 7, "path": pdb, "name": "Vec3" })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 7).await;
+    assert_eq!((r["type"].as_str(), r["size"].as_u64()), (Some("pdb_type_result"), Some(12)), "{r}");
+    send(&mut client, json!({ "type": "pdb_progress", "id": 8 })).await;
+    let r = recv_until(&mut client, |v| v["id"] == 8).await;
+    assert!(r["jobs"].is_array());
+}
