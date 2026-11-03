@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod monitor;
 pub mod pdbinfo;
 pub mod symbols;
+pub mod sync;
 pub mod unwind;
 #[cfg(windows)]
 pub mod win_threads;
@@ -186,6 +187,8 @@ struct Inner {
     policy: Mutex<mcp::Policy>,
     /// module / page monitors (monitor.rs)
     monitors: Mutex<monitor::Monitors>,
+    /// IDA / Ghidra / Binary Ninja sync hub (sync.rs)
+    sync: Mutex<sync::Hub>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -209,6 +212,7 @@ impl Relay {
             token: Mutex::new(None),
             policy: Mutex::new(mcp::Policy::default()),
             monitors: Mutex::new(monitor::Monitors::default()),
+            sync: Mutex::new(sync::Hub::default()),
         }))
     }
 
@@ -361,6 +365,12 @@ impl Relay {
                     "module_timeline" => monitor::module_timeline(self),
                     _ => monitor::page_monitor_list(self),
                 };
+                v["id"] = orig;
+                return v;
+            }
+            // Disassembler sync hub (IDA / Ghidra / Binary Ninja on /sync); see sync.rs.
+            "sync_status" | "sync_config" | "sync_send" | "sync_log" => {
+                let mut v = self.sync_verb(&verb, &req);
                 v["id"] = orig;
                 return v;
             }
@@ -1258,6 +1268,22 @@ async fn client_ws(
     ws.on_upgrade(move |s| relay.client(s))
 }
 
+/// `/sync`: disassembler plugins (IDA, Ghidra, Binary Ninja). Token-protected like `/client`.
+async fn sync_ws(
+    State(relay): State<Relay>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !auth::authorized(relay.token().as_deref(), &headers, query.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    ws.on_upgrade(move |s| relay.sync_socket(s))
+}
+
 fn upstream_ws(relay: Relay, kind: Kind, headers: &HeaderMap, ws: WebSocketUpgrade) -> Response {
     // Echo connects without an Origin; anything with one is a browser page. No token here: Echo's
     // `process::open_socket(url)` and the agent's `ws::connect` dial a fixed URL baked into the agent
@@ -1406,6 +1432,7 @@ pub fn router(relay: Relay) -> Router {
         .route("/agent", get(agent_ws))
         .route("/ext", get(ext_ws))
         .route("/client", get(client_ws))
+        .route("/sync", get(sync_ws))
         .route("/health", get(health))
         .route("/mcp", post(mcp).get(mcp_events))
         .with_state(relay)
