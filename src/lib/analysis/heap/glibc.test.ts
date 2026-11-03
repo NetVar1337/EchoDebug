@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { HeapMem } from "./reader";
 import { FakeMem } from "./testmem";
-import { alignChunk, arenaLayoutFor, binChunkSize, binHeader, exploreGlibc, findMainArena, glibcVersion, kArenaLayouts, layoutAt, revealPtr, tcacheBinSizes, tcacheLayout, type ArenaLayout, type GlibcVersion } from "./glibc";
+import { alignChunk, arenaLayoutFor, binChunkSize, binHeader, exploreGlibc, findMainArena, mmappedChunks, glibcVersion, kArenaLayouts, layoutAt, revealPtr, tcacheBinSizes, tcacheLayout, type ArenaLayout, type GlibcVersion } from "./glibc";
 import { filterChunks, findChunk, heapStats, sizeHistogram } from "./model";
 
 const L = kArenaLayouts["2.27+"];
@@ -336,5 +336,33 @@ describe("glibc heap", () => {
     const r = await exploreGlibc({ mem: new HeapMem(m.read), regions: m.list(), libc: { name: "libc.so.6", base: LIBC, size: 0x3000 } });
     expect(r.heaps).toEqual([]);
     expect(r.source).toMatch(/not found/);
+  });
+});
+
+describe("mmapped chunks", () => {
+  // the kernel merges adjacent anonymous mappings, so a chunk can start mid-region (glibc 2.43 runners)
+  it("finds an IS_MMAPPED chunk that is not at the start of its region", async () => {
+    const base = 0x7f0000000000n;
+    const m = new FakeMem().map(base, 0x8000);
+    m.q(base + 0x3000n + 8n, 0x4000n | 2n); // prev_size 0, size 0x4000, IS_MMAPPED
+    const got = await mmappedChunks(new HeapMem(m.read), m.list(), () => false, 10);
+    expect(got.map((c) => [c.address, c.size, c.state])).toEqual([[base + 0x3000n, 0x4000, "mmapped"]]);
+  });
+
+  it("still finds chunks at the start of a region, back to back", async () => {
+    const base = 0x7f0000100000n;
+    const m = new FakeMem().map(base, 0x6000);
+    m.q(base + 8n, 0x2000n | 2n).q(base + 0x2000n + 8n, 0x4000n | 2n);
+    const got = await mmappedChunks(new HeapMem(m.read), m.list(), () => false, 10);
+    expect(got.map((c) => c.address)).toEqual([base, base + 0x2000n]);
+  });
+
+  it("skips pages the caller excludes and headers that run past the region", async () => {
+    const base = 0x7f0000200000n;
+    const m = new FakeMem().map(base, 0x4000);
+    m.q(base + 8n, 0x1000n | 2n); // excluded page
+    m.q(base + 0x2000n + 8n, 0x8000n | 2n); // runs past the end
+    const got = await mmappedChunks(new HeapMem(m.read), m.list(), (a) => a === base, 10);
+    expect(got).toEqual([]);
   });
 });

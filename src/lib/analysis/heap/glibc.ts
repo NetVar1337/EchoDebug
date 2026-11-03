@@ -456,18 +456,28 @@ export async function readTcache(mem: HeapMem, c: HeapChunk, heap: string, mode:
 
 // ---- mmapped chunks ----------------------------------------------------------------------------------
 
-/** IS_MMAPPED chunks at the start of anonymous writable regions (adjacent mmaps merge, so walk on). */
+/**
+ * IS_MMAPPED chunks in anonymous writable regions. A chunk starts on a page boundary, but not always
+ * at the start of its region: the kernel merges adjacent anonymous mappings with the same protection,
+ * so an mmapped chunk can sit in the middle of a larger region (seen on glibc 2.43 runners). Every page
+ * boundary is probed (bounded by `kMmapProbeCap` reads); a match is followed by the chunks that come
+ * right after it.
+ */
+export const kMmapProbeCap = 65536;
 export async function mmappedChunks(mem: HeapMem, regions: Region[], skip: (a: bigint) => boolean, max: number): Promise<HeapChunk[]> {
   const out: HeapChunk[] = [];
+  let probes = 0;
   for (const r of regions) {
-    if (!r.writable || r.size < 0x1000 || skip(r.base)) continue;
+    if (!r.writable || r.size < 0x1000) continue;
     const end = r.base + BigInt(r.size);
     let p = r.base;
-    while (p < end && out.length < max) {
+    while (p < end && out.length < max && probes < kMmapProbeCap) {
+      if (skip(p)) { p += 0x1000n; continue; }
+      probes++;
       const hdr = await mem.bytes(p, 0x20);
-      if (!hdr) break;
+      if (!hdr) { p += 0x1000n; continue; }
       const prev = u64At(hdr, 0), field = u64At(hdr, 8), size = field & ~7n;
-      if ((field & 7n) !== 2n || prev >= 0x1000n || size < 0x1000n || (size & 0xfffn) !== 0n || p + size > end) break;
+      if ((field & 7n) !== 2n || prev >= 0x1000n || size < 0x1000n || (size & 0xfffn) !== 0n || p + size > end) { p += 0x1000n; continue; }
       out.push({ address: p, user: p + 16n, size: Number(size), userSize: Number(size) - 16, state: "mmapped", flags: flagText(field & 7n), heap: "glibc:mmap", preview: hdr.slice(16, 32) });
       p += size;
     }
@@ -602,7 +612,7 @@ export async function exploreGlibc(env: GlibcEnv): Promise<HeapReport> {
   const mm = await mmappedChunks(mem, regions, skip, Math.max(0, max - report.chunks.length));
   if (mm.length) {
     report.chunks.push(...mm);
-    report.heaps.push({ id: "glibc:mmap", kind: "mmapped chunks", address: mm[0].address, label: "mmapped (heuristic)", committed: mm.reduce((s, c) => s + c.size, 0), counters: { chunks: mm.length }, ranges: mm.map((c) => ({ base: c.address, size: c.size, label: "mmap" })), notes: ["IS_MMAPPED chunk headers found at the start of anonymous writable mappings"] });
+    report.heaps.push({ id: "glibc:mmap", kind: "mmapped chunks", address: mm[0].address, label: "mmapped (heuristic)", committed: mm.reduce((s, c) => s + c.size, 0), counters: { chunks: mm.length }, ranges: mm.map((c) => ({ base: c.address, size: c.size, label: "mmap" })), notes: ["IS_MMAPPED chunk headers found on page boundaries of anonymous writable mappings"] });
   }
   report.chunks.sort((x, y) => (x.address < y.address ? -1 : x.address > y.address ? 1 : 0));
   if (mode === "auto") notes.push("glibc version unknown: safe-linked pointers decoded per pointer");
