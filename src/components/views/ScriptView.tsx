@@ -1,6 +1,6 @@
 // Script console: async JavaScript against the `ed` API, with saved scripts and captured output.
 import { useRef, useState } from "react";
-import { Play, Plus, Save, Square, Trash2 } from "lucide-react";
+import { BookOpen, Play, Plus, Save, Square, Trash2 } from "lucide-react";
 import { runScript, show } from "@/lib/scripting";
 import { useScripts, type Script } from "@/store/scripts";
 import { log } from "@/store/output";
@@ -26,6 +26,8 @@ export default function ScriptView() {
   const [cur, setCur] = useState<Script>(store.scripts[0] ?? { id: "new", name: "untitled", code: "" });
   const [out, setOut] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
+  const [showRef, setShowRef] = useState(() => { try { return localStorage.getItem("echodebug.script.ref") === "1"; } catch { return false; } });
+  const toggleRef = () => { setShowRef(!showRef); try { localStorage.setItem("echodebug.script.ref", showRef ? "0" : "1"); } catch { /* private mode */ } };
   const signal = useRef({ aborted: false });
 
   const run = async () => {
@@ -53,7 +55,7 @@ export default function ScriptView() {
   const create = () => setCur({ id: Math.random().toString(36).slice(2, 10), name: "untitled", code: "// ed.print(ed.module().name)\n" });
 
   return (
-    <div className="split-h" style={{ gridTemplateColumns: "200px minmax(0, 1fr) 300px" }}>
+    <div className="split-h" style={{ gridTemplateColumns: showRef ? "minmax(120px, 170px) minmax(280px, 1fr) minmax(220px, 300px)" : "minmax(120px, 170px) minmax(280px, 1fr)" }}>
       <div className="list-col">
         <div className="toolbar"><span className="panel-title grow">Scripts</span><IconButton tip="New script" onClick={create}><Plus size={14} /></IconButton></div>
         <div className="vlist">
@@ -67,12 +69,13 @@ export default function ScriptView() {
       </div>
       <div className="list-col">
         <div className="toolbar">
-          <input className="input" style={{ width: 220 }} value={cur.name} onChange={(e) => setCur({ ...cur, name: e.target.value })} />
+          <input className="input" style={{ width: 180, minWidth: 80, flexShrink: 1 }} value={cur.name} onChange={(e) => setCur({ ...cur, name: e.target.value })} />
           <IconButton tip="Run (Ctrl+Enter)" onClick={() => void run()} disabled={running}><Play size={14} /></IconButton>
           <IconButton tip="Stop" onClick={() => { signal.current.aborted = true; }} disabled={!running}><Square size={14} /></IconButton>
           <IconButton tip="Save" onClick={save}><Save size={14} /></IconButton>
           <span className="grow" />
-          <span className="faint" style={{ fontSize: 12 }}>runs in the app with full access to the target</span>
+          <span className="faint ellipsis" style={{ fontSize: 12, minWidth: 0 }} title="Scripts run in the app with full access to the target">full access to the target</span>
+          <IconButton tip={showRef ? "Hide the API reference" : "Show the API reference"} onClick={toggleRef}><BookOpen size={14} /></IconButton>
         </div>
         <textarea className="textarea mono" style={{ flex: "1 1 60%", resize: "none", border: "none", borderRadius: 0 }} spellCheck={false} value={cur.code}
           onChange={(e) => setCur({ ...cur, code: e.target.value })}
@@ -83,10 +86,10 @@ export default function ScriptView() {
         <div className="toolbar"><span className="panel-title grow">Output</span><button className="row-action" onClick={() => setOut([])}>clear</button></div>
         <pre className="mcp-result" style={{ flex: "1 1 40%", margin: 0, overflow: "auto", maxHeight: "none" }}>{out.join("\n")}</pre>
       </div>
-      <div className="list-col" style={{ borderRight: "none" }}>
+      {showRef && <div className="list-col" style={{ borderRight: "none" }}>
         <div className="toolbar"><span className="panel-title">API</span></div>
         <pre className="mcp-result" style={{ margin: 0, maxHeight: "none", whiteSpace: "pre-wrap" }}>{kRef}</pre>
-      </div>
+      </div>}
     </div>
   );
 }

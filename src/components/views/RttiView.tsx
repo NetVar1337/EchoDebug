@@ -15,6 +15,33 @@ import { request } from "@/lib/client";
 import { isElf } from "@/lib/analysis/elf";
 import type { Module } from "@/lib/hex";
 
+/** Live objects of a class: every qword in writable memory equal to its vtable (find_instances). */
+function Instances({ vtable }: { vtable: string }) {
+  const ui = useUi();
+  const modules = useConn((s) => s.modules);
+  const [r, setR] = useState<{ count: number; instances: string[]; truncated: boolean; class: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setR(null), [vtable]);
+  const find = async () => {
+    setBusy(true);
+    const out = await attempt("instances", request<{ count: number; instances: string[]; truncated: boolean; class: string }>("find_instances", { vtable, max: 2000 }));
+    setBusy(false);
+    if (out) { setR(out); log("info", "instances", `${out.count}${out.truncated ? "+" : ""} objects with vtable ${vtable}`); }
+  };
+  return (
+    <span>
+      <button className="btn small" disabled={busy} onClick={() => void find()}>{busy ? "Scanning…" : "Find instances"}</button>
+      {r && (
+        <span className="mono" style={{ fontSize: 12 }}>
+          {" "}{r.count}{r.truncated ? "+" : ""} objects{r.class ? ` (${r.class})` : ""}:{" "}
+          {r.instances.slice(0, 12).map((a) => <span key={a} className="link" style={{ marginRight: 6 }} onClick={() => ui.goStruct(a)}>{labelAddr(a, modules)}</span>)}
+          {r.instances.length > 12 ? "…" : ""}
+        </span>
+      )}
+    </span>
+  );
+}
+
 type ItaniumClass = { name: string; mangled: string; typeinfo: string | null; vtable: string | null; slots: number; bases: string[] };
 
 /** GCC/Clang modules: classes from the _ZTI/_ZTV symbols (Itanium C++ ABI), via the local backend. */
@@ -52,6 +79,7 @@ function ItaniumClasses({ m }: { m: Module }) {
               <td className="faint ellipsis">{c.bases.length ? `: ${c.bases.join(", ")}` : ""}</td>
               <td>{c.vtable ? <span className="link" onClick={() => ui.goMemory(c.vtable!)} title="vtable (first virtual slot)">{labelAddr(c.vtable, modules)}</span> : "—"}</td>
               <td className="faint">{c.slots} slots</td>
+              <td>{c.vtable ? <Instances vtable={c.vtable} /> : null}</td>
             </tr>
           ))}
         </tbody></table>
@@ -162,6 +190,7 @@ export default function RttiView() {
                   <span>vtable</span><span className="mono link" onClick={() => ui.goMemory(obj.vtable)}>{obj.vtable}</span>
                   <span>base</span><span>{obj.baseName || "—"}</span>
                 </div>
+                <div className="row"><Instances vtable={obj.vtable} /></div>
               </div>
               <div className="panel-section">
                 <div className="label">Virtual functions</div>
@@ -197,12 +226,13 @@ export default function RttiView() {
                   <div className="faint">No vftable found for this class (it may have none, or it is not a polymorphic type).</div>
                 ) : (
                   <table className="table mono">
-                    <thead><tr><th>Address</th><th>Slots</th></tr></thead>
+                    <thead><tr><th>Address</th><th>Slots</th><th /></tr></thead>
                     <tbody>
                       {vfts.map((v) => (
-                        <tr key={v.rva} onClick={() => ui.goMemory(v.address)}>
-                          <td className="link">{labelAddr(v.address, modules)}</td>
+                        <tr key={v.rva}>
+                          <td className="link" onClick={() => ui.goMemory(v.address)}>{labelAddr(v.address, modules)}</td>
                           <td className="dim">{v.slots}</td>
+                          <td><Instances vtable={typeof v.address === "string" ? v.address : "0x" + BigInt(v.address).toString(16)} /></td>
                         </tr>
                       ))}
                     </tbody>

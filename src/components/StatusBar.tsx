@@ -1,4 +1,5 @@
-import { SunMoon } from "lucide-react";
+import { Keyboard, PanelBottom, PanelLeft, PanelRight, ScanSearch, Sparkles, SunMoon } from "lucide-react";
+import { togglePanel, useVisiblePanels } from "@/lib/layout";
 import { useConn } from "@/store/conn";
 import { useMotion, kMotionPrefs } from "@/store/motion";
 import { useUi } from "@/store/ui";
@@ -22,6 +23,8 @@ export default function StatusBar() {
   const setUi = useUi((s) => s.set);
   const motion = useMotion((s) => s.pref);
   const setMotion = useMotion((s) => s.setPref);
+  const vis = useVisiblePanels();
+  const linuxLocal = c.os === "linux" || (!c.ext && c.localAvailable);
   const mismatch = c.ext && c.extVersion && c.extVersion !== c.appVersion;
 
   const cycleTheme = () => {
@@ -45,9 +48,16 @@ export default function StatusBar() {
       <Pill state={c.relay ? "ok" : "bad"} label={`Relay :${c.port}`} />
       <Pill state={c.mem ? "ok" : "idle"} label={c.agent ? "Memory: ready" : c.mem ? "Memory: local /proc" : "Memory: idle"} />
       <Pill state={c.modules.length ? "ok" : "idle"} label={c.modules.length ? `Modules: ${c.modules.length}` : "Modules: none"} />
-      <Pill state={c.ext ? (mismatch ? "busy" : "ok") : "bad"} label={c.ext ? `Agent v${c.extVersion}${mismatch ? ` ≠ app v${c.appVersion}` : ""}` : "Agent: offline"} />
+      {!(linuxLocal && !c.ext) && <Pill state={c.ext ? (mismatch ? "busy" : "ok") : "bad"} label={c.ext ? `Agent v${c.extVersion}${mismatch ? ` ≠ app v${c.appVersion}` : ""}` : "Agent: offline"} />}
+      <span className="status-sep" />
+      <button className="icon-button" data-active={vis.left} aria-label="Toggle side panel" data-tip="Side panel (Ctrl+B)" onClick={() => togglePanel("left")}><PanelLeft size={13} /></button>
+      <button className="icon-button" data-active={vis.scanner} aria-label="Toggle scanner" data-tip="Scanner (Ctrl+Alt+S)" onClick={() => togglePanel("scanner")}><ScanSearch size={13} /></button>
+      <button className="icon-button" data-active={vis.output} aria-label="Toggle output" data-tip="Output (Ctrl+J)" onClick={() => togglePanel("output")}><PanelBottom size={13} /></button>
+      <button className="icon-button" data-active={vis.inspector} aria-label="Toggle inspector" data-tip="Inspector (Ctrl+Alt+I)" onClick={() => togglePanel("inspector")}><PanelRight size={13} /></button>
+      <span className="status-sep" />
+      <button className="icon-button" aria-label="Keyboard shortcuts" data-tip="Keyboard shortcuts (F1)" onClick={() => setUi({ shortcutsOpen: true })}><Keyboard size={13} /></button>
       <button className="icon-button" data-tip={`Theme: ${theme}`} onClick={cycleTheme}><SunMoon size={13} /></button>
-      <button className="icon-button" data-tip={`Motion: ${motion}`} onClick={cycleMotion}><SunMoon size={13} /></button>
+      <button className="icon-button" data-tip={`Motion: ${motion}`} onClick={cycleMotion}><Sparkles size={13} /></button>
       <span className="faint">v{c.appVersion}</span>
     </footer>
   );

@@ -6,7 +6,7 @@ export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script";
+  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors" | "engines" | "lifter";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -21,6 +21,8 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "yara", label: "YARA" },
   { id: "pointers", label: "Pointers" },
   { id: "emulator", label: "Emulator" },
+  { id: "emudbg", label: "Emu Debugger" },
+  { id: "lifter", label: "Lifter" },
   { id: "graph", label: "Graph" },
   { id: "dotnet", label: ".NET" },
   { id: "crypto", label: "Crypto" },
@@ -32,6 +34,9 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "rtti", label: "RTTI" },
   { id: "xrefs", label: "Xrefs" },
   { id: "antidebug", label: "Anti-Debug" },
+  { id: "hooks", label: "Hooks" },
+  { id: "monitors", label: "Monitors" },
+  { id: "engines", label: "Engines" },
   { id: "bindiff", label: "BinDiff" },
   { id: "unpack", label: "Unpack" },
   { id: "decrypt", label: "Decrypt" },
@@ -39,9 +44,35 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "debugger", label: "Debugger" },
 ];
 
+/** Views grouped for the "All views" menu and the command palette. */
+export type ViewGroup = "Code" | "Memory" | "Binary" | "Dynamic";
+export const kViewGroups: Record<ViewGroup, { blurb: string; tabs: TabId[] }> = {
+  Code: { blurb: "disassembly, graphs, references, signatures", tabs: ["disassembly", "cfg", "graph", "xrefs", "strings", "signatures", "sigtools", "yara"] },
+  Memory: { blurb: "bytes, structures, pointers, snapshots, patches", tabs: ["memory", "structs", "pointers", "snapshots", "map", "patches"] },
+  Binary: { blurb: "PE, .NET, RTTI, triage, unpacking, engines", tabs: ["pe", "dotnet", "rtti", "triage", "crypto", "caves", "antidebug", "hooks", "bindiff", "unpack", "decrypt", "engines"] },
+  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "emudbg", "lifter", "emulator", "monitors", "script"] },
+};
+export const kTabHints: Partial<Record<TabId, string>> = {
+  disassembly: "functions and instructions", cfg: "control-flow graph of a function", graph: "call graph", xrefs: "who references an address",
+  strings: "ASCII / UTF-16 strings of a module", signatures: "make and test byte patterns", sigtools: "signature catalog, health and repair", yara: "YARA rules over memory",
+  memory: "hex view with find and edit", structs: "typed structure view", pointers: "pointer scanner and chains", snapshots: "diff memory over time", map: "module layout and entropy", patches: "every byte you changed, with undo",
+  pe: "headers, sections, imports, exports, resources", dotnet: ".NET metadata and IL", rtti: "C++ classes and vtables", triage: "suspicious imports", crypto: "crypto constants", caves: "free space in code sections", antidebug: "anti-debugging tricks", hooks: "inline / IAT hooks and patched code", bindiff: "compare with an older build", unpack: "find the OEP, rebuild imports", decrypt: "run string decryptors in the emulator", engines: "Unreal / Unity IL2CPP / Source dumps",
+  debugger: "breakpoints on the live process", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", emulator: "run a routine once", monitors: "module loads, page changes", script: "automate with JavaScript",
+};
+export const kDefaultOpenTabs: TabId[] = ["disassembly", "memory", "structs", "strings", "pe", "xrefs", "emudbg", "script"];
+export type PanelId = "left" | "scanner" | "inspector" | "output";
+
 type UiStore = {
   rail: RailView;
   tab: TabId;
+  /** tabs shown in the workspace strip, in order */
+  openTabs: TabId[];
+  /** panel visibility (narrow windows also auto-hide the scanner and inspector) */
+  panels: Record<PanelId, boolean>;
+  viewsOpen: boolean;
+  shortcutsOpen: boolean;
+  closeTab: (t: TabId) => void;
+  togglePanel: (p: PanelId) => void;
   settingsOpen: boolean;
   gotoOpen: boolean;
   paletteOpen: boolean;
@@ -78,11 +109,31 @@ type UiStore = {
   goModule: (name: string, tab: "pe" | "strings") => void;
 };
 
+/** Activating a tab opens it in the strip (after the active one) when it is not there yet. */
+function withTab(s: { tab: TabId; openTabs: TabId[] }, tab: TabId): { tab: TabId; openTabs: TabId[] } {
+  if (s.openTabs.includes(tab)) return { tab, openTabs: s.openTabs };
+  const at = s.openTabs.indexOf(s.tab);
+  const open = [...s.openTabs];
+  open.splice(at < 0 ? open.length : at + 1, 0, tab);
+  return { tab, openTabs: open };
+}
+
 export const useUi = create<UiStore>()(
   persist(
     (set) => ({
       rail: "targets",
       tab: "disassembly",
+      openTabs: kDefaultOpenTabs,
+      panels: { left: true, scanner: true, inspector: true, output: true },
+      viewsOpen: false,
+      shortcutsOpen: false,
+      closeTab: (t) => set((s) => {
+        const open = s.openTabs.filter((x) => x !== t);
+        if (!open.length) return {};
+        const i = s.openTabs.indexOf(t);
+        return { openTabs: open, tab: s.tab === t ? open[Math.min(i, open.length - 1)] : s.tab };
+      }),
+      togglePanel: (p) => set((s) => ({ panels: { ...s.panels, [p]: !s.panels[p] } })),
       settingsOpen: false,
       gotoOpen: false,
       paletteOpen: false,
@@ -104,18 +155,18 @@ export const useUi = create<UiStore>()(
       lastTarget: null,
       recentTargets: [],
       setRail: (rail) => set({ rail }),
-      setTab: (tab) => set({ tab }),
+      setTab: (tab) => set((s) => withTab(s, tab)),
       set: (p) => set(p),
       select: (selected) => set({ selected }),
-      goDisasm: (a) => set({ disasmAt: a, selected: a, tab: "disassembly" }),
-      goMemory: (a) => set({ memoryAt: a, selected: a, tab: "memory" }),
-      goStruct: (a) => set({ structAt: a, selected: a, tab: "structs" }),
-      goSig: (a) => set({ sigAt: a, selected: a, tab: "signatures" }),
-      goModule: (module, tab) => set({ module, tab }),
+      goDisasm: (a) => set((s) => ({ disasmAt: a, selected: a, ...withTab(s, "disassembly") })),
+      goMemory: (a) => set((s) => ({ memoryAt: a, selected: a, ...withTab(s, "memory") })),
+      goStruct: (a) => set((s) => ({ structAt: a, selected: a, ...withTab(s, "structs") })),
+      goSig: (a) => set((s) => ({ sigAt: a, selected: a, ...withTab(s, "signatures") })),
+      goModule: (module, tab) => set((s) => ({ module, ...withTab(s, tab) })),
     }),
     {
       name: "echodebug.ui",
-      partialize: (s) => ({ rail: s.rail, tab: s.tab, theme: s.theme, accent: s.accent, autoUpdate: s.autoUpdate, module: s.module, layout: s.layout, places: s.places, reattach: s.reattach, lastTarget: s.lastTarget, recentTargets: s.recentTargets }),
+      partialize: (s) => ({ rail: s.rail, tab: s.tab, openTabs: s.openTabs, panels: s.panels, theme: s.theme, accent: s.accent, autoUpdate: s.autoUpdate, module: s.module, layout: s.layout, places: s.places, reattach: s.reattach, lastTarget: s.lastTarget, recentTargets: s.recentTargets }),
     },
   ),
 );
