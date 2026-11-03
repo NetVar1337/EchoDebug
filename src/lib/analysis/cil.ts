@@ -84,6 +84,7 @@ export function disassembleIl(img: Uint8Array, rva: number, name: (token: number
     headerSize = 1;
     codeSize = h >> 2;
   } else if ((h & 3) === 3) {
+    if (rva + 12 > img.length) throw new IlError("fat method header runs past the image");
     flags = dv.getUint16(rva, true);
     headerSize = (flags >> 12) * 4;
     maxStack = dv.getUint16(rva + 2, true);
@@ -96,19 +97,26 @@ export function disassembleIl(img: Uint8Array, rva: number, name: (token: number
   const code: IlInsn[] = [];
   let p = 0;
   const hex = (a: number, b: number) => Array.from(img.subarray(start + a, start + b), (x) => x.toString(16).padStart(2, "0")).join("");
+  const kOperandSize: Record<Operand, number> = { none: 0, i8: 1, u8: 1, u16: 2, i32: 4, i64: 8, r4: 4, r8: 8, tok: 4, br8: 1, br32: 4, switch: 4 };
   while (p < codeSize) {
     const at = p;
     let op = img[start + p++];
     let entry: [string, Operand] | undefined;
-    if (op === 0xfe) {
+    if (op === 0xfe && p < codeSize) {
       op = img[start + p++];
       entry = two[op];
-    } else entry = one[op];
+    } else entry = op === 0xfe ? undefined : one[op];
     if (!entry) {
       code.push({ offset: at, size: p - at, bytes: hex(at, p), opcode: `.byte 0x${op.toString(16)}`, operand: "" });
       continue;
     }
     const [mn, kind] = entry;
+    // an operand cut off by the end of the body (or a switch table longer than it) ends the listing
+    const need = kOperandSize[kind] + (kind === "switch" && p + 4 <= codeSize ? dv.getUint32(start + p, true) * 4 : 0);
+    if (p + need > codeSize) {
+      code.push({ offset: at, size: codeSize - at, bytes: hex(at, codeSize), opcode: mn, operand: "<truncated>" });
+      break;
+    }
     let operand = "";
     let token: number | undefined;
     let targets: number[] | undefined;
@@ -146,9 +154,10 @@ export function disassembleIl(img: Uint8Array, rva: number, name: (token: number
       const fat = (kind & 0x40) !== 0;
       const size = fat ? img[s + 1] | (img[s + 2] << 8) | (img[s + 3] << 16) : img[s + 1];
       if ((kind & 0x01) !== 0) {
-        const n = fat ? Math.floor((size - 4) / 24) : Math.floor((size - 4) / 12);
+        const stride = fat ? 24 : 12;
+        const n = Math.min(Math.floor((size - 4) / stride), Math.floor((img.length - s - 4) / stride));
         for (let i = 0; i < n; i++) {
-          const c = s + 4 + i * (fat ? 24 : 12);
+          const c = s + 4 + i * stride;
           const f = fat ? dv.getUint32(c, true) : dv.getUint16(c, true);
           const tryStart = fat ? dv.getUint32(c + 4, true) : dv.getUint16(c + 2, true);
           const tryLen = fat ? dv.getUint32(c + 8, true) : img[c + 4];
@@ -178,10 +187,16 @@ export type UserStringRef = { token: number; method: string; methodToken: number
 /** Every `ldstr` in every method body: user-string token → the places that load it. */
 export function userStringRefs(img: Uint8Array, methods: readonly { token: number; rva: number; name: string; type: string }[]): Map<number, UserStringRef[]> {
   const out = new Map<number, UserStringRef[]>();
+  // methods may share a body (hostile metadata points thousands at one huge one): decode each once
+  const bodies = new Map<number, IlBody | null>();
   for (const m of methods) {
     if (!m.rva) continue;
-    let body: IlBody;
-    try { body = disassembleIl(img, m.rva); } catch { continue; }
+    let body = bodies.get(m.rva);
+    if (body === undefined) {
+      try { body = disassembleIl(img, m.rva); } catch { body = null; }
+      bodies.set(m.rva, body);
+    }
+    if (!body) continue;
     for (const i of body.code) {
       if (i.opcode !== "ldstr" || i.token === undefined) continue;
       const list = out.get(i.token) ?? [];
