@@ -91,6 +91,28 @@ pub fn default_token() -> io::Result<Option<String>> {
     load_or_create(&token_path()).map(Some)
 }
 
+/// Files the removed in-app assistant used for the user's Anthropic API key: a DPAPI blob on
+/// Windows, a mode-0600 plain file elsewhere (both in [`config_dir`]).
+pub const ASSISTANT_KEY_FILES: &[&str] = &["anthropic-key.dpapi", "anthropic-key"];
+
+/// Deletes the assistant's stored API key, if any, and returns the paths removed. Runs on every
+/// app start (a no-op once the files are gone). The plain file is overwritten with zeros before it
+/// is unlinked so the secret does not linger in the old blocks.
+pub fn remove_assistant_key_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for name in ASSISTANT_KEY_FILES {
+        let path = dir.join(name);
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        if meta.is_file() {
+            let _ = fs::write(&path, vec![0u8; meta.len() as usize]);
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 /// Constant-time comparison so the token cannot be guessed byte by byte from timings.
 pub fn eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -139,6 +161,22 @@ mod tests {
         fs::write(&path, "short").unwrap();
         let c = load_or_create(&path).unwrap();
         assert_ne!(c, "short", "an invalid stored token is replaced");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assistant_key_cleanup() {
+        let dir = std::env::temp_dir().join(format!("echodebug-keyclean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("anthropic-key"), "sk-ant-api03-secret").unwrap();
+        fs::write(dir.join("anthropic-key.dpapi"), [1u8, 2, 3]).unwrap();
+        fs::write(dir.join("relay-token"), "keep").unwrap();
+        let removed = remove_assistant_key_files(&dir);
+        assert_eq!(removed.len(), 2);
+        assert!(!dir.join("anthropic-key").exists() && !dir.join("anthropic-key.dpapi").exists());
+        assert!(dir.join("relay-token").exists(), "other files stay");
+        assert!(remove_assistant_key_files(&dir).is_empty(), "second run is a no-op");
         let _ = fs::remove_dir_all(&dir);
     }
 

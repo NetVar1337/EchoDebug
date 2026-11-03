@@ -221,6 +221,7 @@ async fn mcp(relay: &Relay, body: Value) -> Value {
         .oneshot(
             Request::post("/mcp")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("mcp-protocol-version", "2025-06-18")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .body(Body::from(body.to_string()))
                 .unwrap(),

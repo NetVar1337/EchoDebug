@@ -48,7 +48,6 @@ const kLeft = {
   names: lazy(() => import("@/components/panels/NamesPanel")),
   mcp: lazy(() => import("@/components/panels/McpPanel")),
   sync: lazy(() => import("@/components/panels/SyncPanel")),
-  assistant: lazy(() => import("@/components/panels/AssistantPanel")),
 };
 const SettingsModal = lazy(() => import("@/components/SettingsModal"));
 

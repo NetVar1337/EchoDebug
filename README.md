@@ -115,13 +115,12 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Script | Async JavaScript against an `ed` API (verbs, memory, journaled writes, names, disassembly, every app analysis), saved scripts |
 | Disassembler sync | **IDA 9.x, Ghidra 11.1+ and Binary Ninja** plugins (`integrations/`) connect to the relay's token-protected `/sync` WebSocket: the disassembly cursor follows the disassembler and the disassembler follows EchoDebug, names and comments sync both ways (last writer wins, conflicts in the sync log), struct types are pushed as C declarations; locations travel as module + RVA so ASLR and rebased databases line up. **Sync** panel (⇄ in the rail): connected tools, module mapping, a toggle per direction, the log. MCP tool `sync_status` (read-only) |
 | Plugins | Third-party **views, palette commands, address context-menu entries and table analyses** as JavaScript modules in `<config>/EchoDebug/plugins`, built on the Script `ed` API; a `manifest.json` declares id, version, entry and permissions (`write` for journaled writes, `annotate` for names; read-only otherwise), shown before you enable a plugin in Settings → Plugins. Example in `examples/plugins/`. Plugins are never exposed over MCP |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, decompiler and unflattening, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, PDB symbols / types / source lines, …) and tools that read and set your names and comments, list and revert journalled patches and list saved signatures, 16 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
+| MCP server | Native MCP server at `http://127.0.0.1:47110/mcp` (Streamable HTTP, token-protected) and over stdio (`echodebug-relay --stdio`, or the app's own `--mcp-stdio`; no token). Speaks protocol **2026-07-28** (stateless requests, `server/discover`, `subscriptions/listen`, elicitation by multi round-trip) and negotiates down to 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05 (initialize, `Mcp-Session-Id`). The backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, decompiler and unflattening, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, PDB symbols / types / source lines, …), names / comments / patches / signatures tools, 16 prompts, 4 resources and 6 templates; titles, structured output with `outputSchema`, `resource_link` results, paginated lists, `tools/list_changed` when the app window, backend or policy changes the tool set, logging, progress, cancellation, `GET /mcp/health`. The **MCP Server** panel: a first-run card with a test call, the connected clients (name / version, transport, protocol, last call, Disconnect), **one-click client setup** with a diff preview and backup, copyable snippets, tool profiles, a schema-driven tool tester and a live `tools/call` log |
 | Value graphs | **Value Graphs** tab: watched addresses plotted over time (i8..u64, f32, f64), several series at once, fed by a batched poll (20 ms–10 s) and the agent's `watch_event` stream into per-series ring buffers (configurable length); wheel zooms, drag pans, double-click returns to live; hover cursor with value and time; pause; min / max / avg over the visible window; CSV export; **Graph this** from the watchlist (button or right-click) |
 | Search everything | **Ctrl+Shift+F** (also in the command palette): one box over names, comments, bookmarks and labelled watches, saved signatures, struct types and fields, modules, exports of every loaded module (read from the export directory only) and the strings of modules already opened in Strings; **Search strings in all modules** extracts the rest on request. Fuzzy ranking (word starts, camelCase, addresses), grouped results, arrow keys + Enter jump to the right view |
-| Assistant | **Assistant** panel (rail, ✦): chat with Claude using your own Anthropic API key (Settings → Assistant; DPAPI-encrypted on Windows, a 0600 file elsewhere; kept by the desktop app and sent only to api.anthropic.com). **Explain function** (disassembly + pseudocode of the function at the cursor with your names and comments), **Suggest names** (function, callees, globals, locals → a review list you accept one by one), **Suggest struct fields** (from the Structs view's live sample → review list), **Summarise module** (imports, strings, triage). The assistant can call EchoDebug's read-only MCP tools (never writes, freezes, dumps, patch reverts, renames, emulation or debugger control) and every call is shown in the transcript. Model and effort pickers (default Claude Opus 5.5). What you send there goes to Anthropic |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script. **Module projects** keep names, comments and bookmarks per module build (by RVA) and restore them on the next attach, wherever ASLR puts the module; when a module's build changes, its saved items are **re-located** by a signature made per name and bookmark (Names panel → Sign), with matched / moved / lost counts, and project exports also carry the signature catalog; panel sizes, the last place in each view and (optionally) the last target are restored on start; a target switcher in the Targets panel |
-| MCP policy | Settings in the MCP panel: allow everything, **ask** (an Allow/Deny dialog in the window for writes, freezes, dumps and debugger breakpoints / monitors) or read-only, plus allow/deny tool lists, an optional audit file (`mcp-audit.jsonl`) and JSONL export. Tools carry MCP annotations and structured output; resource templates (`echodebug://memory/{address}/{size}`, `module/{name}/exports`, …) and argument completion are supported |
+| MCP policy | **Tool profiles**: Read-only analysis, Reverse engineering, Full control, mapped onto the policy: allow everything, **ask** (writes, freezes, patch reverts, dumps, real-thread traces and debugger breakpoints / monitors wait for approval: in the client when it supports form elicitation, else an Allow/Deny dialog in the window) or read-only, plus allow/deny tool lists (denied tools are not listed to clients), an optional audit file (`mcp-audit.jsonl`) and JSONL export. Tools carry MCP annotations; resource templates (`echodebug://memory/{address}/{size}`, `module/{name}/exports`, …) and argument completion are supported |
 | Lifter | **Lifter** tab (and `lift_block` / `lift_trace` / `devirt` tools): x86-64 lifted to expressions with symbolic execution. **Block** shows each instruction's effect, dead code and the branch condition (constant = opaque predicate); **Deobfuscate trace** emulates a function against the live process, slices away junk, push/pop noise and dead stores, simplifies formulas (MBA included) and folds loops (`[rdi + i] = [rsi + i] ^ 0x5a for i in 0..n`); **Devirtualize** finds a VM's dispatcher, lifts each handler, guesses the VIP register and lists the virtual instruction stream. Scratch buffers for pointer arguments are one checkbox away |
 | Agent extras | Emulation with API stand-ins (unpackers and decryptors run to the end), unpacking-layer detection, register-change traces, zero-filled unmapped reads and xmm registers; Emu Debugger watchpoints, conditional breakpoints and snapshots; typed watches with conditions, hit counts and history; add/clamp freezes in groups; backend snapshot diffs; pointer maps compared across restarts; object instances by vtable; backend xref scans; multi-threaded scans; cancel, stats and a write journal; an **EchoDebug** tab inside Echo with status and safety switches; settings in `echodebug/agent.json` |
 | Emulated debugger | **Emu Debugger** tab: a persistent Unicorn session over the target's memory — step, run to an address, breakpoints, edit registers and memory, watch the stack — without touching the process (`emu_*` verbs, also as MCP tools) |
@@ -178,33 +177,63 @@ window (permissions are enforced by the API, not a sandbox), so install only plu
 
 ### Connecting an MCP client
 
+Open the **MCP Server** panel (rail) → **Connect a client**. EchoDebug finds the clients installed on
+this machine and adds or removes one `echodebug` entry in each one's own config file, after showing you
+the exact change; nothing else in the file is touched (comments and other servers stay) and the old file
+is kept next to it as `<file>.echodebug-backup-<time>`. Restart the client afterwards, then **Run a test
+call** (or ask the client to call the `status` tool).
+
+| Client | Config EchoDebug edits (Windows · macOS · Linux) | Transports |
+|---|---|---|
+| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json` · `~/Library/Application Support/Claude/…` · `~/.config/Claude/…` (`mcpServers`) | stdio |
+| Claude Code | `~/.claude.json` (user scope, `mcpServers`), or `claude mcp add --scope user …` | HTTP, stdio |
+| Cursor | `~/.cursor/mcp.json` (`mcpServers`) | HTTP, stdio |
+| VS Code | user `mcp.json`: `%APPDATA%\Code\User` · `~/Library/Application Support/Code/User` · `~/.config/Code/User` (`servers`) | HTTP, stdio |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` (`mcpServers`, `serverUrl`) | HTTP, stdio |
+| Zed | `%APPDATA%\Zed\settings.json` · `~/.config/zed/settings.json` (`context_servers`) | HTTP, stdio |
+| Codex CLI | `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` (`[mcp_servers.echodebug]`) | HTTP, stdio |
+| Gemini CLI | `~/.gemini/settings.json` (`mcpServers`, `httpUrl`) | HTTP, stdio |
+| Continue | `~/.continue/mcpServers/echodebug.yaml` (a block file of its own) | HTTP, stdio |
+| Cline | `…/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`, or the CLI's `~/.cline/data/settings/cline_mcp_settings.json` | HTTP, stdio |
+
+**HTTP** connects to the running app (`http://127.0.0.1:47110/mcp` with `Authorization: Bearer <token>`,
+so the token is written into that client's file). **stdio** makes the client start
+`EchoDebug --mcp-stdio` (the app executable, no window) or `echodebug-relay --stdio`: it needs no token
+(it reads it from `<config>/EchoDebug/relay-token`, stdio being local), bridges to the running app, and
+runs its own headless relay when the app is closed (then the `ui_*` tools are not available). For any
+other client the panel has copyable JSON, CLI commands and a curl probe, for example:
+
 ```bash
-claude mcp add --transport http echodebug http://127.0.0.1:47110/mcp --header "Authorization: Bearer <token>"
+claude mcp add --scope user --transport http echodebug http://127.0.0.1:47110/mcp --header "Authorization: Bearer <token>"
+claude mcp add --scope user echodebug -- echodebug-relay --stdio
+curl -s http://127.0.0.1:47110/mcp/health        # {"ok":true,"latest":"2026-07-28","authorized":null,…}
 ```
 
-The MCP Server panel shows this command with your token filled in. The relay listens on `127.0.0.1`
-only, requires the token on `/client` and `/mcp` (stored in `<config>/EchoDebug/relay-token`;
-`ECHODEBUG_TOKEN` overrides it, `ECHODEBUG_AUTH=0` turns the check off) and rejects browser origins
-other than the app's own, so other programs and web pages cannot reach your target's memory.
-**Regenerate token** (Settings or the MCP Server panel) replaces the stored token; the relay switches
-at once and MCP clients must be re-added with the new command.
+The relay listens on `127.0.0.1` only, requires the token on `/client`, `/sync` and `/mcp` (stored in
+`<config>/EchoDebug/relay-token`; `ECHODEBUG_TOKEN` overrides it, `ECHODEBUG_AUTH=0` turns the check
+off) and rejects browser origins other than the app's own, so other programs and web pages cannot reach
+your target's memory. A missing or wrong token gets a 401 that says where to copy the current one.
+**Regenerate token** (Settings or the MCP Server panel) replaces the stored token; use **Update** in
+Connect a client to rewrite HTTP entries.
 
-For stdio clients: `claude mcp add echodebug -- echodebug-relay --stdio`.
+**Tool profiles** set the call policy in one click: *Read-only analysis* (reads, disassembly and
+analyses, attach / detach; nothing that writes, freezes, dumps, renames, scans or emulates is offered),
+*Reverse engineering* (everything, writes / freezes / dumps need approval), *Full control*. Tools a
+profile denies disappear from `tools/list`, and clients are told when the list changes. Approval in
+"ask" mode happens in the client when it supports form elicitation (switchable), otherwise in the app
+window. The panel lists connected clients (from `initialize` or each request's `clientInfo`) with their
+last call and a **Disconnect** button, and its tool tester runs a tool through exactly the path a
+client uses.
 
-Any MCP client works: the relay speaks Streamable HTTP JSON-RPC 2.0 (`initialize`, `ping`,
-`tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read|subscribe|templates/list`,
-`completion/complete`; batches supported,
-notifications answered with `202`; `GET /mcp` with `Accept: text/event-stream` streams resource updates
-and agent events; a `tools/call` with a `progressToken` streams scan progress). Prompts:
+Protocol details (versions, headers, errors, notifications) are in PROTOCOL.md → MCP surface. Prompts:
 `explain_function`, `find_pattern`, `find_string`, `pointer_path`, `scan_value`, `triage_module`,
 `find_vtable`, `make_signature`, `diff_snapshots`, `unpack_module`, `decrypt_strings`,
 `deobfuscate_function`, `devirtualize`, `find_value_references`, `rebuild_class`,
-`update_signatures_after_patch`. Resources:
-`echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`, `echodebug://target/modules`. Tools
-named `ui_*` and the annotation tools (`list_names`, `set_name`, `list_comments`, `set_comment`,
-`list_patches`, `revert_patch`, `list_signatures`) run in the app window; with only the headless relay
-they answer with a clear error. `revert_patch` writes target memory, so the ask / read-only policy
-applies to it.
+`update_signatures_after_patch`. Resources: `echodebug://status`, `echodebug://tools`,
+`echodebug://mcp/log`, `echodebug://target/modules`. Tools named `ui_*` and the annotation tools
+(`list_names`, `set_name`, `list_comments`, `set_comment`, `list_patches`, `revert_patch`,
+`list_signatures`) run in the app window and are listed only while one is open. Scripts and plugins
+are never exposed over MCP.
 
 ## Development
 

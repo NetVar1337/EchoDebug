@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use echo_debug_relay::{assistant, auth, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
+use echo_debug_relay::{auth, mcp_clients, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
 use serde::Serialize;
-use serde_json::Value;
-use tauri::ipc::Channel;
+use serde_json::{json, Value};
 use tauri::Manager;
 
 mod plugins;
@@ -140,55 +137,93 @@ fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|e| format!("read {}: {e}", path))
 }
 
-/// Running assistant requests by the UI's id, so the UI can cancel them.
-#[derive(Default)]
-struct AssistantState {
-    streams: Mutex<HashMap<u32, Arc<AtomicBool>>>,
+// ---- MCP client setup ---------------------------------------------------------------------------
+//
+// One-click setup of MCP clients (relay/src/mcp_clients.rs). The file paths come only from that
+// module's table of known client configs; the UI passes a client id and never a path, and nothing
+// is written until the user confirms the previewed diff.
+
+/// What a client config gets: the HTTP endpoint with the token, or this executable in stdio mode.
+fn mcp_server_spec(state: &RelayState) -> mcp_clients::Server {
+    let token = state.token.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let command = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "echodebug".into());
+    let mut args = vec!["--mcp-stdio".to_owned()];
+    if state.port != DEFAULT_PORT {
+        args.push(state.port.to_string());
+    }
+    mcp_clients::Server { url: format!("http://127.0.0.1:{}/mcp", state.port), token, command, args }
 }
 
-/// Whether an Anthropic API key is stored, and how (never the key itself).
-#[tauri::command]
-fn assistant_key_status() -> Value {
-    assistant::key_info()
+fn mcp_action(action: &str, transport: Option<&str>) -> Result<mcp_clients::Action, String> {
+    match action {
+        "uninstall" => Ok(mcp_clients::Action::Uninstall),
+        "install" => {
+            let t = transport.and_then(mcp_clients::Transport::parse).ok_or("install needs transport 'http' or 'stdio'")?;
+            Ok(mcp_clients::Action::Install(t))
+        }
+        other => Err(format!("unknown action '{other}'")),
+    }
 }
 
+/// Every known client: whether it is installed, where its config is and how EchoDebug is in it.
 #[tauri::command]
-fn assistant_set_key(key: String) -> Result<Value, String> {
-    assistant::save_key(&key)
-}
-
-#[tauri::command]
-fn assistant_clear_key() -> Result<Value, String> {
-    assistant::clear_key()?;
-    Ok(assistant::key_info())
-}
-
-/// Streams one Messages API request. The body comes from the UI and is checked by
-/// `assistant::prepare_body` (read-only tools only, no fields that send data elsewhere); the key is
-/// added here and goes nowhere but api.anthropic.com. Every SSE event is sent on `on_event`.
-#[tauri::command]
-async fn assistant_send(state: tauri::State<'_, AssistantState>, id: u32, body: Value, on_event: Channel<Value>) -> Result<(), String> {
-    let key = assistant::load_key().ok_or("no Anthropic API key: add one in Settings → Assistant")?;
-    let body = assistant::prepare_body(body)?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    state.streams.lock().unwrap_or_else(|e| e.into_inner()).insert(id, cancel.clone());
-    let flag = cancel.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        assistant::stream(&key, &body, &flag, |ev| {
-            let _ = on_event.send(ev);
+fn mcp_clients(state: tauri::State<'_, RelayState>) -> Value {
+    let env = mcp_clients::Env::current();
+    let server = mcp_server_spec(&state);
+    let clients: Vec<Value> = mcp_clients::CLIENTS
+        .iter()
+        .map(|c| {
+            let mut row = mcp_clients::status(c, &env);
+            let mut snippets = serde_json::Map::new();
+            if c.http {
+                snippets.insert("http".into(), json!(mcp_clients::snippet(c, mcp_clients::Transport::Http, &server)));
+            }
+            if c.stdio {
+                snippets.insert("stdio".into(), json!(mcp_clients::snippet(c, mcp_clients::Transport::Stdio, &server)));
+            }
+            row["snippets"] = Value::Object(snippets);
+            row
         })
-    })
-    .await
-    .map_err(|e| e.to_string())
-    .and_then(|r| r);
-    state.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    result
+        .collect();
+    json!({ "clients": clients, "stdio": { "command": server.command, "args": server.args } })
 }
 
+/// The diff one-click setup would apply to a client's config. Writes nothing.
 #[tauri::command]
-fn assistant_cancel(state: tauri::State<'_, AssistantState>, id: u32) {
-    if let Some(c) = state.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
-        c.store(true, Ordering::Relaxed);
+fn mcp_client_preview(state: tauri::State<'_, RelayState>, id: String, action: String, transport: Option<String>) -> Result<Value, String> {
+    let c = mcp_clients::client(&id).ok_or_else(|| format!("unknown MCP client '{id}'"))?;
+    let plan = mcp_clients::plan(c, &mcp_clients::Env::current(), &mcp_server_spec(&state), mcp_action(&action, transport.as_deref())?)?;
+    Ok(plan.to_json())
+}
+
+/// Applies the change the user saw: refused when the planned diff is no longer `diff`.
+#[tauri::command]
+fn mcp_client_apply(state: tauri::State<'_, RelayState>, id: String, action: String, transport: Option<String>, diff: String) -> Result<Value, String> {
+    let c = mcp_clients::client(&id).ok_or_else(|| format!("unknown MCP client '{id}'"))?;
+    let plan = mcp_clients::plan(c, &mcp_clients::Env::current(), &mcp_server_spec(&state), mcp_action(&action, transport.as_deref())?)?;
+    if plan.diff != diff {
+        return Err(format!("{} changed since the preview; preview again", plan.path.display()));
+    }
+    let done = mcp_clients::apply(&plan)?;
+    Ok(json!({ "path": done.path.display().to_string(), "backup": done.backup.map(|b| b.display().to_string()) }))
+}
+
+/// `EchoDebug --mcp-stdio [port]`: MCP over stdin/stdout for clients that launch servers
+/// (bridged to the running app, or its own relay when the app is closed). No window opens.
+pub fn run_mcp_stdio(args: &[String]) -> i32 {
+    let port = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .or_else(|| std::env::var("ECHODEBUG_PORT").ok())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    match tauri::async_runtime::block_on(echo_debug_relay::serve_stdio(port, env!("CARGO_PKG_VERSION").to_string())) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("echodebug --mcp-stdio failed: {e}");
+            1
+        }
     }
 }
 
@@ -205,6 +240,11 @@ pub fn run() {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(DEFAULT_PORT);
             let version = app.package_info().version.to_string();
+            // The in-app assistant was removed: delete the API key it may have stored (a DPAPI
+            // blob on Windows, a 0600 file elsewhere) so no secret is left behind.
+            for p in auth::remove_assistant_key_files(&auth::config_dir()) {
+                eprintln!("removed the stored assistant API key {}", p.display());
+            }
             // Every /client and /mcp request must carry this token (see relay/src/auth.rs).
             let token = match auth::default_token() {
                 Ok(t) => t,
@@ -242,7 +282,6 @@ pub fn run() {
                 eprintln!("host os '{}': skipping Echo agent install (Windows-only); local /proc backend active", std::env::consts::OS);
             }
             app.manage(RelayState { port, error, relay, token: Mutex::new(token) });
-            app.manage(AssistantState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -258,11 +297,9 @@ pub fn run() {
             plugins::plugins_dir,
             plugins::list_plugins,
             plugins::read_plugin_file,
-            assistant_key_status,
-            assistant_set_key,
-            assistant_clear_key,
-            assistant_send,
-            assistant_cancel
+            mcp_clients,
+            mcp_client_preview,
+            mcp_client_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

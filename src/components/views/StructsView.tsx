@@ -12,7 +12,6 @@ import { fieldValue, kFieldSizes, layout, toCpp, type Field, type FieldType } fr
 import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
 import { useTypes, type TypeDef } from "@/store/types";
-import { useStructCtx } from "@/store/structctx";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
 import AutoDetect from "./structs/AutoDetect";
@@ -50,17 +49,6 @@ export default function StructsView() {
     ui.set({ structTypeId: null });
     if (t) select(t);
   }, [ui.structTypeId]);
-
-  // the assistant reads what is shown here and hands accepted fields back
-  useEffect(() => {
-    useStructCtx.setState({ name: cls.name, base: base ?? null, fields: cls.fields, data, rtti: (base && rtti[base]) || "" });
-  }, [cls.name, cls.fields, base, data, rtti]);
-  const pending = useStructCtx((s) => s.pending);
-  useEffect(() => {
-    if (!pending) return;
-    useStructCtx.setState({ pending: null });
-    setCls((c) => ({ ...c, fields: pending }));
-  }, [pending]);
 
   // search everything → a struct type: open it here
   useEffect(() => {
