@@ -241,6 +241,8 @@ fn owned(d: pdb::TypeData<'_>) -> Ty {
 }
 
 const DEPTH: usize = 24;
+/// Type records `name` visits at most for one spelling.
+const NAME_BUDGET: usize = 256;
 
 impl TypeDb {
     /// Builds the name index after `types` is filled.
@@ -319,9 +321,11 @@ impl TypeDb {
         let mut out = Vec::new();
         let mut cur = Some(list);
         let mut guard = 0;
+        let mut seen = std::collections::HashSet::new();
         while let Some(i) = cur {
             guard += 1;
-            if guard > 4096 {
+            // a continuation that loops back would list the same members up to 4096 times
+            if guard > 4096 || !seen.insert(i) {
                 break;
             }
             match self.get(i) {
@@ -344,13 +348,17 @@ impl TypeDb {
 
     /// C-like spelling of a type.
     pub fn name(&self, idx: u32) -> String {
-        self.name_d(idx, 0)
+        self.name_d(idx, 0, &std::cell::Cell::new(NAME_BUDGET))
     }
 
-    fn name_d(&self, idx: u32, d: usize) -> String {
-        if d > DEPTH {
+    /// `work` counts the records visited: depth alone does not bound a type graph whose function
+    /// types list the same pointer-to-function argument many times (fan-out ^ DEPTH; a hostile
+    /// PDB hung `name` there).
+    fn name_d(&self, idx: u32, d: usize, work: &std::cell::Cell<usize>) -> String {
+        if d > DEPTH || work.get() == 0 {
             return "…".into();
         }
+        work.set(work.get() - 1);
         if idx < self.first {
             return primitive(idx).0;
         }
@@ -359,9 +367,9 @@ impl TypeDb {
                 let star = if *reference { "&" } else { "*" };
                 let c = if *konst { " const" } else { "" };
                 if let Some(Ty::Proc { ret, args, .. }) = self.get(*to) {
-                    return format!("{} (*{c})({})", ret.map(|r| self.name_d(r, d + 1)).unwrap_or_else(|| "void".into()), self.arg_names(*args, d + 1));
+                    return format!("{} (*{c})({})", ret.map(|r| self.name_d(r, d + 1, work)).unwrap_or_else(|| "void".into()), self.arg_names(*args, d + 1, work));
                 }
-                format!("{}{star}{c}", self.name_d(*to, d + 1))
+                format!("{}{star}{c}", self.name_d(*to, d + 1, work))
             }
             Some(Ty::Mod { to, konst, vol }) => {
                 let mut s = String::new();
@@ -371,26 +379,34 @@ impl TypeDb {
                 if *vol {
                     s.push_str("volatile ");
                 }
-                s + &self.name_d(*to, d + 1)
+                s + &self.name_d(*to, d + 1, work)
             }
             Some(Ty::Array { elem, size, .. }) => {
                 let es = self.size(*elem).max(1);
-                format!("{}[{}]", self.name_d(*elem, d + 1), *size as u64 / es)
+                format!("{}[{}]", self.name_d(*elem, d + 1, work), *size as u64 / es)
             }
-            Some(Ty::Bitfield { to, len, .. }) => format!("{} : {len}", self.name_d(*to, d + 1)),
+            Some(Ty::Bitfield { to, len, .. }) => format!("{} : {len}", self.name_d(*to, d + 1, work)),
             Some(Ty::Udt { name, .. }) | Some(Ty::Enum { name, .. }) => name.clone(),
-            Some(Ty::Proc { ret, args, .. }) => format!("{} ({})", ret.map(|r| self.name_d(r, d + 1)).unwrap_or_else(|| "void".into()), self.arg_names(*args, d + 1)),
-            Some(Ty::Args(_)) => format!("({})", self.arg_names(idx, d + 1)),
+            Some(Ty::Proc { ret, args, .. }) => format!("{} ({})", ret.map(|r| self.name_d(r, d + 1, work)).unwrap_or_else(|| "void".into()), self.arg_names(*args, d + 1, work)),
+            Some(Ty::Args(_)) => format!("({})", self.arg_names(idx, d + 1, work)),
             _ => format!("<type 0x{idx:x}>"),
         }
     }
 
-    fn arg_names(&self, args: u32, d: usize) -> String {
+    fn arg_names(&self, args: u32, d: usize, work: &std::cell::Cell<usize>) -> String {
         let a = self.args(args);
         if a.is_empty() {
             return "void".into();
         }
-        a.iter().map(|x| if *x == 0 { "...".into() } else { self.name_d(*x, d) }).collect::<Vec<_>>().join(", ")
+        let mut out: Vec<String> = Vec::new();
+        for x in &a {
+            if work.get() == 0 {
+                out.push("…".into());
+                break;
+            }
+            out.push(if *x == 0 { "...".into() } else { self.name_d(*x, d, work) });
+        }
+        out.join(", ")
     }
 
     /// Kind word for listings.
@@ -568,11 +584,16 @@ impl TypeDb {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         let mut total = 0;
+        // member counts per field list: hostile types all share one huge list
+        let mut counts: HashMap<(u32, bool), usize> = HashMap::new();
+        let mut count_of = |list: u32, data_only: bool| -> usize {
+            *counts.entry((list, data_only)).or_insert_with(|| self.members(list).iter().filter(|m| !data_only || matches!(m, Member::Data { .. })).count())
+        };
         for (i, t) in self.types.iter().enumerate() {
             let idx = self.first + i as u32;
             let (name, kind, size, count) = match t {
-                Ty::Udt { name, kind, size, fields, forward: false, .. } => (name, *kind, *size, fields.map(|l| self.members(l).iter().filter(|m| matches!(m, Member::Data { .. })).count()).unwrap_or(0)),
-                Ty::Enum { name, underlying, fields, forward: false, .. } => (name, "enum", self.size(*underlying), self.members(*fields).len()),
+                Ty::Udt { name, kind, size, fields, forward: false, .. } => (name, *kind, *size, fields.map(|l| count_of(l, true)).unwrap_or(0)),
+                Ty::Enum { name, underlying, fields, forward: false, .. } => (name, "enum", self.size(*underlying), count_of(*fields, false)),
                 _ => continue,
             };
             if (!f.is_empty() && !name.to_lowercase().contains(&f)) || !seen.insert(name.clone()) {
@@ -625,8 +646,20 @@ fn read_types(pdb: &mut pdb::PDB<'_, fs::File>) -> Result<TypeDb, String> {
 // ------------------------------------------------------------------------------------------------
 // loading
 
+/// Runs a `pdb` crate reader over a file that came from a symbol server or the disk. The crate
+/// indexes and slices with sizes taken from the file (`names_buf[name_offset..]`,
+/// `stream[start..start + size]`) and panics on a damaged one, in release builds too; the panic
+/// becomes an error instead of taking the relay's worker down.
+pub fn guarded<T>(what: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err(format!("{}: damaged PDB (the reader gave up)", what.display())))
+}
+
 /// Reads everything we use from a PDB.
 pub fn load(path: &Path) -> Result<Loaded, String> {
+    guarded(path, || load_unguarded(path))
+}
+
+fn load_unguarded(path: &Path) -> Result<Loaded, String> {
     let file = fs::File::open(path).map_err(e2s)?;
     let mut pdb = pdb::PDB::open(file).map_err(e2s)?;
     let info = pdb.pdb_information().map_err(e2s)?;
