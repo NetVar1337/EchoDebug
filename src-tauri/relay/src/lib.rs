@@ -21,7 +21,6 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub mod a64;
 pub mod arch;
-pub mod assistant;
 pub mod auth;
 pub mod local;
 pub mod local_dbg;

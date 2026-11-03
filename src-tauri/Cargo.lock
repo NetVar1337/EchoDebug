@@ -1032,7 +1032,6 @@ dependencies = [
  "tower",
  "unicorn-engine",
  "ureq",
- "windows-sys 0.61.2",
  "yaxpeax-arch",
  "yaxpeax-arm",
 ]

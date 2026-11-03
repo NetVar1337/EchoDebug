@@ -338,11 +338,6 @@ await step("search everything finds a name and jumps to it", async () => {
   await until(async () => (await page.locator(".tabs-wrap .tab[data-active=true]").innerText()).startsWith("Disassembly"));
 });
 
-await step("assistant panel explains it needs the desktop app in a browser", async () => {
-  await page.locator(".rail-button[aria-label='Assistant']").click();
-  await until(async () => (await page.locator(".panel", { hasText: "runs in the EchoDebug desktop app" }).count()) > 0);
-});
-
 await step("views menu, tab close and panel toggles", async () => {
   await page.locator("[aria-label='All views']").click();
   await page.locator('input[placeholder="Find a view…"]').fill("hooks");
