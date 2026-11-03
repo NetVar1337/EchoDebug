@@ -1,0 +1,10 @@
+data: {"candidates":[{"content":{"parts":[{"text":"Plan: ","thought":true}],"role":"model"},"index":0}],"usageMetadata":{"promptTokenCount":100,"totalTokenCount":100},"modelVersion":"gemini-3-pro"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"read memory.","thought":true}],"role":"model"},"index":0}],"modelVersion":"gemini-3-pro"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"Reading "}],"role":"model"},"index":0}],"modelVersion":"gemini-3-pro"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"now."}],"role":"model"},"index":0}],"modelVersion":"gemini-3-pro"}
+
+data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_memory","args":{"address":"0x10","size":8}},"thoughtSignature":"SIG1"}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":25,"thoughtsTokenCount":5,"cachedContentTokenCount":10,"totalTokenCount":130},"modelVersion":"gemini-3-pro"}
+

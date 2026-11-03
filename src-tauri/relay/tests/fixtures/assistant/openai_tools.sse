@@ -1,0 +1,22 @@
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"content":"Let me "},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"content":"read both."},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_A","type":"function","function":{"name":"read_memory","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"address\":\"0x10\","}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_B","type":"function","function":{"name":"disassemble","arguments":"{\"address\""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"size\":4}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":":\"0x20\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5-2026","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":40,"total_tokens":140,"prompt_tokens_details":{"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":12}}}
+
+data: [DONE]
+

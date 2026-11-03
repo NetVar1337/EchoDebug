@@ -1,0 +1,13 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1","model":"anthropic/claude-opus-5-5","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Think ","reasoning_details":[{"type":"reasoning.text","text":"Think ","format":"anthropic-claude-v1","index":0}]},"finish_reason":null}]}
+
+data: {"id":"gen-1","model":"anthropic/claude-opus-5-5","choices":[{"index":0,"delta":{"content":"","reasoning":"about it.","reasoning_details":[{"type":"reasoning.text","text":"about it.","signature":"sigX","format":"anthropic-claude-v1","index":0}]},"finish_reason":null}]}
+
+data: {"id":"gen-1","model":"anthropic/claude-opus-5-5","choices":[{"index":0,"delta":{"content":"Answer."},"finish_reason":null}]}
+
+data: {"id":"gen-1","model":"anthropic/claude-opus-5-5","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop","native_finish_reason":"end_turn"}]}
+
+data: {"id":"gen-1","model":"anthropic/claude-opus-5-5","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60,"cost":0.00042,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]

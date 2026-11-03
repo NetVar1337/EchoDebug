@@ -138,41 +138,133 @@ fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|e| format!("read {}: {e}", path))
 }
 
-/// Running assistant requests by the UI's id, so the UI can cancel them.
+/// Running assistant requests and OpenRouter sign-ins by the UI's id, so the UI can cancel them.
+type SignIn = (Arc<assistant::oauth::Pending>, Arc<AtomicBool>);
+
 #[derive(Default)]
 struct AssistantState {
     streams: Mutex<HashMap<u32, Arc<AtomicBool>>>,
+    signins: Mutex<HashMap<u32, SignIn>>,
 }
 
-/// Whether an Anthropic API key is stored, and how (never the key itself).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Every provider (built-in ones whether configured or not, then custom endpoints) with how its
+/// credential is stored. Never a key or a header value.
 #[tauri::command]
-fn assistant_key_status() -> Value {
-    assistant::key_info()
+fn assistant_providers() -> Value {
+    let st = assistant::creds::Store::default();
+    let mut v = assistant::creds::storage_note();
+    v["providers"] = Value::Array(st.infos());
+    v["conversations"] = Value::String(assistant::convs::Convs::default().path_display());
+    v
+}
+
+/// Saves a provider's key, or a custom endpoint (kind, name, base URL, optional key, headers).
+/// An empty key keeps the stored one.
+#[tauri::command]
+fn assistant_save_provider(cred: Value) -> Result<Value, String> {
+    let st = assistant::creds::Store::default();
+    let id = cred.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let existing = st.get(&id);
+    let c = assistant::creds::from_ui(&cred, existing.as_ref(), unix_now())?;
+    st.save(&c)?;
+    Ok(st.info(&c.id))
+}
+
+/// Sign out of a provider / forget a custom endpoint.
+#[tauri::command]
+fn assistant_remove_provider(id: String) -> Result<Value, String> {
+    let st = assistant::creds::Store::default();
+    st.remove(&id)?;
+    Ok(st.info(&id))
+}
+
+/// Lists the provider's models live from its API.
+#[tauri::command]
+async fn assistant_models(provider: String) -> Result<Vec<Value>, String> {
+    let ep = assistant::endpoint(&assistant::creds::Store::default(), &provider)?;
+    tauri::async_runtime::spawn_blocking(move || assistant::models::list(&ep)).await.map_err(|e| e.to_string())?
+}
+
+/// Settings' "Test connection".
+#[tauri::command]
+async fn assistant_test(provider: String) -> Result<Value, String> {
+    let ep = assistant::endpoint(&assistant::creds::Store::default(), &provider)?;
+    tauri::async_runtime::spawn_blocking(move || assistant::models::test(&ep)).await.map_err(|e| e.to_string())?
+}
+
+/// Starts OpenRouter's OAuth PKCE sign-in: returns the URL the UI opens in the browser.
+#[tauri::command]
+fn assistant_signin_begin(state: tauri::State<'_, AssistantState>, id: u32) -> Result<String, String> {
+    let p = assistant::oauth::begin()?;
+    let url = p.url.clone();
+    state.signins.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (Arc::new(p), Arc::new(AtomicBool::new(false))));
+    Ok(url)
+}
+
+/// Waits for the browser to come back, exchanges the code and stores the key as the OpenRouter
+/// credential (method "oauth").
+#[tauri::command]
+async fn assistant_signin_finish(state: tauri::State<'_, AssistantState>, id: u32) -> Result<Value, String> {
+    let (p, cancel) = state.signins.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().ok_or("no sign-in in progress")?;
+    let r = tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let code = p.wait(&cancel, std::time::Duration::from_secs(600))?;
+        let key = assistant::oauth::exchange(assistant::oauth::EXCHANGE_URL, &code, &p.verifier)?;
+        let st = assistant::creds::Store::default();
+        let c = assistant::creds::from_ui(&serde_json::json!({ "id": "openrouter", "api_key": key, "method": "oauth" }), None, unix_now())?;
+        st.save(&c)?;
+        Ok(st.info("openrouter"))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    state.signins.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    r
 }
 
 #[tauri::command]
-fn assistant_set_key(key: String) -> Result<Value, String> {
-    assistant::save_key(&key)
+fn assistant_signin_cancel(state: tauri::State<'_, AssistantState>, id: u32) {
+    if let Some((_, c)) = state.signins.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Saved conversations (`<config>/assistant-conversations`, mode 0600).
+#[tauri::command]
+fn assistant_conv_list() -> Vec<Value> {
+    assistant::convs::Convs::default().list()
 }
 
 #[tauri::command]
-fn assistant_clear_key() -> Result<Value, String> {
-    assistant::clear_key()?;
-    Ok(assistant::key_info())
+fn assistant_conv_load(id: String) -> Result<String, String> {
+    assistant::convs::Convs::default().load(&id)
 }
 
-/// Streams one Messages API request. The body comes from the UI and is checked by
-/// `assistant::prepare_body` (read-only tools only, no fields that send data elsewhere); the key is
-/// added here and goes nowhere but api.anthropic.com. Every SSE event is sent on `on_event`.
 #[tauri::command]
-async fn assistant_send(state: tauri::State<'_, AssistantState>, id: u32, body: Value, on_event: Channel<Value>) -> Result<(), String> {
-    let key = assistant::load_key().ok_or("no Anthropic API key: add one in Settings → Assistant")?;
-    let body = assistant::prepare_body(body)?;
+fn assistant_conv_save(id: String, body: String) -> Result<(), String> {
+    assistant::convs::Convs::default().save(&id, &body)
+}
+
+#[tauri::command]
+fn assistant_conv_delete(id: String) -> Result<(), String> {
+    assistant::convs::Convs::default().delete(&id)
+}
+
+/// Streams one provider-neutral request. `assistant::send` checks it (read-only tools only, no
+/// fields that send data elsewhere, the same for every provider) and builds the provider's own
+/// body; the credential is looked up here and goes only to that provider. Every normalised event
+/// is sent on `on_event`.
+#[tauri::command]
+async fn assistant_send(state: tauri::State<'_, AssistantState>, id: u32, provider: String, body: Value, on_event: Channel<Value>) -> Result<(), String> {
+    let ep = assistant::endpoint(&assistant::creds::Store::default(), &provider)?;
     let cancel = Arc::new(AtomicBool::new(false));
     state.streams.lock().unwrap_or_else(|e| e.into_inner()).insert(id, cancel.clone());
     let flag = cancel.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        assistant::stream(&key, &body, &flag, |ev| {
+        assistant::send(&ep, &body, &flag, |ev| {
             let _ = on_event.send(ev);
         })
     })
@@ -253,11 +345,20 @@ pub fn run() {
             write_binary_file,
             read_text_file,
             read_binary_file,
-            assistant_key_status,
-            assistant_set_key,
-            assistant_clear_key,
+            assistant_providers,
+            assistant_save_provider,
+            assistant_remove_provider,
+            assistant_models,
+            assistant_test,
+            assistant_signin_begin,
+            assistant_signin_finish,
+            assistant_signin_cancel,
             assistant_send,
-            assistant_cancel
+            assistant_cancel,
+            assistant_conv_list,
+            assistant_conv_load,
+            assistant_conv_save,
+            assistant_conv_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

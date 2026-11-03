@@ -1,27 +1,40 @@
-//! The in-app assistant's link to the Anthropic Messages API.
+//! The in-app assistant's link to model providers.
 //!
-//! The desktop app (not the web view, and not the relay's sockets) owns the user's API key: the
-//! React UI builds a request body, the app's `assistant_send` command checks it with
-//! [`prepare_body`], adds the key from [`load_key`] and streams the response with [`stream`].
-//! The key only ever goes to `api.anthropic.com`; it is never logged, never returned to the UI and
-//! never written anywhere but [`key_path`].
+//! The desktop app (not the web view, and not the relay's sockets) owns every credential: the React
+//! UI builds a provider-neutral request, the app's `assistant_send` command checks it with
+//! [`provider::parse_request`] (read-only tools only), looks up the provider's credential in
+//! [`creds`], builds that provider's own HTTP request with [`provider::build`] and streams the reply
+//! with [`stream`]. Every provider's stream is translated by [`decode`] into one event shape (the
+//! Messages API's `message_start` / `content_block_*` / `message_delta` / `message_stop`), so the UI
+//! has one accumulator for text, thinking and tool calls whatever the provider.
 //!
-//! Key storage: on Windows the key is encrypted with DPAPI (`CryptProtectData`, bound to the
-//! user's login); elsewhere it is a plain file readable only by the current user (mode 0600) in
-//! the app's config directory, which [`KeyInfo::note`] tells the user.
+//! Keys are never logged, never returned to the UI and only sent to the provider they belong to:
+//! built-in providers (Anthropic, OpenAI, Gemini, OpenRouter) have fixed hosts; a custom endpoint's
+//! key goes to the base URL the user saved with it.
+//!
+//! Providers: Anthropic (API key), OpenAI (API key, Chat Completions), Google Gemini (API key,
+//! Generative Language API), OpenRouter (API key, or its OAuth PKCE sign-in in [`oauth`]), and
+//! custom OpenAI-compatible / Anthropic-compatible endpoints (Ollama, LM Studio, vLLM, llama.cpp,
+//! LiteLLM, Azure OpenAI, gateways) with an optional key and custom headers. Subscription sign-in
+//! that reuses another product's OAuth client is deliberately not offered.
 
-use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
-use std::path::PathBuf;
+pub mod convs;
+pub mod creds;
+pub mod decode;
+#[cfg(test)]
+mod mock;
+pub mod models;
+pub mod oauth;
+pub mod provider;
+
+use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-pub const API_URL: &str = "https://api.anthropic.com/v1/messages";
-pub const API_VERSION: &str = "2026-10-21";
-/// `fallbacks: "default"` (server-side retry of a refused request on Anthropic's recommended model).
-pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+use self::decode::Decoder;
+use self::provider::{Endpoint, HttpReq, Kind};
 
 /// Tools the assistant handles inside the app without touching the target (they only fill the
 /// review lists the user accepts from).
@@ -37,6 +50,7 @@ pub const ASSISTANT_DENY: &[&str] = &[
 /// Whether the assistant may call the tool behind `verb`: read-only by the MCP annotations
 /// (`mcp::is_read_only`, which excludes every write, freeze, dump and state change) and not on
 /// [`ASSISTANT_DENY`]. Execution-control verbs (`dbg_*`, `emu_*`) are refused by prefix too.
+/// The same rule applies to every provider.
 pub fn assistant_tool_allowed(verb: &str) -> bool {
     crate::mcp::is_read_only(verb)
         && !ASSISTANT_DENY.contains(&verb)
@@ -44,37 +58,9 @@ pub fn assistant_tool_allowed(verb: &str) -> bool {
         && !verb.starts_with("emu_")
 }
 
-/// Top-level request fields the app sends. Anything else (`mcp_servers`, `container`, …) could
-/// send data somewhere other than the model, so it is refused.
-const BODY_FIELDS: &[&str] = &[
-    "model", "max_tokens", "system", "messages", "tools", "tool_choice", "thinking", "output_config", "stream",
-    "cache_control", "fallbacks",
-];
-
-/// Checks a request body from the UI and returns the one to send (always streamed).
-pub fn prepare_body(body: Value) -> Result<Value, String> {
-    let Value::Object(mut obj) = body else { return Err("assistant request must be a JSON object".into()) };
-    if let Some(k) = obj.keys().find(|k| !BODY_FIELDS.contains(&k.as_str())) {
-        return Err(format!("assistant request field '{k}' is not allowed"));
-    }
-    let model = obj.get("model").and_then(Value::as_str).unwrap_or_default();
-    if !model.starts_with("claude-") || model.len() > 64 || !model.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.') {
-        return Err(format!("unknown model '{model}'"));
-    }
-    if !obj.get("messages").is_some_and(Value::is_array) {
-        return Err("assistant request needs 'messages'".into());
-    }
-    if let Some(tools) = obj.get("tools") {
-        let tools = tools.as_array().ok_or("'tools' must be an array")?;
-        for t in tools {
-            check_tool(t)?;
-        }
-    }
-    obj.insert("stream".into(), Value::Bool(true));
-    Ok(Value::Object(obj))
-}
-
-fn check_tool(t: &Value) -> Result<(), String> {
+/// Checks one tool of a request: a plain client tool (name, schema, no server-tool `type`) that is
+/// one of the app's review tools or maps through `tools.json` to an allowed verb.
+pub fn check_tool(t: &Value) -> Result<(), String> {
     let name = t.get("name").and_then(Value::as_str).ok_or("tool without a name")?;
     // server tools (web fetch, code execution, MCP toolsets) carry a "type" and no schema
     if t.get("type").is_some() || !t.get("input_schema").is_some_and(Value::is_object) {
@@ -90,7 +76,17 @@ fn check_tool(t: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// The tools the app may offer the assistant, as `(name, verb)` pairs from `tools.json`.
+pub fn allowed_tools() -> Vec<(String, String)> {
+    crate::tool_list()
+        .iter()
+        .filter_map(|t| Some((t.get("name")?.as_str()?.to_owned(), t.get("verb")?.as_str()?.to_owned())))
+        .filter(|(_, v)| assistant_tool_allowed(v))
+        .collect()
+}
+
 /// Incremental server-sent-events parser: feed it lines, get each event's JSON `data`.
+/// `data: [DONE]` (OpenAI's end marker) comes back as `{"type":"[DONE]"}`.
 #[derive(Default)]
 pub struct SseParser {
     data: String,
@@ -105,6 +101,9 @@ impl SseParser {
                 return None;
             }
             let data = std::mem::take(&mut self.data);
+            if data.trim() == "[DONE]" {
+                return Some(json!({ "type": "[DONE]" }));
+            }
             return Some(serde_json::from_str(&data).unwrap_or_else(|_| json!({ "type": "unparsed", "data": data })));
         }
         if let Some(d) = line.strip_prefix("data:") {
@@ -119,55 +118,114 @@ impl SseParser {
     }
 }
 
-/// Text of an API error reply (`{"type":"error","error":{"type","message"}}`).
-pub fn error_message(status: u16, body: &str) -> String {
-    let parsed: Option<Value> = serde_json::from_str(body).ok();
-    let e = parsed.as_ref().and_then(|v| v.get("error"));
-    let kind = e.and_then(|e| e.get("type")).and_then(Value::as_str).unwrap_or("");
-    let msg = e.and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("");
-    let hint = match status {
-        401 => " (check the API key in Settings → Assistant)",
-        429 => " (rate limited; try again shortly)",
-        529 => " (the API is overloaded; try again shortly)",
-        _ => "",
-    };
-    if msg.is_empty() {
-        format!("HTTP {status}{hint}")
-    } else {
-        format!("HTTP {status} {kind}: {msg}{hint}")
-    }
-}
-
-/// POSTs `body` (from [`prepare_body`]) and calls `on` with every streamed event until the
-/// stream ends or `cancel` is set.
-pub fn stream(key: &str, body: &Value, cancel: &AtomicBool, mut on: impl FnMut(Value)) -> Result<(), String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// The HTTP client every assistant request uses (system proxy honoured).
+pub fn agent(recv_timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_recv_body(Some(Duration::from_secs(600)))
+        .timeout_recv_body(Some(recv_timeout))
         .http_status_as_error(false)
         .proxy(ureq::Proxy::try_from_env())
         .build()
-        .into();
-    let mut req = agent
-        .post(API_URL)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .header("anthropic-version", API_VERSION)
-        .header("x-api-key", key);
-    if body.get("fallbacks").is_some() {
-        req = req.header("anthropic-beta", FALLBACK_BETA);
+        .into()
+}
+
+/// The most telling error kind of an error object: a string `type`, `status` or `code` first
+/// (`invalid_request_error`, `RESOURCE_EXHAUSTED`, `rate_limit_exceeded`), else a numeric code.
+pub fn error_kind(e: &Value) -> String {
+    ["type", "status", "code"]
+        .iter()
+        .find_map(|k| e.get(*k).and_then(Value::as_str))
+        .map(str::to_owned)
+        .or_else(|| e.get("code").filter(|c| c.is_number()).map(Value::to_string))
+        .unwrap_or_default()
+}
+
+/// Text of an API error reply with an actionable hint. Understands the error bodies of every
+/// provider (`{"error":{"type","message"}}`, OpenAI's `{"error":{"code","message"}}`, Gemini's
+/// `{"error":{"status","message"}}`, a bare string). The UI keys its buttons off the hints'
+/// wording ("Settings", "retry after", "/compact"), see `src/lib/assistant/errors.ts`.
+pub fn error_message(kind: Kind, status: u16, body: &str, retry_after: Option<&str>) -> String {
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let e = parsed.as_ref().and_then(|v| v.get("error"));
+    let e = match e {
+        Some(Value::Array(a)) => a.first(),
+        other => other,
+    };
+    let kind_s = e.map(error_kind).unwrap_or_default();
+    let mut msg = e
+        .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
+        .or_else(|| parsed.as_ref().and_then(|v| v.get("message")).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_owned();
+    if msg.is_empty() && parsed.is_none() && !body.trim().is_empty() && body.len() < 300 && !body.trim_start().starts_with('<') {
+        msg = body.trim().to_owned();
+    }
+    let low = format!("{kind_s} {msg}").to_lowercase();
+    let too_long = low.contains("prompt is too long")
+        || low.contains("context_length_exceeded")
+        || low.contains("context length")
+        || low.contains("maximum context")
+        || low.contains("too many tokens")
+        || low.contains("exceeds the maximum number of tokens")
+        || low.contains("input is too long")
+        || status == 413;
+    let hint = if too_long {
+        " (the conversation is too long for this model; run /compact or start a /new conversation)".to_owned()
+    } else {
+        match status {
+            401 | 403 => format!(" (check the {} credential in Settings → Assistant)", kind.label()),
+            402 => " (out of credits on this provider; add credits or pick another provider)".to_owned(),
+            404 => " (unknown model or endpoint; refresh the model list or check the base URL in Settings → Assistant)".to_owned(),
+            408 | 504 => " (the provider timed out; /retry)".to_owned(),
+            429 => match retry_after.and_then(|s| s.trim().parse::<f64>().ok()) {
+                Some(s) => format!(" (rate limited; retry after {}s, then /retry)", s.ceil() as u64),
+                None => " (rate limited; wait a moment, then /retry)".to_owned(),
+            },
+            500..=599 => " (the provider had a problem or is overloaded; /retry shortly)".to_owned(),
+            _ => String::new(),
+        }
+    };
+    if msg.is_empty() {
+        format!("HTTP {status}{hint}")
+    } else if kind_s.is_empty() {
+        format!("HTTP {status}: {msg}{hint}")
+    } else {
+        format!("HTTP {status} {kind_s}: {msg}{hint}")
+    }
+}
+
+/// POSTs `req` and calls `on` with every event the provider's stream turns into (one shape for
+/// every provider, see [`decode`]) until the stream ends or `cancel` is set.
+pub fn stream(req: &HttpReq, kind: Kind, mut dec: Box<dyn Decoder>, cancel: &AtomicBool, mut on: impl FnMut(Value)) -> Result<(), String> {
+    let agent = agent(Duration::from_secs(600));
+    let mut r = agent.post(&req.url);
+    for (k, v) in &req.headers {
+        r = r.header(k.as_str(), v.as_str());
     }
     // the error never includes the request (and so never the key)
-    let mut resp = req.send(body.to_string()).map_err(|e| format!("cannot reach api.anthropic.com: {e}"))?;
+    let host = provider::host_of(&req.url);
+    let mut resp = r.send(req.body.to_string()).map_err(|e| format!("cannot reach {host}: {e}"))?;
     let status = resp.status().as_u16();
     if status != 200 {
+        let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_owned);
         let mut text = String::new();
         let _ = resp.body_mut().as_reader().take(64 * 1024).read_to_string(&mut text);
-        return Err(error_message(status, &text));
+        return Err(error_message(kind, status, &text, retry.as_deref()));
     }
     let mut reader = BufReader::new(resp.body_mut().as_reader());
     let mut sse = SseParser::default();
     let mut line = String::new();
+    let mut out = Vec::new();
+    let mut emit = |dec: &mut Box<dyn Decoder>, v: Option<Value>, on: &mut dyn FnMut(Value)| {
+        out.clear();
+        match v {
+            Some(v) => dec.feed(v, &mut out),
+            None => dec.finish(&mut out),
+        }
+        for ev in out.drain(..) {
+            on(ev);
+        }
+    };
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -176,137 +234,36 @@ pub fn stream(key: &str, body: &Value, cancel: &AtomicBool, mut on: impl FnMut(V
         let n = reader.read_line(&mut line).map_err(|e| format!("stream interrupted: {e}"))?;
         if n == 0 {
             if let Some(v) = sse.feed("") {
-                on(v);
+                emit(&mut dec, Some(v), &mut on);
             }
+            emit(&mut dec, None, &mut on);
             return Ok(());
         }
         if let Some(v) = sse.feed(line.trim_end_matches('\n')) {
-            let done = v.get("type").and_then(Value::as_str) == Some("message_stop");
-            on(v);
-            if done {
+            emit(&mut dec, Some(v), &mut on);
+            if dec.done() {
+                emit(&mut dec, None, &mut on);
                 return Ok(());
             }
         }
     }
 }
 
-// ---- key storage ---------------------------------------------------------------------------------
-
-pub fn key_path() -> PathBuf {
-    crate::auth::config_dir().join(if cfg!(windows) { "anthropic-key.dpapi" } else { "anthropic-key" })
+/// The endpoint for a stored provider.
+pub fn endpoint(store: &creds::Store, provider_id: &str) -> Result<Endpoint, String> {
+    let c = store.get(provider_id).ok_or_else(|| match creds::builtin_kind(provider_id) {
+        Some(k) => format!("{} is not set up: add a key{} in Settings → Assistant", k.label(), if k == Kind::OpenRouter { " or sign in" } else { "" }),
+        None => format!("no endpoint '{provider_id}': add it in Settings → Assistant"),
+    })?;
+    Ok(Endpoint::from_cred(&c))
 }
 
-/// Where and how the key is kept, for Settings. Never contains the key.
-pub fn key_info() -> Value {
-    let present = load_key().is_some();
-    let (storage, note) = if cfg!(windows) {
-        ("dpapi", "Encrypted with Windows DPAPI for your user account.")
-    } else {
-        ("file", "Stored in a file readable only by your user (mode 0600); no system keychain is used on this platform.")
-    };
-    json!({ "present": present, "storage": storage, "path": key_path().display().to_string(), "note": note })
-}
-
-fn valid_key(k: &str) -> bool {
-    (16..=512).contains(&k.len()) && k.bytes().all(|b| b.is_ascii_graphic())
-}
-
-pub fn save_key(key: &str) -> Result<Value, String> {
-    let key = key.trim();
-    if !valid_key(key) {
-        return Err("that does not look like an API key (expected something like sk-ant-…)".into());
-    }
-    let path = key_path();
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    let bytes = protect(key.as_bytes()).map_err(|e| format!("encrypt key: {e}"))?;
-    write_private(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(key_info())
-}
-
-pub fn load_key() -> Option<String> {
-    let bytes = fs::read(key_path()).ok()?;
-    let plain = unprotect(&bytes).ok()?;
-    let k = String::from_utf8(plain).ok()?.trim().to_owned();
-    valid_key(&k).then_some(k)
-}
-
-pub fn clear_key() -> Result<(), String> {
-    match fs::remove_file(key_path()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(bytes)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes)
-    }
-}
-
-#[cfg(not(windows))]
-fn protect(b: &[u8]) -> io::Result<Vec<u8>> {
-    Ok(b.to_vec())
-}
-
-#[cfg(not(windows))]
-fn unprotect(b: &[u8]) -> io::Result<Vec<u8>> {
-    Ok(b.to_vec())
-}
-
-#[cfg(windows)]
-fn dpapi(b: &[u8], encrypt: bool) -> io::Result<Vec<u8>> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB};
-    let input = CRYPT_INTEGER_BLOB { cbData: b.len() as u32, pbData: b.as_ptr() as *mut u8 };
-    let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
-    // SAFETY: `input` points at `b`, which outlives the call; DPAPI allocates `output` with
-    // LocalAlloc and we free it with LocalFree after copying it out.
-    let ok = unsafe {
-        if encrypt {
-            CryptProtectData(&input, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
-        } else {
-            CryptUnprotectData(&input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
-        }
-    };
-    if ok == 0 || output.pbData.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: DPAPI returned `cbData` bytes at `pbData`.
-    let out = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe { LocalFree(output.pbData as _) };
-    Ok(out)
-}
-
-#[cfg(windows)]
-fn protect(b: &[u8]) -> io::Result<Vec<u8>> {
-    dpapi(b, true)
-}
-
-#[cfg(windows)]
-fn unprotect(b: &[u8]) -> io::Result<Vec<u8>> {
-    dpapi(b, false)
-}
-
-/// The tools the app may offer the assistant, as `(name, verb)` pairs from `tools.json`.
-pub fn allowed_tools() -> Vec<(String, String)> {
-    crate::tool_list()
-        .iter()
-        .filter_map(|t| Some((t.get("name")?.as_str()?.to_owned(), t.get("verb")?.as_str()?.to_owned())))
-        .filter(|(_, v)| assistant_tool_allowed(v))
-        .collect()
+/// Checks a neutral request from the UI, builds the provider's own request and streams the reply
+/// as normalised events. Nothing but [`provider::build`] decides what is sent.
+pub fn send(ep: &Endpoint, body: &Value, cancel: &AtomicBool, on: impl FnMut(Value)) -> Result<(), String> {
+    let req = provider::parse_request(body, ep.kind)?;
+    let http = provider::build(ep, &req);
+    stream(&http, ep.kind, provider::decoder_for(ep), cancel, on)
 }
 
 #[cfg(test)]
@@ -327,14 +284,17 @@ mod tests {
             r#"data: "delta":{"type":"text_delta","text":"hi"}}"#,
             "",
             "",
+            "data: [DONE]",
+            "",
         ] {
             if let Some(v) = p.feed(l) {
                 out.push(v);
             }
         }
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 3);
         assert_eq!(out[0]["type"], "message_start");
         assert_eq!(out[1]["delta"]["text"], "hi");
+        assert_eq!(out[2]["type"], "[DONE]");
     }
 
     #[test]
@@ -351,35 +311,93 @@ mod tests {
     }
 
     #[test]
-    fn prepare_body_checks_fields_and_tools() {
-        let ok = json!({ "model": "claude-opus-5-5", "max_tokens": 100, "messages": [],
-            "tools": [{ "name": "read_memory", "description": "", "input_schema": { "type": "object" } },
-                      { "name": "submit_name_suggestions", "input_schema": { "type": "object" } }] });
-        let b = prepare_body(ok).unwrap();
-        assert_eq!(b["stream"], true);
-        let bad_tool = json!({ "model": "claude-opus-5-5", "messages": [], "tools": [{ "name": "write_memory", "input_schema": { "type": "object" } }] });
-        assert!(prepare_body(bad_tool).unwrap_err().contains("not read-only"));
-        let unknown = json!({ "model": "claude-opus-5-5", "messages": [], "tools": [{ "name": "rm_rf", "input_schema": { "type": "object" } }] });
-        assert!(prepare_body(unknown).is_err());
-        let server = json!({ "model": "claude-opus-5-5", "messages": [], "tools": [{ "type": "web_fetch_20260209", "name": "web_fetch" }] });
-        assert!(prepare_body(server).is_err());
-        let extra = json!({ "model": "claude-opus-5-5", "messages": [], "mcp_servers": [] });
-        assert!(prepare_body(extra).unwrap_err().contains("mcp_servers"));
-        assert!(prepare_body(json!({ "model": "gpt", "messages": [] })).is_err());
-        assert!(prepare_body(json!({ "model": "claude-opus-5-5" })).is_err());
+    fn error_messages_carry_hints() {
+        let m = error_message(Kind::Anthropic, 401, r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#, None);
+        assert!(m.contains("401") && m.contains("invalid x-api-key") && m.contains("Settings") && m.contains("Anthropic"), "{m}");
+        assert_eq!(error_message(Kind::OpenAi, 500, "<html>oops</html>", None), "HTTP 500 (the provider had a problem or is overloaded; /retry shortly)");
+        let m = error_message(Kind::OpenAi, 429, r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#, Some("7.2"));
+        assert!(m.contains("retry after 8s"), "{m}");
+        let m = error_message(Kind::OpenAi, 400, r#"{"error":{"message":"This model's maximum context length is 128000 tokens","code":"context_length_exceeded"}}"#, None);
+        assert!(m.contains("/compact"), "{m}");
+        let m = error_message(Kind::Anthropic, 400, r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1200000 tokens > 1000000 maximum"}}"#, None);
+        assert!(m.contains("/compact"), "{m}");
+        let m = error_message(Kind::Gemini, 400, r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#, None);
+        assert!(m.contains("API key not valid") && m.contains("INVALID_ARGUMENT"), "{m}");
+        let m = error_message(Kind::Gemini, 403, r#"[{"error":{"code":403,"message":"denied","status":"PERMISSION_DENIED"}}]"#, None);
+        assert!(m.contains("denied") || m.contains("Gemini"), "{m}");
+        let m = error_message(Kind::OpenRouter, 402, r#"{"error":{"code":402,"message":"Insufficient credits"}}"#, None);
+        assert!(m.contains("credits"), "{m}");
+        assert!(error_message(Kind::OpenAiCompat, 404, "model not found", None).contains("model not found"));
     }
 
     #[test]
-    fn error_messages() {
-        let m = error_message(401, r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#);
-        assert!(m.contains("401") && m.contains("invalid x-api-key") && m.contains("Settings"));
-        assert_eq!(error_message(500, "oops"), "HTTP 500");
+    fn check_tool_refuses_writes_and_server_tools() {
+        assert!(check_tool(&json!({ "name": "read_memory", "input_schema": { "type": "object" } })).is_ok());
+        assert!(check_tool(&json!({ "name": "submit_name_suggestions", "input_schema": { "type": "object" } })).is_ok());
+        assert!(check_tool(&json!({ "name": "write_memory", "input_schema": { "type": "object" } })).unwrap_err().contains("not read-only"));
+        assert!(check_tool(&json!({ "name": "rm_rf", "input_schema": { "type": "object" } })).is_err());
+        assert!(check_tool(&json!({ "type": "web_fetch_20260209", "name": "web_fetch" })).is_err());
+    }
+
+    fn collect(ep: &Endpoint, body: &Value) -> (Result<(), String>, Vec<Value>) {
+        let mut evs = Vec::new();
+        let r = send(ep, body, &AtomicBool::new(false), |e| evs.push(e));
+        (r, evs)
+    }
+
+    fn body(model: &str) -> Value {
+        json!({ "model": model, "system": "sys", "max_tokens": 100, "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "read_memory", "description": "", "input_schema": { "type": "object", "properties": { "address": { "type": "string" } } } }] })
     }
 
     #[test]
-    fn key_validation() {
-        assert!(valid_key("sk-ant-api03-abcdefghijklmnop"));
-        assert!(!valid_key("short"));
-        assert!(!valid_key("sk-ant with space inside it"));
+    fn streams_every_provider_through_one_event_shape() {
+        let fx = |n: &str| std::fs::read_to_string(format!("{}/tests/fixtures/assistant/{n}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let m = mock::serve(vec![
+            mock::route("POST /v1/messages", 200, "text/event-stream", &fx("anthropic_tools.sse")),
+            mock::route("POST /chat/completions", 200, "text/event-stream", &fx("openai_tools.sse")),
+            mock::route("POST /models/gemini-3-pro:streamGenerateContent?alt=sse", 200, "text/event-stream", &fx("gemini_tools.sse")),
+        ]);
+        let ep = |kind: Kind, id: &str| Endpoint { id: id.into(), kind, base: m.base.clone(), key: Some("key-0123456789".into()), headers: vec![] };
+        for (kind, id, model, tool) in [
+            (Kind::Anthropic, "anthropic", "claude-opus-5-5", "read_memory"),
+            (Kind::OpenAi, "openai", "gpt-5", "read_memory"),
+            (Kind::OpenRouter, "openrouter", "openai/gpt-5", "read_memory"),
+            (Kind::Gemini, "gemini", "gemini-3-pro", "read_memory"),
+        ] {
+            let (r, evs) = collect(&ep(kind, id), &body(model));
+            r.unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let msg = decode::tests::fold(&evs);
+            assert_eq!(msg["stop_reason"], "tool_use", "{kind:?}");
+            assert!(msg["content"].as_array().unwrap().iter().any(|b| b["type"] == "tool_use" && b["name"] == tool), "{kind:?}");
+        }
+        let seen = m.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0].header("x-api-key"), Some("key-0123456789"));
+        assert_eq!(seen[1].header("authorization"), Some("Bearer key-0123456789"));
+        assert_eq!(seen[2].header("x-title"), Some("EchoDebug"));
+        assert_eq!(seen[3].header("x-goog-api-key"), Some("key-0123456789"));
+        let gem: Value = serde_json::from_str(&seen[3].body).unwrap();
+        assert_eq!(gem["contents"][0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn refuses_before_sending_and_reports_http_errors() {
+        let m = mock::serve(vec![mock::route("POST /chat/completions", 429, "application/json", r#"{"error":{"message":"slow down","code":"rate_limit_exceeded"}}"#)]);
+        let ep = Endpoint { id: "openai".into(), kind: Kind::OpenAi, base: m.base.clone(), key: Some("key-0123456789".into()), headers: vec![] };
+        let mut bad = body("gpt-5");
+        bad["tools"] = json!([{ "name": "write_memory", "input_schema": { "type": "object" } }]);
+        assert!(collect(&ep, &bad).0.unwrap_err().contains("not read-only"));
+        // nothing went out for the refused request
+        assert!(m.seen.lock().unwrap().is_empty());
+        let e = collect(&ep, &body("gpt-5")).0.unwrap_err();
+        assert!(e.contains("429") && e.contains("slow down") && e.contains("/retry"), "{e}");
+    }
+
+    #[test]
+    fn unconfigured_providers_say_how_to_set_them_up() {
+        let st = creds::Store { dir: std::env::temp_dir().join(format!("echodebug-ep-{}", std::process::id())) };
+        assert!(endpoint(&st, "openrouter").unwrap_err().contains("sign in"));
+        assert!(endpoint(&st, "custom-x").unwrap_err().contains("no endpoint"));
     }
 }
