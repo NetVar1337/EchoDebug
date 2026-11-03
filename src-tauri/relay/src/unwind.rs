@@ -678,7 +678,7 @@ pub fn pe_unwind(mem: &(impl Memory + ?Sized), base: u64, f: RuntimeFunction, pc
         let frame = if sets_fp { regs.gpr[info.frame_reg as usize]?.wrapping_sub(info.frame_offset as u64 * 16) } else { regs.gpr[RSP]? };
         // an epilog only exists in the primary function and only after its prolog; the top frame
         // is the only one that can be inside one (callers sit right after a call)
-        if first && top && prolog_offset >= info.prolog_size as u64 && unwind_epilog(mem, pc, &info, regs).is_some() {
+        if first && top && prolog_offset >= info.prolog_size as u64 && unwind_epilog(mem, pc, (base + f.begin as u64, base + f.end as u64), &info, regs).is_some() {
             return Some(());
         }
         for c in &info.codes {
@@ -730,9 +730,9 @@ pub fn pe_unwind(mem: &(impl Memory + ?Sized), base: u64, f: RuntimeFunction, pc
     Some(())
 }
 
-/// If `pc` sits in a `ret` epilog (`add rsp, n` | `lea rsp, [fp+n]`, pops, `ret`), unwinds by
-/// executing it.
-fn unwind_epilog(mem: &(impl Memory + ?Sized), pc: u64, info: &UnwindInfo, regs: &mut Regs) -> Option<()> {
+/// If `pc` sits in an epilog (`add rsp, n` | `lea rsp, [fp+n]`, pops, then `ret` or a tail-call
+/// `jmp` out of the function), unwinds by executing it.
+fn unwind_epilog(mem: &(impl Memory + ?Sized), pc: u64, func: (u64, u64), info: &UnwindInfo, regs: &mut Regs) -> Option<()> {
     let code = mem.bytes(pc, 48).or_else(|| mem.bytes(pc, 16))?;
     let mut i = 0usize;
     let mut sp = regs.gpr[RSP]?;
@@ -779,6 +779,22 @@ fn unwind_epilog(mem: &(impl Memory + ?Sized), pc: u64, info: &UnwindInfo, regs:
                 i += 2;
             }
             Some([0xc3, ..]) | Some([0xc2, _, _, ..]) | Some([0xf3, 0xc3, ..]) => break,
+            // tail call: jmp rel32 / rel8 to outside the function, or jmp [rip+disp32]
+            Some([0xe9, a, b, c, d, ..]) => {
+                let to = (pc + i as u64 + 5).wrapping_add(i32::from_le_bytes([*a, *b, *c, *d]) as i64 as u64);
+                if to >= func.0 && to < func.1 {
+                    return None;
+                }
+                break;
+            }
+            Some([0xeb, d, ..]) => {
+                let to = (pc + i as u64 + 2).wrapping_add(*d as i8 as i64 as u64);
+                if to >= func.0 && to < func.1 {
+                    return None;
+                }
+                break;
+            }
+            Some([0xff, 0x25, ..]) | Some([0x48, 0xff, 0x25, ..]) => break,
             _ => return None,
         }
     }
@@ -1827,6 +1843,54 @@ mod tests {
         frames[0].symbol = None;
         symbolize(&mut un, &mut frames, &Symbols::default(), &mut HashMap::new());
         assert_eq!(frames[0].symbol, None);
+    }
+
+    /// Lays a PE file out by section (RVA-indexed), like the loader.
+    fn map_pe(file: &[u8]) -> Vec<u8> {
+        let rd32 = |o: usize| u32::from_le_bytes(file[o..o + 4].try_into().unwrap()) as usize;
+        let rd16 = |o: usize| u16::from_le_bytes(file[o..o + 2].try_into().unwrap()) as usize;
+        let nt = rd32(0x3c);
+        let (nsec, opt) = (rd16(nt + 6), rd16(nt + 20));
+        let mut img = vec![0u8; rd32(nt + 24 + 56)];
+        let hdr = rd32(nt + 24 + 60);
+        img[..hdr].copy_from_slice(&file[..hdr]);
+        for i in 0..nsec {
+            let s = nt + 24 + opt + i * 40;
+            let (va, raw_size, raw) = (rd32(s + 12), rd32(s + 16), rd32(s + 20));
+            let n = raw_size.min(file.len().saturating_sub(raw)).min(img.len() - va);
+            img[va..va + n].copy_from_slice(&file[raw..raw + n]);
+        }
+        img
+    }
+
+    /// clang/lld output (src/lib/analysis/fixtures/fix-seh.exe, see fix-seh.c):
+    /// guarded @0x1010: push rbp; push rsi; sub rsp, 0x28; lea rbp, [rsp+0x20] (frame register),
+    /// epilog @0x1047: add rsp, 0x28; pop rsi; pop rbp; ret
+    /// mainCRTStartup @0x10a0: sub rsp, 0x28; call [GetTickCount]; mov ecx, eax; add rsp, 0x28; jmp guarded
+    #[test]
+    fn pe_real_compiler_output() {
+        let img = map_pe(include_bytes!("../../../src/lib/analysis/fixtures/fix-seh.exe"));
+        assert_eq!(read_pdata(&Flat { base: BASE, data: &img }, BASE).unwrap().len(), 3);
+        let s = STACK;
+        // body of guarded (return address of the GetTickCount call), rbp = frame + 0x20
+        let mut st = vec![0u64; 5];
+        st.extend([0x5151, 0xbbbb, BASE + 0x2000_0000]);
+        let mem = Regions(vec![(BASE, img.clone()), (s, stack(&st))]);
+        let mods = vec![ModuleInfo { name: "fix-seh.exe".into(), base: BASE, size: img.len() as u64 }];
+        let mut un = Unwinder::new(&mem, mods.clone());
+        let (r, m, ..) = un.step(&Regs::new(BASE + 0x102a, s, s + 0x20), false, false).unwrap();
+        assert_eq!((m, r.rip, r.rsp(), r.gpr[RSI], r.gpr[RBP]), (Method::Pdata, BASE + 0x2000_0000, s + 0x40, Some(0x5151), Some(0xbbbb)));
+        // rsp moved by the callee? the frame register still finds the frame
+        let (r, ..) = un.step(&Regs::new(BASE + 0x102a, s - 0x100, s + 0x20), false, false).unwrap();
+        assert_eq!(r.rsp(), s + 0x40);
+        // top frame stopped on the epilog's `add rsp, 0x28`
+        let (r, ..) = un.step(&Regs::new(BASE + 0x1047, s, 0), true, true).unwrap();
+        assert_eq!((r.rip, r.gpr[RSI], r.gpr[RBP]), (BASE + 0x2000_0000, Some(0x5151), Some(0xbbbb)));
+        // mainCRTStartup at its tail-call jmp: the stack is already released
+        let mem = Regions(vec![(BASE, img), (s, stack(&[BASE + 0x3000_0000]))]);
+        let mut un = Unwinder::new(&mem, mods);
+        let (r, ..) = un.step(&Regs::new(BASE + 0x10b0, s, 0), true, true).unwrap();
+        assert_eq!((r.rip, r.rsp()), (BASE + 0x3000_0000, s + 8));
     }
 
     // ---- ELF / CFI fixtures -----------------------------------------------------------------
