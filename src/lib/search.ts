@@ -21,6 +21,8 @@ export type SearchItem = {
   address?: string;
   /** kind-specific payload for the jump (type id, module name, …) */
   ref?: string;
+  /** the address is outside every loaded module (an older base): ranked below live items */
+  stale?: boolean;
 };
 
 export type Match = { score: number; /** indices of matched characters in the text */ hits: number[] };
@@ -100,6 +102,7 @@ export function matchAll(query: string, item: SearchItem): Match | null {
     score += m.score;
     if (m.hits.length && fuzzyMatch(tok, item.text)) for (const h of m.hits) hits.add(h);
   }
+  if (item.stale) score -= 25;
   return { score, hits: [...hits].sort((a, b) => a - b) };
 }
 

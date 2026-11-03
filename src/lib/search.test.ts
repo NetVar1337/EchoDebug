@@ -39,6 +39,9 @@ describe("matchAll", () => {
     expect(matchAll("player damage", item)).not.toBeNull();
     expect(matchAll("player heal", item)).toBeNull();
   });
+  it("ranks items at stale addresses below live ones", () => {
+    expect(matchAll("player", { ...item, stale: true })!.score).toBeLessThan(matchAll("player", item)!.score);
+  });
   it("matches the detail weakly and addresses strongly", () => {
     const viaDetail = matchAll("game", item)!;
     const viaText = matchAll("take", item)!;

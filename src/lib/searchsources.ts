@@ -2,7 +2,7 @@
 // signatures, struct types) plus two caches filled on demand: module exports (read from the
 // export directory only, not the whole image) and the strings of modules the Strings view or an
 // explicit "search strings in all modules" has extracted. Nothing here starts a large scan by itself.
-import { fmtAddr, toBig, type Module } from "./hex";
+import { fmtAddr, moduleOf, toBig, type Module } from "./hex";
 import { readBytes, readRange, loadImage } from "./memory";
 import { extractStrings, type FoundString } from "./analysis/strings";
 import type { SearchItem } from "./search";
@@ -144,10 +144,14 @@ export function startSearchCaches(): void {
 export function collectItems(modules: readonly Module[]): SearchItem[] {
   const out: SearchItem[] = [];
   const live = new Set(modules.map(keyOf));
+  // names saved for an earlier base of a module (or another target) point nowhere now
+  const stale = (a: string) => modules.length > 0 && !moduleOf(toBig(a), modules);
   for (const n of useNames.getState().names) {
     const address = "0x" + n.address.replace(/^0x/, "").replace(/^0+(?=.)/, "");
-    if (n.name) out.push({ kind: "name", text: n.name, address, detail: address });
-    if (n.comment) out.push({ kind: "comment", text: n.comment, address, detail: n.name || address });
+    const st = stale(address);
+    const where = st ? `${address} · not in a loaded module` : address;
+    if (n.name) out.push({ kind: "name", text: n.name, address, detail: where, stale: st });
+    if (n.comment) out.push({ kind: "comment", text: n.comment, address, detail: n.name ? `${n.name}${st ? " · not loaded" : ""}` : where, stale: st });
   }
   for (const b of useWatch.getState().bookmarks) out.push({ kind: "bookmark", text: b.label || b.address, address: b.address, detail: b.label ? b.address : undefined });
   for (const w of useWatch.getState().watches) if (w.label) out.push({ kind: "bookmark", text: w.label, address: w.address, detail: `watch · ${w.type}`, ref: "watch" });

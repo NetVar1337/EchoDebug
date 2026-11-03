@@ -140,7 +140,7 @@ export default function WatchPanel() {
       </div>
       <div className="panel-body">
         <table className="table">
-          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 70 }} /></colgroup>
+          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 80 }} /></colgroup>
           <thead><tr><th>Address</th><th>Type</th><th>Value</th><th /></tr></thead>
           <tbody>
             {w.watches.map((e) => (
