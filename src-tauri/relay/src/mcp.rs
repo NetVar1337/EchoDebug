@@ -219,6 +219,10 @@ mod tests {
         // the app window's annotation tools
         assert_eq!(annotations("ui_list_names", "n")["readOnlyHint"], true);
         assert_eq!(annotations("ui_list_signatures", "s")["readOnlyHint"], true);
+        // the decompiler and flattening removal only read code
+        assert_eq!(annotations("ui_unflatten", "unflatten")["readOnlyHint"], true);
+        assert_eq!(annotations("ui_decompile", "decompile")["readOnlyHint"], true);
+        assert!(!is_gated("ui_unflatten"));
         let set = annotations("ui_set_name", "n");
         assert_eq!((set["readOnlyHint"].as_bool(), set["destructiveHint"].as_bool(), set["idempotentHint"].as_bool()), (Some(false), Some(false), Some(true)));
         assert_eq!(annotations("ui_set_comment", "c")["readOnlyHint"], false);

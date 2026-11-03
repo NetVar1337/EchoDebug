@@ -404,6 +404,19 @@ Annotation verbs (MCP tools without the `ui_` prefix) read and change the app's 
 | `ui_revert_patch` (`revert_patch`) | `patch_id` | `patch_id`, `address`, `restored` (the app writes `before` back via `write`, then marks the patch reverted) |
 | `ui_list_signatures` (`list_signatures`) | – | `signatures:[{id,name,module,ida,address,hits,note}]` |
 
+Decompiler verbs (read-only; the function is disassembled through `disassemble`, bounded by `.pdata`, switch tables
+read from the module image; x86-64 only, a function in an AArch64 module is refused with an error):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_decompile` (`decompile`) | `address`, `unflatten?`, `with_addresses?`, `max_insns?` (default 8000) | `entry`, `signature`, `variables:[{name,type,location,argument,fields?:[{offset,size}]}]`, `pseudocode` (text), `lines?:[{address,text}]`, `unflatten?` (as below), `truncated` |
+| `ui_unflatten` (`unflatten`) | `address`, `with_pseudocode?` (default true), `max_insns?` | `flattened`, `dispatcher`, `state` (variable name), `dispatcherBlocks`, `states`, `recovered:[{block,next:[address],via:"const"\|"select"}]`, `unresolved:[{block,reason}]`, `note`, `original:{blocks,edges}`, `recovered_cfg?:{blocks,edges:[{from,to,kind,case?}]}`, `pseudocode?` |
+
+Prototypes: `src/lib/analysis/prototypes.ts` exposes `registerPrototypeProvider(id, (address, name) => Prototype | null,
+{ fallback? })`; a `Prototype` is `{ name?, returns?, args?: [{ name?, type? }], variadic?, noreturn? }`. Providers are asked
+in order (the app registers `pdb` first: the prototypes of a loaded PDB's function symbols), then a built-in table of common C runtime / Win32 functions, then fallback providers (the app registers one with the
+argument counts it reads from the callees' own code).
+
 Module tables read from the loaded image (every backend):
 
 | Verb (tool) | Args | Result |

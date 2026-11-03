@@ -63,6 +63,9 @@ import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
+import { analyzeCallees, directCallees, liveOptions, loadFunction, notDecompilable, type LiveFunction } from "./decomplive";
+import { decompile, irGraph, type Decompiled } from "./analysis/decompile";
+import { useDecomp, varTypesOf } from "@/store/decomp";
 import { heapHandlers } from "./heaptools";
 import { sehForMcp, tlsReport } from "./threadslive";
 
@@ -266,6 +269,56 @@ provide("ui_cfg", async (args) => {
     entry: fmtAddr(cfg.entry), truncated: cfg.truncated,
     blocks: cfg.blocks.map((b) => ({ start: fmtAddr(b.start), end: fmtAddr(b.end), terminator: b.terminator, instructions: args.with_text ? b.lines.map((l) => `${l.address}  ${l.text}`) : b.lines.length })),
     edges: cfg.edges.map((e) => ({ from: fmtAddr(e.from), to: fmtAddr(e.to), kind: e.kind, ...(e.label ? { case: e.label } : {}) })),
+  };
+});
+
+/** Decompiles the function at `address` against the live target (shared by ui_decompile / ui_unflatten). */
+async function decompileAt(args: Args, unflatten: boolean): Promise<{ fn: LiveFunction; d: Decompiled }> {
+  const a = addrArg(args);
+  const fn = await loadFunction(a, modules(), num(args, "max_insns", 8000, 50000));
+  const why = notDecompilable(fn);
+  if (why) throw new Error(why);
+  const abi = useConn.getState().backend === "local" ? "sysv" : "win64";
+  const opts = () => liveOptions(fn, { abi, userName: useNames.getState().nameOf, types: useTypes.getState().types, varTypes: varTypesOf(useDecomp.getState().varTypes, fmtAddr(a)), unflatten });
+  let d = decompile(fn.structure, opts());
+  // callee argument counts come from the callees' own code; decompile again once they are known
+  if (await analyzeCallees(directCallees(d.ir), modules(), abi).catch(() => 0)) d = decompile(fn.structure, opts());
+  return { fn, d };
+}
+
+const pseudoText = (d: Decompiled) => d.lines.map((l) => "    ".repeat(l.indent) + l.text).join("\n");
+
+provide("ui_decompile", async (args) => {
+  const { fn, d } = await decompileAt(args, args.unflatten === true);
+  return {
+    entry: fmtAddr(fn.cfg.entry),
+    signature: d.signature,
+    variables: d.vars.map((v) => ({ name: v.name, type: v.type, location: v.loc, argument: v.arg, ...(v.fields.length ? { fields: v.fields.map((f) => ({ offset: `0x${f.offset.toString(16)}`, size: f.size })) } : {}) })),
+    pseudocode: pseudoText(d),
+    ...(args.with_addresses ? { lines: d.lines.filter((l) => l.addr).map((l) => ({ address: l.addr, text: l.text })) } : {}),
+    ...(d.report ? { unflatten: d.report } : {}),
+    truncated: fn.cfg.truncated,
+  };
+});
+
+provide("ui_unflatten", async (args) => {
+  const { fn, d } = await decompileAt(args, true);
+  const r = d.report!;
+  const g = irGraph(d.ir);
+  const addrOf = new Map(g.blocks.map((b) => [b.id, fmtAddr(b.start)]));
+  return {
+    entry: fmtAddr(fn.cfg.entry),
+    ...r,
+    original: { blocks: fn.cfg.blocks.length, edges: fn.cfg.edges.length },
+    ...(r.flattened
+      ? {
+          recovered_cfg: {
+            blocks: g.blocks.length,
+            edges: g.edges.map((e) => ({ from: addrOf.get(e.from), to: addrOf.get(e.to), kind: e.kind, ...(e.label ? { case: e.label } : {}) })),
+          },
+        }
+      : {}),
+    ...(args.with_pseudocode === false ? {} : { pseudocode: pseudoText(d) }),
   };
 });
 
