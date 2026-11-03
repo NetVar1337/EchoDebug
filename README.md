@@ -170,10 +170,27 @@ npm run dev                  # UI only in a browser (needs a relay: cargo run -p
 npm test                     # frontend unit tests (PE/ELF/.NET parsers, assembler, CFG, YARA, FLIRT, diff, unpacking, struct auto-detect, engine readers, …)
 npm run test:e2e             # end-to-end UI test against a live process (Linux: gcc, cargo, playwright)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml   # relay, local backend, ptrace, Unicorn, PDB
+FUZZ_CASES=100000 npm run test:fuzz                                   # long fuzz run of the byte parsers (see below)
+FUZZ_CASES=100000 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml fuzz
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 # agent tests: compiles echo_debug.as with the real AngelScript engine against mocks of Echo's API
 cmake -S tests/agent -B build/agent-tests && cmake --build build/agent-tests -j && ctest --test-dir build/agent-tests --output-on-failure
 ```
+
+**Fuzzing.** Every parser that reads target or file bytes has property tests: hostile or damaged
+input must never crash, hang or allocate without bound. On the frontend
+(`src/lib/analysis/fuzz/`, [fast-check](https://fast-check.dev)) they cover PE (headers, imports,
+exports, .pdata, Rich/TLS/relocations/debug, resources, RTTI, Authenticode, unpacking, hook and
+byte scans), .NET metadata and CIL, ELF, FLIRT `.sig`/`.pat`, YARA rules and matching, and the
+IL2CPP / Source / Unreal readers, with random bytes and structure-aware mutations of the
+fixtures (header fields set to extreme sizes, counts and offsets, truncation, self-references).
+A parser must return or throw its own error (never a `RangeError`/`TypeError`) within
+`FUZZ_BUDGET_MS` (200 ms) per input. In the relay (`src-tauri/relay/src/fuzz.rs`, proptest) they
+cover the lifter's decoder, the link_map / Itanium RTTI walkers against hostile memory, the type
+demangler, the memory scanners and PDB files: no panic, within the budget. `npm test` and
+`cargo test` run a few dozen cases per property; `FUZZ_CASES` raises it and `FUZZ_SEED` replays a
+failing frontend run. Every bug they found has a regression test with the failing input inlined
+(`fuzz/regressions.test.ts`, the `regressions` blocks of the YARA / FLIRT fuzz files, the end of `fuzz.rs`).
 
 The agent tests (`tests/agent/`) need CMake and a C++17 compiler; CMake fetches the pinned AngelScript SDK.
 `echo_mock.as` stands in for Echo's API (one fake target, scriptable Unicorn/Zydis, captured `ws::send`),
