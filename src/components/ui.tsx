@@ -2,6 +2,7 @@
 import { Component, type ReactNode, Suspense, useEffect, useState } from "react";
 import { Check, Copy, PlugZap } from "lucide-react";
 import { useConn } from "@/store/conn";
+import AttachPrompt from "./AttachPrompt";
 
 export function Panel({ title, actions, children, className = "" }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string }) {
   return (
@@ -46,12 +47,8 @@ export function Empty({ icon, title, hint }: { icon?: ReactNode; title: string; 
 export function NeedsAgent({ children, ext = false }: { children: ReactNode; ext?: boolean }) {
   const { relay, agent, backend, ext: extUp, os } = useConn();
   if (!relay) return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="Relay not reachable." hint="The EchoDebug relay is not running. Restart the app or check the port in Settings." />;
-  if (!agent && backend !== "local") {
-    return os === "linux"
-      ? <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="No process attached." hint="Attach to a process from the Targets panel — on Linux the relay reads it via /proc (same user, or ptrace_scope=0)." />
-      : <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="Echo memory server not connected." hint="Load echo_debug.as in Echo, then attach to a process from the Targets panel." />;
-  }
-  if (ext && !extUp) return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="EchoDebug agent not connected." hint={os === "linux" ? "This feature needs the Windows Echo agent (write / freeze / emulate / pointer scan). The local Linux backend covers read, modules, sig/string scan, disassembly, scanner and writes." : "This view needs the echo_debug.as agent (write / scan / emulate verbs). Load it in Echo."} />;
+  if (!agent && backend !== "local") return <AttachPrompt />;
+  if (ext && !extUp && backend !== "local") return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="EchoDebug agent not connected." hint={os === "linux" ? "This feature needs the Windows Echo agent (write / freeze / emulate / pointer scan). The local Linux backend covers read, modules, sig/string scan, disassembly, scanner and writes." : "This view needs the echo_debug.as agent (write / scan / emulate verbs). Load it in Echo."} />;
   return <>{children}</>;
 }
 

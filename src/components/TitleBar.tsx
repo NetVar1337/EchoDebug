@@ -5,7 +5,8 @@ import { useEffect, useRef, useState } from "react";
 import { Minus, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import iconUrl from "@/assets/icon.png";
-import { useUi, kTabs, type Theme } from "@/store/ui";
+import { useUi, kTabs, kDefaultOpenTabs, type Theme } from "@/store/ui";
+import { togglePanel, useLayout, useVisiblePanels } from "@/lib/layout";
 import { useUpdate } from "@/store/update";
 import { useConn } from "@/store/conn";
 import { openUrl } from "@/lib/tauri";
@@ -29,6 +30,7 @@ async function windowAction(action: "minimize" | "toggleMaximize" | "close") {
 
 export default function TitleBar() {
   const ui = useUi();
+  const vis = useVisiblePanels();
   const upd = useUpdate();
   const target = useConn((s) => s.target);
   const version = useConn((s) => s.appVersion);
@@ -76,7 +78,7 @@ export default function TitleBar() {
       <div className="brand"><img src={iconUrl} alt="" />EchoDebug</div>
       {menu("File", [
         { label: "Go to address…", hint: "Ctrl+G", run: () => ui.set({ gotoOpen: true }) },
-        { label: "Command palette…", hint: "Ctrl+Shift+P", run: () => ui.set({ paletteOpen: true }) },
+        { label: "Command palette…", hint: "Ctrl+K", run: () => ui.set({ paletteOpen: true }) },
         "sep",
         { label: "Export session…", run: () => ui.set({ sessionExportOpen: true }) },
         { label: "Import session…", run: () => ui.set({ sessionImportOpen: true }) },
@@ -84,10 +86,18 @@ export default function TitleBar() {
         { label: "Exit", hint: "Alt+F4", run: () => void windowAction("close") },
       ])}
       {menu("View", [
-        ...kTabs.map((t) => ({ label: t.label, run: () => ui.setTab(t.id), checked: ui.tab === t.id })),
+        { label: "All views…", hint: "Ctrl+Shift+V", run: () => ui.set({ viewsOpen: true }) },
+        ...ui.openTabs.map((t) => ({ label: kTabs.find((x) => x.id === t)?.label ?? t, run: () => ui.setTab(t), checked: ui.tab === t })),
+        "sep",
+        { label: "Side panel", hint: "Ctrl+B", run: () => togglePanel("left"), checked: vis.left },
+        { label: "Scanner", hint: "Ctrl+Alt+S", run: () => togglePanel("scanner"), checked: vis.scanner },
+        { label: "Output", hint: "Ctrl+J", run: () => togglePanel("output"), checked: vis.output },
+        { label: "Inspector", hint: "Ctrl+Alt+I", run: () => togglePanel("inspector"), checked: vis.inspector },
+        { label: "Reset tabs and panels", run: () => { ui.set({ openTabs: kDefaultOpenTabs, panels: { left: true, scanner: true, inspector: true, output: true } }); useLayout.setState({ forced: {} }); } },
         "sep",
         { label: "Go to address…", hint: "Ctrl+G", run: () => ui.set({ gotoOpen: true }) },
-        { label: "Command palette…", hint: "Ctrl+Shift+P", run: () => ui.set({ paletteOpen: true }) },
+        { label: "Command palette…", hint: "Ctrl+K", run: () => ui.set({ paletteOpen: true }) },
+        { label: "Keyboard shortcuts", hint: "F1", run: () => ui.set({ shortcutsOpen: true }) },
         { label: "Settings…", run: () => ui.set({ settingsOpen: true }) },
       ])}
       {menu("Window", [

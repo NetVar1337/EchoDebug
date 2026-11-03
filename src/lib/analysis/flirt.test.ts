@@ -177,7 +177,9 @@ describe("flirt signature files", () => {
   });
 
   it("computes the CRC-16 the way FLIRT does", () => {
-    // "123456789" has the well-known CRC-16/ARC check value 0xBB3D.
-    expect(crc16(new TextEncoder().encode("123456789"))).toBe(0xbb3d);
+    // FLAIR's crc16.cpp is CRC-16/X-25 (check value 0x906E for "123456789") with the two
+    // bytes swapped, as radare2's flirt.c carries it.
+    expect(crc16(new TextEncoder().encode("123456789"))).toBe(0x6e90);
+    expect(crc16(new Uint8Array())).toBe(0);
   });
 });

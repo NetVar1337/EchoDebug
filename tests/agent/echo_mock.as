@@ -69,6 +69,53 @@ void create_thread(int tps, thread_callback@ cb)
     if (tps == 0 && cb !is null) cb();   // one-shot job threads run inline; ticking threads never start
 }
 
+// Single-threaded host: a plain flag is enough.
+class atomic_bool
+{
+    bool v;
+    atomic_bool(bool init) { v = init; }
+    bool load() const { return v; }
+    void store(bool x) { v = x; }
+}
+
+atomic_bool@ create_atomic_bool(bool init) { return atomic_bool(init); }
+
+// ---------------------------------------------------------------------------------------------
+// Hash containers (linear lists: the tests only hold a handful of keys)
+// ---------------------------------------------------------------------------------------------
+
+class hash_map
+{
+    array<uint64> keys;
+    array<string> vals;
+    int find(uint64 k) const { for (uint i = 0; i < keys.length(); i++) if (keys[i] == k) return int(i); return -1; }
+    bool contains(uint64 k) const { return find(k) >= 0; }
+    void set_string(uint64 k, const string &in v)
+    {
+        int i = find(k);
+        if (i >= 0) vals[i] = v;
+        else { keys.insertLast(k); vals.insertLast(v); }
+    }
+    bool get_string(uint64 k, string &out v) const
+    {
+        int i = find(k);
+        if (i < 0) return false;
+        v = vals[i];
+        return true;
+    }
+}
+
+hash_map@ create_hash_map() { return hash_map(); }
+
+class hash_set_uint64
+{
+    array<uint64> keys;
+    bool contains(uint64 k) const { for (uint i = 0; i < keys.length(); i++) if (keys[i] == k) return true; return false; }
+    void insert(uint64 k) { if (!contains(k)) keys.insertLast(k); }
+}
+
+hash_set_uint64@ create_hash_set_uint64() { return hash_set_uint64(); }
+
 class mutex
 {
     void lock() {}
@@ -132,6 +179,7 @@ namespace util
 {
     string get_username() { return "tester"; }
     uint64 tickcount() { return g_mock_tick; }
+    uint64 system_time() { return 1700000000000 + g_mock_tick; }
     // Echo's format_string is variadic; the agent only formats one value with "{}".
     string format_string(string fmt, double v) { return formatFloat(v, "", 0, 6); }
     string format_string(string fmt, int64 v) { return formatInt(v); }
@@ -147,6 +195,55 @@ namespace util
         }
         return s;
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Files (in-memory: path -> contents)
+// ---------------------------------------------------------------------------------------------
+
+array<string> g_mock_file_names;
+array<string> g_mock_file_data;
+
+int mock_file(const string &in path)
+{
+    for (uint i = 0; i < g_mock_file_names.length(); i++) if (g_mock_file_names[i] == path) return int(i);
+    return -1;
+}
+
+namespace file
+{
+    bool read(string path, string &out text)
+    {
+        int i = mock_file(path);
+        text = i < 0 ? "" : g_mock_file_data[i];
+        return i >= 0;
+    }
+    bool write(string path, string text)
+    {
+        int i = mock_file(path);
+        if (i >= 0) g_mock_file_data[i] = text;
+        else { g_mock_file_names.insertLast(path); g_mock_file_data.insertLast(text); }
+        return true;
+    }
+    bool append(string path, string text)
+    {
+        string cur;
+        read(path, cur);
+        return write(path, cur + text);
+    }
+    bool remove(string path)
+    {
+        int i = mock_file(path);
+        if (i < 0) return false;
+        g_mock_file_names.removeAt(i);
+        g_mock_file_data.removeAt(i);
+        return true;
+    }
+}
+
+namespace dir
+{
+    bool create(string path) { return true; }
 }
 
 string formatChar(uint c)
@@ -214,6 +311,12 @@ class memory_buffer
     uint16 read_uint16(uint64 o) { return uint16(rd(o, 2)); }
     uint32 read_uint32(uint64 o) { return uint32(rd(o, 4)); }
     uint64 read_uint64(uint64 o) { return rd(o, 8); }
+    int8 read_int8(uint64 o) { return int8(rd(o, 1)); }
+    int16 read_int16(uint64 o) { return int16(rd(o, 2)); }
+    int32 read_int32(uint64 o) { return int32(rd(o, 4)); }
+    int64 read_int64(uint64 o) { return int64(rd(o, 8)); }
+    float read_float(uint64 o) { return fpFromIEEE(uint(rd(o, 4))); }
+    double read_double(uint64 o) { return fpFromIEEE(rd(o, 8)); }
     uint64 size() { return data.length(); }
 }
 
@@ -261,6 +364,15 @@ namespace process
         return mock_mapped(address, 8);
     }
 
+    bool read_uint32(uint64 address, uint32 &out v)
+    {
+        array<uint8>@ b = read_bytes(address, 4);
+        v = 0;
+        if (b is null) return false;
+        for (uint i = 0; i < 4; i++) v |= uint32(b[i]) << (8 * i);
+        return true;
+    }
+
     bool read_string(uint64 address, string &out v)
     {
         v = "";
@@ -274,6 +386,46 @@ namespace process
         if (!mock_mapped(address, bytes.length())) return false;
         for (uint i = 0; i < bytes.length(); i++) g_mock_mem[uint(address - MOCK_BASE) + i] = bytes[i];
         return true;
+    }
+
+    bool write_le(uint64 address, uint64 v, uint w)
+    {
+        array<uint8> b(w);
+        for (uint i = 0; i < w; i++) b[i] = uint8(v >> (8 * i));
+        return write_bytes(b, address);
+    }
+    bool write_uint8(uint64 a, uint8 v) { return write_le(a, v, 1); }
+    bool write_int8(uint64 a, int8 v) { return write_le(a, uint64(v), 1); }
+    bool write_uint16(uint64 a, uint16 v) { return write_le(a, v, 2); }
+    bool write_int16(uint64 a, int16 v) { return write_le(a, uint64(v), 2); }
+    bool write_uint32(uint64 a, uint32 v) { return write_le(a, v, 4); }
+    bool write_int32(uint64 a, int32 v) { return write_le(a, uint64(v), 4); }
+    bool write_uint64(uint64 a, uint64 v) { return write_le(a, v, 8); }
+    bool write_int64(uint64 a, int64 v) { return write_le(a, uint64(v), 8); }
+    bool write_float(uint64 a, float v) { return write_le(a, fpToIEEE(v), 4); }
+    bool write_double(uint64 a, double v) { return write_le(a, fpToIEEE(v), 8); }
+
+    // Byte patterns ("48 8B ?? 05"; ? or ?? = any byte) over the module at `base`.
+    array<uint64>@ find_signatures(uint64 base, string pattern)
+    {
+        array<string> toks = pattern.split(" ");
+        array<int> pat;
+        for (uint i = 0; i < toks.length(); i++)
+        {
+            if (toks[i] == "") continue;
+            if (toks[i] == "?" || toks[i] == "??") { pat.insertLast(-1); continue; }
+            uint n = 0;
+            pat.insertLast(int(parseInt(toks[i], 16, n)));
+        }
+        array<uint64> hits;
+        if (base != MOCK_BASE || pat.length() == 0) return hits;
+        for (uint o = 0; o + pat.length() <= g_mock_mem.length(); o++)
+        {
+            bool ok = true;
+            for (uint k = 0; k < pat.length() && ok; k++) ok = pat[k] < 0 || g_mock_mem[o + k] == uint8(pat[k]);
+            if (ok) hits.insertLast(MOCK_BASE + o);
+        }
+        return hits;
     }
 
     memory_region virtual_query(uint64 address)
@@ -371,10 +523,18 @@ namespace uc
         fetch_prot, read_prot, write_prot, map, hook, insn_invalid
     }
 
+    enum mem_type { read, write, fetch, read_unmapped, write_unmapped, fetch_unmapped, write_prot, read_prot, fetch_prot, read_after }
+    funcdef bool mem_hook_fn(uint64 h, mem_type type, uint64 address, uint32 size, uint64 value);
+
     uint64 create() { return 1; }
+    // unmapped-access hooks are accepted but never fire (the mock has no faulting accesses)
+    bool hook_memory_unmapped(uint64 h, mem_hook_fn@ cb) { return true; }
+    void stop(uint64 h) {}
+    void flush_code(uint64 h) {}
     // vector registers and the region list are not modelled: reads fail, no regions
     bool reg_read128(uint64 h, x86_reg reg, array<uint8> &out data) { return false; }
     bool reg_read256(uint64 h, x86_reg reg, array<uint8> &out data) { return false; }
+    bool reg_write128(uint64 h, x86_reg reg, const array<uint8> &in data) { return false; }
     bool mem_regions(uint64 h, array<uc_memory_region> &out regions) { regions.resize(0); return true; }
     uint64 create_process() { return 2; }
     void close(uint64 h) {}
@@ -487,6 +647,24 @@ namespace zydis
             if (g_mock_insns[i].runtime_address == rip) insns.insertLast(g_mock_insns[i]);
         return insns.length() > 0;
     }
+
+    // Canned instructions from `rip` onward, laid end to end, up to and including the first ret.
+    bool disasm_func(const array<uint8>@ &in bytes, uint64 rip, array<disasm_insn@> &out insns)
+    {
+        insns.resize(0);
+        uint64 a = rip;
+        while (a < rip + bytes.length())
+        {
+            disasm_insn@ hit = null;
+            for (uint i = 0; i < g_mock_insns.length() && hit is null; i++)
+                if (g_mock_insns[i].runtime_address == a) @hit = g_mock_insns[i];
+            if (hit is null || hit.length == 0) return false;
+            insns.insertLast(hit);
+            if (hit.text == "ret") return true;
+            a += hit.length;
+        }
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -544,6 +722,7 @@ class json_obj
     json_obj@ get_obj(string k) { json_val@ v = at_key(k); return v is null ? null : v.o; }
 
     string get_string_at(uint n) { json_val@ v = at(n); return v is null || v.t != json_type::string ? "" : v.s; }
+    double get_double_at(uint n) { json_val@ v = at(n); return v is null || v.t != json_type::number ? 0 : v.d; }
     int64 get_int64_at(uint n) { json_val@ v = at(n); return v is null || v.t != json_type::number ? 0 : v.i; }
     uint64 get_uint64_at(uint n) { json_val@ v = at(n); return v is null || v.t != json_type::number ? 0 : v.u; }
     json_obj@ get_obj_at(uint n) { json_val@ v = at(n); return v is null ? null : v.o; }
@@ -552,6 +731,7 @@ class json_obj
     void set(string k, double v) { put(k, jdbl(v)); }
     void set(string k, int v) { put(k, jint(v)); }
     void set(string k, uint v) { put(k, juint(v)); }
+    void set(string k, uint8 v) { put(k, juint(v)); }
     void set(string k, int64 v) { put(k, jint(v)); }
     void set(string k, uint64 v) { put(k, juint(v)); }
     void set(string k, bool v) { put(k, jbool(v)); }

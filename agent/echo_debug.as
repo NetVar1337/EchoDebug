@@ -14,6 +14,11 @@
 //     guarantees a scan never sees the target change underneath it.
 //   * emulate and peb_walk also run through the job slot: the slot serialises them, so the
 //     code-hook globals (g_emu_*) are only ever touched by one job thread at a time.
+//   * scan_new first scans (not 'unknown') split the regions into shards worked by the job thread
+//     and three helper threads (par_scan_new); shards merge in address order.
+//   * Optional settings live in echodebug/agent.json (port, auto_attach, alerts), writes and freezes
+//     are journaled to echodebug/journal.jsonl, and an "EchoDebug" tab in Echo's menu shows status
+//     and the safety switches (pause freezes/watches, restore and detach, cancel the running job).
 //   * Ticking threads (only creatable from main): keepalive at 1 tps (reconnect with backoff,
 //     process-exit detection, AUTO_ATTACH retries, job watchdog) and freeze at 20 tps.
 //   * Shared state: g_state_mx (attach state + job slot incl. the claimed JobParams — claim and
@@ -25,7 +30,7 @@
 //   * Freeze entries keep the bytes that were at the address before freezing; they are restored
 //     on detach, on target exit and in on_unload (Echo docs: undo target modifications on unload).
 
-const string AGENT_VERSION = "0.8.1";
+const string AGENT_VERSION = "0.8.8";
 const int RELAY_PORT = 47110;
 const string AUTO_ATTACH = "";   // optional process name to attach on load
 
@@ -54,7 +59,8 @@ const uint CHAIN_MAX_OFFSETS = 64;
 
 // Watch list limits (agent-side sampler, emits watch_event on change)
 const uint WATCH_MAX_ENTRIES = 256;
-const uint WATCH_MAX_BYTES = 16;
+const uint WATCH_MAX_BYTES = 256;
+const uint WATCH_HISTORY = 16;
 const uint64 JOB_TIME_LIMIT_MS = 100000;       // the relay fails requests after 120 s
 const uint64 JOB_WATCHDOG_MS = 125000;         // frees the slot if a job thread died mid-way (just past the relay's 120 s timeout)
 
@@ -167,6 +173,11 @@ uint g_emu_mem_limit = 0;
 array<MemAccess@> g_emu_mem;
 array<uint> g_emu_mem_pending;   // indexes of writes whose new value is read before the next instruction
 
+// Cooperative cancel for long jobs (scans, pointer scans, emulation): set by the 'cancel' verb or
+// the in-Echo panel, cleared when the next job is claimed.
+atomic_bool@ g_cancel = create_atomic_bool(false);
+uint64 g_emu_max = 0;
+
 // g_pow2[e + 1074] == 2^e, used to decode IEEE-754 bits without a reinterpret cast.
 array<double> g_pow2;
 
@@ -181,7 +192,14 @@ class FreezeEntry
     array<uint8> original;   // bytes at `address` before the freeze, for restore on detach/unload
     bool has_original;
     bool failed;
-    FreezeEntry() { address = 0; has_original = false; failed = false; }
+    string mode;     // "set" (write data), "add" (value += step each tick), "clamp" (keep within min..max)
+    string vtype;    // numeric type for add/clamp
+    double step;
+    double minv;
+    double maxv;
+    string group;
+    bool paused;
+    FreezeEntry() { address = 0; has_original = false; failed = false; mode = "set"; vtype = ""; step = 0; minv = 0; maxv = 0; group = ""; paused = false; }
 }
 
 class WatchEntry
@@ -191,7 +209,13 @@ class WatchEntry
     string label;
     array<uint8> prev;    // last sampled bytes
     bool has_prev;
-    WatchEntry() { address = 0; size = 4; has_prev = false; }
+    string vtype;         // optional numeric decode
+    string cond;          // any | eq | ne | gt | lt | delta
+    double cval;
+    uint hits;
+    array<string> history;   // last values (hex), newest last
+    bool alert;
+    WatchEntry() { address = 0; size = 4; has_prev = false; vtype = ""; cond = "any"; cval = 0; hits = 0; alert = false; }
 }
 
 // One decoded memory operand of an emulated instruction.
@@ -237,8 +261,11 @@ class EmuJob
     int64 trace_limit;
     bool mem_log;
     int64 mem_log_limit;
+    EmuExtras@ x;
+    json_obj@ xmm_req;
     EmuJob()
     {
+        @x = EmuExtras();
         start = 0; stop = 0; max_insns = 100000; timeout_us = 1000000;
         trace = false; trace_limit = 2000;
         mem_log = false; mem_log_limit = 2000;
@@ -403,8 +430,8 @@ class PageReader
 // Small helpers
 // ---------------------------------------------------------------------------------------------
 
-string ext_url() { return "ws://127.0.0.1:" + RELAY_PORT + "/ext"; }
-string native_url() { return "ws://127.0.0.1:" + RELAY_PORT + "/agent"; }
+string ext_url() { return "ws://127.0.0.1:" + g_port + "/ext"; }
+string native_url() { return "ws://127.0.0.1:" + g_port + "/agent"; }
 
 uint64 umin(uint64 a, uint64 b) { return a < b ? a : b; }
 uint64 align_up(uint64 v, uint64 a) { return (v + a - 1) & ~(a - 1); }
@@ -880,6 +907,16 @@ bool parse_value(json_obj@ r, const string &in k, int vt, uint64 &out bits, doub
 void send_json(json_obj@ o)
 {
     string s = json::stringify(o);
+    if (!ws::is_connected())
+    {
+        // replies die with the connection (the relay already failed them); events are kept
+        if (o.get_string("type") != "event") return;
+        g_evq_mx.lock();
+        g_evq.insertLast(s);
+        if (g_evq.length() > EVQ_MAX) g_evq.removeAt(0);
+        g_evq_mx.unlock();
+        return;
+    }
     g_send_mx.lock();
     ws::send(s);
     g_send_mx.unlock();
@@ -998,6 +1035,7 @@ bool claim_job(const string &in kind, int64 id, JobParams@ p, uint &out seq)
         g_job_seq++;
         g_job_t0 = util::tickcount();
         @g_job_params = p;
+        g_cancel.store(false);
     }
     seq = g_job_seq;
     g_state_mx.unlock();
@@ -1020,7 +1058,7 @@ bool job_busy()
     return b;
 }
 
-bool time_up(uint64 t0) { return util::tickcount() - t0 > JOB_TIME_LIMIT_MS; }
+bool time_up(uint64 t0) { return g_cancel.load() || util::tickcount() - t0 > JOB_TIME_LIMIT_MS; }
 
 ScanState@ get_scan()
 {
@@ -1136,6 +1174,7 @@ void mark_detached(const string &in why)
     publish_scan(null);
     clear_freeze();
     clear_watch();
+    emud_mark_stale();
     console::log(LOG_PREFIX + "detached (" + why + ")");
     alert::show_tag("EchoDebug: detached (" + why + ")", TAG, 255, 160, 40);
     send_json(new_event("detached"));
@@ -1303,7 +1342,9 @@ void h_write(json_obj@ r, int64 id)
             return;
         }
     }
+    array<uint8>@ before = process::read_bytes(addr, bytes.length());
     if (!process::write_bytes(bytes, addr)) { send_error(id, E_FAILED, "write failed", hex_addr(addr)); return; }
+    journal("write", addr, before is null ? "" : hex_of(before, 0, before.length()), hex_of(bytes, 0, bytes.length()));
     memory_region m = process::virtual_query(addr);
     json_obj@ o = ok_reply("write", id);
     o.set("written", bytes.length());
@@ -1425,8 +1466,21 @@ void h_freeze(json_obj@ r, int64 id)
     if (!opt_bool(r, "enabled", true, enabled)) { bad_args(id, "enabled must be a bool"); return; }
     string hex;
     if (!opt_str(r, "data", "", hex)) { bad_args(id, "data must be a hex string"); return; }
+    string mode, vt, group;
+    double step, minv, maxv;
+    if (!opt_str(r, "mode", "set", mode) || !opt_str(r, "value_type", "", vt) || !opt_str(r, "group", "", group) ||
+        !opt_double(r, "step", 1, step) || !opt_double(r, "min", 0, minv) || !opt_double(r, "max", 0, maxv))
+    { bad_args(id, "mode set|add|clamp, value_type, group, step/min/max numbers"); return; }
+    if (mode != "set" && mode != "add" && mode != "clamp") { bad_args(id, "mode must be set, add or clamp"); return; }
+    if (mode != "set" && vt_width(vt) == 0) { bad_args(id, "add/clamp need a numeric value_type"); return; }
     array<uint8> bytes;
-    if (enabled)
+    if (enabled && mode != "set")
+    {
+        array<uint8>@ cur = process::read_bytes(addr, vt_width(vt));
+        if (cur is null) { send_error(id, E_FAILED, "read failed", hex_addr(addr)); return; }
+        bytes = cur;
+    }
+    else if (enabled)
     {
         if (!parse_hex_bytes(hex, bytes) || bytes.length() == 0) { bad_args(id, "data must be non-empty hex"); return; }
         if (bytes.length() > FREEZE_MAX_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "freeze data is limited to 4096 bytes"); return; }
@@ -1444,6 +1498,8 @@ void h_freeze(json_obj@ r, int64 id)
         {
             g_freeze[uint(idx)].data = bytes;
             g_freeze[uint(idx)].failed = false;
+            FreezeEntry@ fe = g_freeze[uint(idx)];
+            fe.mode = mode; fe.vtype = vt; fe.step = step; fe.minv = minv; fe.maxv = maxv; fe.group = group; fe.paused = false;
         }
         else if (g_freeze.length() >= FREEZE_MAX_ENTRIES) full = true;
         else
@@ -1454,6 +1510,7 @@ void h_freeze(json_obj@ r, int64 id)
             // capture the pre-freeze bytes once, so detach/unload can restore them
             array<uint8>@ orig = process::read_bytes(addr, bytes.length());
             if (orig !is null && orig.length() == bytes.length()) { e.original = orig; e.has_original = true; }
+            e.mode = mode; e.vtype = vt; e.step = step; e.minv = minv; e.maxv = maxv; e.group = group;
             g_freeze.insertLast(e);
         }
         if (!full)
@@ -1472,7 +1529,7 @@ void h_freeze(json_obj@ r, int64 id)
     g_freeze_mx.unlock();
 
     if (full) { send_error(id, E_LIMIT, "limit exceeded", "at most 1024 frozen entries"); return; }
-    if (patched_ev !is null) send_json(patched_ev);
+    if (patched_ev !is null) { send_json(patched_ev); journal("freeze", addr, patched_ev.get_string("old"), patched_ev.get_string("new")); }
     json_obj@ o = ok_reply("freeze", id);
     o.set("frozen", n);
     send_json(o);
@@ -1487,6 +1544,12 @@ void h_freeze_list(json_obj@ r, int64 id)
         json_obj@ e = json_obj();
         e.set("address", hex_addr(g_freeze[i].address));
         e.set("data", hex_of(g_freeze[i].data, 0, g_freeze[i].data.length()));
+        e.set("mode", g_freeze[i].mode);
+        if (g_freeze[i].vtype != "") e.set("value_type", g_freeze[i].vtype);
+        if (g_freeze[i].mode == "add") e.set("step", g_freeze[i].step);
+        if (g_freeze[i].mode == "clamp") { e.set("min", g_freeze[i].minv); e.set("max", g_freeze[i].maxv); }
+        if (g_freeze[i].group != "") e.set("group", g_freeze[i].group);
+        e.set("paused", g_freeze[i].paused);
         arr.push(e);
     }
     g_freeze_mx.unlock_shared();
@@ -1506,7 +1569,16 @@ void h_watch(json_obj@ r, int64 id)
     if (!get_addr(r, "address", addr)) { bad_args(id, "watch requires 'address'"); return; }
     int64 sz;
     if (!opt_int(r, "size", 4, sz)) { bad_args(id, "size must be a number"); return; }
-    if (sz < 1 || sz > int64(WATCH_MAX_BYTES)) { send_error(id, E_LIMIT, "limit exceeded", "watch size must be 1..16"); return; }
+    if (sz < 1 || sz > int64(WATCH_MAX_BYTES)) { send_error(id, E_LIMIT, "limit exceeded", "watch size must be 1..256"); return; }
+    string vt, cond;
+    double cval;
+    bool alert;
+    if (!opt_str(r, "value_type", "", vt) || !opt_str(r, "condition", "any", cond) || !opt_double(r, "value", 0, cval) || !opt_bool(r, "alert", false, alert))
+    { bad_args(id, "value_type string, condition any|eq|ne|gt|lt|delta, value number, alert bool"); return; }
+    if (vt != "" && vt_width(vt) == 0) { bad_args(id, "value_type must be u8..u64, i8..i64, f32 or f64"); return; }
+    if (cond != "any" && vt == "") { bad_args(id, "conditions need a numeric value_type"); return; }
+    if (cond != "any" && cond != "eq" && cond != "ne" && cond != "gt" && cond != "lt" && cond != "delta") { bad_args(id, "unknown condition " + cond); return; }
+    if (vt != "" && uint(sz) < vt_width(vt)) sz = int64(vt_width(vt));
     string label;
     if (!opt_str(r, "label", "", label)) { bad_args(id, "label must be a string"); return; }
 
@@ -1518,6 +1590,7 @@ void h_watch(json_obj@ r, int64 id)
     {
         g_watch[uint(idx)].size = uint(sz);
         if (label != "") g_watch[uint(idx)].label = label;
+        g_watch[uint(idx)].vtype = vt; g_watch[uint(idx)].cond = cond; g_watch[uint(idx)].cval = cval; g_watch[uint(idx)].alert = alert;
     }
     else if (g_watch.length() >= WATCH_MAX_ENTRIES)
     {
@@ -1531,6 +1604,7 @@ void h_watch(json_obj@ r, int64 id)
         e.address = addr;
         e.size = uint(sz);
         e.label = label;
+        e.vtype = vt; e.cond = cond; e.cval = cval; e.alert = alert;
         // seed with the current value so the first event only fires on a real change
         array<uint8>@ b = process::read_bytes(addr, uint(sz));
         if (b !is null && b.length() == uint(sz)) { e.prev = b; e.has_prev = true; }
@@ -1568,6 +1642,12 @@ void h_watch_list(json_obj@ r, int64 id)
         e.set("size", g_watch[i].size);
         e.set("label", g_watch[i].label);
         e.set("last", g_watch[i].has_prev ? hex_of(g_watch[i].prev, 0, g_watch[i].prev.length()) : "");
+        e.set("hits", g_watch[i].hits);
+        if (g_watch[i].vtype != "") e.set("value_type", g_watch[i].vtype);
+        if (g_watch[i].cond != "any") { e.set("condition", g_watch[i].cond); e.set("value", g_watch[i].cval); }
+        json_obj@ hist = json::array();
+        for (uint k = 0; k < g_watch[i].history.length(); k++) hist.push(g_watch[i].history[k]);
+        e.set("history", hist);
         arr.push(e);
     }
     g_watch_mx.unlock_shared();
@@ -1579,7 +1659,7 @@ void h_watch_list(json_obj@ r, int64 id)
 // 10 tps: sample watched addresses, emit watch_event on change.
 void watch_tick()
 {
-    if (!is_attached()) return;
+    if (!is_attached() || g_pause_watch) return;
     g_watch_mx.lock();
     for (uint i = 0; i < g_watch.length(); i++)
     {
@@ -1588,15 +1668,39 @@ void watch_tick()
         if (cur is null || cur.length() != e.size) continue;
         if (e.has_prev && bytes_eq(cur, 0, e.prev, 0, e.size)) continue;
         string old = e.has_prev ? hex_of(e.prev, 0, e.prev.length()) : "";
+        double ov = 0, nv = 0;
+        bool num = e.vtype != "" && num_decode(e.vtype, cur, nv) && (!e.has_prev || num_decode(e.vtype, e.prev, ov));
+        bool fire = true;
+        if (e.cond != "any" && num)
+        {
+            if (e.cond == "eq") fire = nv == e.cval;
+            else if (e.cond == "ne") fire = nv != e.cval;
+            else if (e.cond == "gt") fire = nv > e.cval;
+            else if (e.cond == "lt") fire = nv < e.cval;
+            else if (e.cond == "delta") fire = e.has_prev && (nv - ov >= e.cval || ov - nv >= e.cval);
+        }
         e.prev = cur;
         e.has_prev = true;
+        string nh = hex_of(cur, 0, cur.length());
+        e.history.insertLast(nh);
+        if (e.history.length() > WATCH_HISTORY) e.history.removeAt(0);
+        if (!fire) continue;
+        e.hits++;
+        uint hits = e.hits;
+        bool al = e.alert;
+        string lbl = e.label;
+        uint64 ad = e.address;
+        string vt = e.vtype;
         g_watch_mx.unlock();
         json_obj@ ev = new_event("watch_event");
-        ev.set("address", hex_addr(e.address));
-        if (e.label != "") ev.set("label", e.label);
+        ev.set("address", hex_addr(ad));
+        if (lbl != "") ev.set("label", lbl);
         ev.set("old", old);
-        ev.set("new", hex_of(cur, 0, cur.length()));
+        ev.set("new", nh);
+        ev.set("hits", hits);
+        if (num) { ev.set("old_value", ov); ev.set("new_value", nv); ev.set("value_type", vt); }
         send_json(ev);
+        if (al) notify((lbl != "" ? lbl : hex_addr(ad)) + (num ? " = " + nv : " changed"), 255, 220, 80);
         g_watch_mx.lock();
     }
     g_watch_mx.unlock();
@@ -1919,6 +2023,14 @@ void run_scan_new(int64 id, ScanSpec@ s)
     uint cap = MAX_CANDIDATES;
     if (pattern && PREV_RAW_CAP / s.width < cap) cap = uint(PREV_RAW_CAP / s.width);
 
+    if (par_scan_new(id, s, rl, st, note))
+    {
+        send_progress("scan_new", rl.total, rl.total);
+        publish_scan(st);
+        send_scan_reply("scan_new", id, st, note);
+        notify("scan finished: " + st.count() + " results", 120, 255, 160);
+        return;
+    }
     uint64 w = s.width;
     uint64 al = s.align;
     uint64 snap_bytes = 0;
@@ -2289,6 +2401,8 @@ void run_pointer_scan(int64 id, PtrSpec@ p)
     }
 
     send_progress("pointer_scan", scanned, scanned);
+    @g_ptr_last = results;
+    notify("pointer scan finished: " + results.length() + " paths", 120, 255, 160);
     json_obj@ o = ok_reply("pointer_scan", id);
     o.set("results", results);
     o.set("truncated", trunc);
@@ -2346,6 +2460,9 @@ string uc_error_name(int e)
 bool emu_hook(uint64 h, uint64 address, uint32 size)
 {
     g_emu_count++;
+    if (g_cancel.load()) { uc::stop(h); return false; }
+    if ((g_emu_count & 0x3FFFF) == 0) send_progress("emulate", g_emu_count, g_emu_max);
+    if (!emux_code(h, g_emu_x, address, size)) return true;   // a stand-in returned to the caller
     if (g_emu_trace_on && g_emu_trace.length() < g_emu_trace_limit) g_emu_trace.insertLast(address);
     if (g_emu_mem_on) emu_log_mem(h, address, size);
     return true;   // the instruction limit is enforced by uc::start's count argument
@@ -2538,6 +2655,9 @@ void h_emulate(json_obj@ r, int64 id)
         }
     }
 
+    string px = emux_parse(r, e.x, e.trace_limit);
+    if (px != "") { bad_args(id, px); return; }
+    if (has_key(r, "xmm")) @e.xmm_req = r;
     JobParams@ p = JobParams();
     @p.emu = e;
     uint seq;
@@ -2573,6 +2693,10 @@ void run_emulate(int64 id, EmuJob@ e)
     g_emu_mem_on = e.mem_log;
     g_emu_mem_limit = uint(e.mem_log_limit);
     ok = ok && uc::hook_code(h, @emu_hook);
+    @g_emu_x = e.x;
+    g_emu_x.blank = blank;
+    emux_reset_run(g_emu_x);
+    if (ok && g_emu_x.zero_unmapped) ok = uc::hook_memory_unmapped(h, @emu_unmapped_hook);
     // Inject the blobs before the run: map the page if the emulator has not faulted it in yet.
     for (uint i = 0; i < e.waddrs.length() && ok; i++)
     {
@@ -2598,6 +2722,10 @@ void run_emulate(int64 id, EmuJob@ e)
         return;
     }
 
+    string xerr = e.xmm_req is null ? "" : emux_set_xmm(h, e.xmm_req);
+    if (xerr != "") { uc::close(h); bad_args(id, xerr); return; }
+    emux_prepare(h, g_emu_x);
+    g_emu_max = uint64(e.max_insns);
     int res = uc::start(h, e.start, e.stop, uint64(e.timeout_us), uint64(e.max_insns));
     emu_flush_writes(h);   // the last instruction's writes
 
@@ -2615,6 +2743,7 @@ void run_emulate(int64 id, EmuJob@ e)
         regs_out.set(names[i], hex_addr(v));
     }
     uint64 fault = uc::fault_address(h);
+    json_obj@ xmm_out = emux_xmm_json(h);
 
     // Read the requested blobs back before the handle is closed.
     json_obj@ mem_out = json::array();
@@ -2663,7 +2792,2036 @@ void run_emulate(int64 id, EmuJob@ e)
     o.set("mem", mem_out);
     // Unicorn reports a timeout or instruction-limit stop as "ok"; this tells them apart.
     o.set("reached_end", res == uc::error::ok && rip == e.stop);
+    emux_report(o, g_emu_x, xmm_out);
     send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Emulated debugger: one persistent Unicorn session (emu_start / emu_step / emu_run / emu_break /
+// emu_set / emu_read / emu_state / emu_close). Process-backed sessions fault pages in from the
+// target on demand and never modify it. Only the ws thread touches the session handle; runs are
+// bounded by timeout_us (<= 5 s), so a long run delays other verbs by at most that much.
+// ---------------------------------------------------------------------------------------------
+
+uint64 g_emud = 0;                 // session handle (0 = none)
+bool g_emud_blank = false;
+array<uint64> g_emud_bps;          // breakpoint addresses
+uint64 g_emud_skip = 0;            // a resumed run does not stop on the breakpoint it sits on
+bool g_emud_skip_on = false;
+uint64 g_emud_hit = 0;
+bool g_emud_hit_on = false;
+uint64 g_emud_count = 0;           // instructions executed over the session's lifetime
+uint64 g_emud_last = 0;            // address of the last instruction the hook saw
+uint64 g_emud_stack = 0;
+array<uint64> g_emud_dirty;        // pages written through emu_set
+mutex@ g_emud_mx = create_mutex();
+bool g_emud_stale = false;         // set by mark_detached (any thread); the ws thread closes the handle
+
+const uint64 EMUD_RET = 0x1000;    // a ret from the start function lands here ("returned")
+
+int u64_index(const array<uint64> &in a, uint64 v)
+{
+    for (uint i = 0; i < a.length(); i++)
+        if (a[i] == v) return int(i);
+    return -1;
+}
+
+bool emud_hook(uint64 h, uint64 address, uint32 size)
+{
+    if (g_cancel.load()) { uc::stop(h); return false; }
+    int bp = u64_index(g_emud_bps, address);
+    if (g_emud_skip_on && address == g_emud_skip) { g_emud_skip_on = false; }
+    else if (bp >= 0 && emud_cond_true(h, uint(bp) < g_emud_conds.length() ? g_emud_conds[uint(bp)] : ""))
+    {
+        g_emud_hit = address;
+        g_emud_hit_on = true;
+        g_emud_last = address;
+        uc::stop(h);
+        return false;
+    }
+    else if (emud_watch_hit(h, address, size))
+    {
+        g_emud_wp_hit_on = true;
+        g_emud_last = address;
+        uc::stop(h);
+        return false;
+    }
+    g_emud_skip_on = false;
+    g_emud_count++;
+    g_emud_last = address;
+    emux_code(h, g_emud_x, address, size);
+    return true;
+}
+
+void emud_close()
+{
+    if (g_emud != 0) uc::close(g_emud);
+    g_emud = 0;
+    g_emud_conds.resize(0);
+    g_emud_wp_addr.resize(0); g_emud_wp_size.resize(0); g_emud_wp_mode.resize(0);
+    g_emud_snaps.resize(0);
+    g_emud_bps.resize(0);
+    g_emud_dirty.resize(0);
+    g_emud_count = 0;
+}
+
+void emud_mark_stale()
+{
+    g_emud_mx.lock();
+    g_emud_stale = true;
+    g_emud_mx.unlock();
+}
+
+// Closes a session invalidated by a detach; true when a session is usable.
+bool emud_ready(int64 id)
+{
+    g_emud_mx.lock();
+    bool stale = g_emud_stale;
+    g_emud_stale = false;
+    g_emud_mx.unlock();
+    if (stale && !g_emud_blank) emud_close();
+    if (g_emud == 0) { send_error(id, E_FAILED, "operation failed", "no emulator session: emu_start first"); return false; }
+    return true;
+}
+
+bool emud_ensure(uint64 a, uint64 n)
+{
+    if (uc::mem_query(g_emud, a) >= 0 && uc::mem_query(g_emud, a + n - 1) >= 0)
+    {
+        array<uint8> probe;
+        if (uc::mem_read(g_emud, a, 1, probe)) return true;
+    }
+    if (!g_emud_blank)
+    {
+        // process-backed: a read through the emulator faults the page in; fall back to mapping a copy
+        array<uint8>@ src = process::read_bytes(a & ~uint64(0xFFF), uint(align_up(a + n, 0x1000) - (a & ~uint64(0xFFF))));
+        if (src !is null && uc::mem_map(g_emud, a & ~uint64(0xFFF), src.length(), uint(uc::prot::all)))
+            return uc::mem_write(g_emud, a & ~uint64(0xFFF), src);
+    }
+    uint64 page = a & ~uint64(0xFFF);
+    return uc::mem_map(g_emud, page, align_up(a + n, 0x1000) - page, uint(uc::prot::all));
+}
+
+json_obj@ emud_state(const string &in verb, int64 id, json_obj@ stop)
+{
+    json_obj@ o = ok_reply(verb, id);
+    array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
+    json_obj@ regs = json_obj();
+    uint64 rip = 0;
+    uint64 rsp = 0;
+    for (uint i = 0; i < names.length(); i++)
+    {
+        x86_reg reg;
+        emu_reg(names[i], reg);
+        uint64 v = 0;
+        uc::reg_read64(g_emud, reg, v);
+        if (names[i] == "rip") rip = v;
+        if (names[i] == "rsp") rsp = v;
+        regs.set(names[i], hex_addr(v));
+    }
+    o.set("regs", regs);
+    o.set("rip", hex_addr(rip));
+    o.set("instructions", g_emud_count);
+    o.set("stop", stop);
+    json_obj@ next = json::array();
+    array<uint8> code;
+    if (rip != EMUD_RET && uc::mem_read(g_emud, rip, 64, code))
+    {
+        array<disasm_insn@> insns;
+        if (zydis::disasm(code, rip, insns))
+        {
+            uint off = 0;
+            for (uint i = 0; i < insns.length() && i < 6; i++)
+            {
+                json_obj@ x = json_obj();
+                x.set("address", hex_addr(rip + off));
+                x.set("bytes", hex_of(code, off, insns[i].length));
+                x.set("text", insns[i].text);
+                next.push(x);
+                off += insns[i].length;
+            }
+        }
+    }
+    o.set("next", next);
+    json_obj@ stack = json::array();
+    array<uint8> sb;
+    if (uc::mem_read(g_emud, rsp, 64, sb))
+        for (uint i = 0; i < 8; i++)
+        {
+            uint64 v = 0;
+            for (uint k = 0; k < 8; k++) v |= uint64(sb[i * 8 + k]) << (8 * k);
+            json_obj@ x = json_obj();
+            x.set("address", hex_addr(rsp + i * 8));
+            x.set("value", hex_addr(v));
+            stack.push(x);
+        }
+    o.set("stack", stack);
+    json_obj@ bps = json::array();
+    for (uint i = 0; i < g_emud_bps.length(); i++) bps.push(hex_addr(g_emud_bps[i]));
+    o.set("breakpoints", bps);
+    json_obj@ dirty = json::array();
+    for (uint i = 0; i < g_emud_dirty.length(); i++) dirty.push(hex_addr(g_emud_dirty[i]));
+    o.set("dirty_pages", dirty);
+    return o;
+}
+
+json_obj@ emud_stop(const string &in reason)
+{
+    json_obj@ s = json_obj();
+    s.set("reason", reason);
+    return s;
+}
+
+// Applies "regs" and "write" from r; "" on success, else the problem.
+string emud_apply(json_obj@ r)
+{
+    if (has_key(r, "regs"))
+    {
+        if (r.type("regs") != json_type::object) return "regs must be an object";
+        json_obj@ regs = r.get_obj("regs");
+        array<string>@ keys = regs.keys();
+        for (uint i = 0; i < keys.length(); i++)
+        {
+            x86_reg reg;
+            uint64 v;
+            if (!emu_reg(keys[i], reg)) return "unknown register: " + keys[i];
+            if (!get_addr(regs, keys[i], v)) return "register values must be hex strings: " + keys[i];
+            if (!uc::reg_write64(g_emud, reg, v)) return "cannot write " + keys[i];
+        }
+    }
+    if (has_key(r, "write"))
+    {
+        if (r.type("write") != json_type::array) return "write must be an array";
+        json_obj@ arr = r.get_obj("write");
+        if (arr.length() > EMU_MAX_BLOBS) return "at most 64 write blobs";
+        for (uint i = 0; i < arr.length(); i++)
+        {
+            json_obj@ blob = arr.get_obj_at(i);
+            if (blob is null) return "write entries must be objects";
+            uint64 a;
+            string hex;
+            array<uint8> bytes;
+            if (!get_addr(blob, "address", a) || !opt_str(blob, "data", "", hex) || !parse_hex_bytes(hex, bytes) || bytes.length() == 0)
+                return "each write needs an address and non-empty hex data";
+            if (bytes.length() > EMU_MAX_BLOB_BYTES) return "a write blob is limited to 64 KiB";
+            if (!emud_ensure(a, bytes.length()) || !uc::mem_write(g_emud, a, bytes)) return "cannot write at " + hex_addr(a);
+            for (uint64 p = a & ~uint64(0xFFF); p < a + bytes.length(); p += 0x1000)
+                if (u64_index(g_emud_dirty, p) < 0) g_emud_dirty.insertLast(p);
+        }
+        uc::flush_code(g_emud);   // patched code must not run from a stale translation
+    }
+    return "";
+}
+
+void h_emu_start(json_obj@ r, int64 id)
+{
+    uint64 start;
+    if (!get_addr(r, "start", start)) { bad_args(id, "emu_start requires 'start'"); return; }
+    string codehex;
+    if (!opt_str(r, "code", "", codehex)) { bad_args(id, "code must be a hex string"); return; }
+    array<uint8> code;
+    bool blank = codehex != "";
+    if (blank && (!parse_hex_bytes(codehex, code) || code.length() == 0 || code.length() > EMU_CODE_MAX)) { bad_args(id, "code must be hex, up to 1 MiB"); return; }
+    if (!blank && !require_attached(id)) return;
+    emud_close();
+    g_emud_mx.lock();
+    g_emud_stale = false;
+    g_emud_mx.unlock();
+    g_emud = blank ? uc::create() : uc::create_process();
+    if (g_emud == 0) { send_error(id, E_FAILED, "emulator creation failed"); return; }
+    g_emud_blank = blank;
+    bool ok = true;
+    if (blank)
+    {
+        uint64 page = start & ~uint64(0xFFF);
+        ok = uc::mem_map(g_emud, page, align_up(start + code.length(), 0x1000) - page, uint(uc::prot::all)) && uc::mem_write(g_emud, start, code);
+    }
+    g_emud_stack = pick_stack_base(blank);
+    // the return address is a mapped, never-executed page: reaching it ends the function cleanly
+    ok = ok && uc::setup_stack(g_emud, g_emud_stack, EMU_STACK_SIZE, EMUD_RET);
+    if (ok && uc::mem_query(g_emud, EMUD_RET) < 0) ok = uc::mem_map(g_emud, EMUD_RET, 0x1000, uint(uc::prot::read | uc::prot::exec));
+    ok = ok && uc::reg_write64(g_emud, x86_reg::rip, start) && uc::hook_code(g_emud, @emud_hook);
+    if (!ok) { emud_close(); send_error(id, E_FAILED, "emulator setup failed", "mapping code/stack failed"); return; }
+    string problem = emud_apply(r);
+    if (problem == "") problem = emux_set_xmm(g_emud, r);
+    @g_emud_x = EmuExtras();
+    g_emud_x.blank = blank;
+    if (problem == "") problem = emux_parse(r, g_emud_x, 2000);
+    if (problem != "") { emud_close(); bad_args(id, problem); return; }
+    if (g_emud_x.zero_unmapped) uc::hook_memory_unmapped(g_emud, @emud_unmapped_hook);
+    emux_prepare(g_emud, g_emud_x);
+    if (has_key(r, "breakpoints") && r.type("breakpoints") == json_type::array)
+    {
+        json_obj@ arr = r.get_obj("breakpoints");
+        for (uint i = 0; i < arr.length(); i++)
+        {
+            uint64 a;
+            if (parse_hex_u64(arr.get_string_at(i), a) && u64_index(g_emud_bps, a) < 0) g_emud_bps.insertLast(a);
+        }
+    }
+    g_emud_count = 0;
+    g_emud_last = start;
+    send_json(emud_state("emu_start", id, emud_stop("start")));
+}
+
+// emu_step (count, default 1) and emu_run (until, max_insns): run from rip, stopping at breakpoints.
+void h_emu_go(json_obj@ r, int64 id, bool step)
+{
+    if (!emud_ready(id)) return;
+    int64 count = 1;
+    int64 timeout = 2000000;
+    uint64 until = 0;
+    if (step) { if (!opt_int(r, "count", 1, count)) { bad_args(id, "count must be a number"); return; } }
+    else
+    {
+        if (!opt_int(r, "max_insns", 1000000, count) || !opt_addr(r, "until", 0, until)) { bad_args(id, "max_insns must be a number, until an address"); return; }
+    }
+    if (!opt_int(r, "timeout_us", 2000000, timeout)) { bad_args(id, "timeout_us must be a number"); return; }
+    if (count < 1) count = 1;
+    if (count > EMU_MAX_INSNS * 10) count = EMU_MAX_INSNS * 10;
+    if (timeout < 1000) timeout = 1000;
+    if (timeout > EMU_MAX_TIMEOUT_US) timeout = EMU_MAX_TIMEOUT_US;
+    uint64 rip = 0;
+    uc::reg_read64(g_emud, x86_reg::rip, rip);
+    if (rip == EMUD_RET) { send_json(emud_state(step ? "emu_step" : "emu_run", id, emud_stop("returned"))); return; }
+    g_emud_skip = rip;
+    g_emud_skip_on = true;
+    g_emud_hit_on = false;
+    g_emud_wp_hit_on = false;
+    emux_reset_run(g_emud_x);
+    emux_prepare_regs(g_emud, g_emud_x);
+    uint64 before = g_emud_count;
+    int res = uc::start(g_emud, rip, until == 0 ? EMUD_RET : until, uint64(timeout), uint64(count));
+    uint64 now = 0;
+    uc::reg_read64(g_emud, x86_reg::rip, now);
+    uint64 ran = g_emud_count - before;
+    json_obj@ stop;
+    if (g_emud_hit_on) { @stop = emud_stop("breakpoint"); stop.set("address", hex_addr(g_emud_hit)); uc::reg_write64(g_emud, x86_reg::rip, g_emud_hit); }
+    else if (g_emud_wp_hit_on) { @stop = emud_stop("watchpoint"); stop.set("hit", g_emud_wp_hit); uc::reg_write64(g_emud, x86_reg::rip, g_emud_last); }
+    else if (g_cancel.load()) @stop = emud_stop("cancelled");
+    else if (now == EMUD_RET) @stop = emud_stop("returned");
+    else if (res != uc::error::ok)
+    {
+        @stop = emud_stop("fault");
+        stop.set("error_name", uc_error_name(res));
+        stop.set("fault_address", hex_addr(uc::fault_address(g_emud)));
+        stop.set("fault_rip", hex_addr(g_emud_last));
+        uc::reg_write64(g_emud, x86_reg::rip, g_emud_last);
+    }
+    else if (until != 0 && now == until) { @stop = emud_stop("until"); stop.set("address", hex_addr(until)); }
+    else if (int64(ran) >= count) @stop = emud_stop(count == 1 ? "step" : "count");
+    else @stop = emud_stop("timeout");
+    stop.set("ran", ran);
+    json_obj@ o = emud_state(step ? "emu_step" : "emu_run", id, stop);
+    emux_report(o, g_emud_x, emux_xmm_json(g_emud));
+    send_json(o);
+}
+
+void h_emu_break(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    bool clear = false;
+    bool on = true;
+    if (!opt_bool(r, "clear", false, clear) || !opt_bool(r, "enabled", true, on)) { bad_args(id, "clear/enabled must be bools"); return; }
+    if (clear) g_emud_bps.resize(0);
+    if (has_key(r, "address"))
+    {
+        uint64 a;
+        if (!get_addr(r, "address", a)) { bad_args(id, "address must be a 0x address"); return; }
+        string cond;
+        if (!opt_str(r, "condition", "", cond)) { bad_args(id, "condition must be a string like rax==0x10"); return; }
+        while (g_emud_conds.length() < g_emud_bps.length()) g_emud_conds.insertLast("");
+        int at = u64_index(g_emud_bps, a);
+        if (at >= 0) { g_emud_bps.removeAt(uint(at)); g_emud_conds.removeAt(uint(at)); }
+        if (on) { g_emud_bps.insertLast(a); g_emud_conds.insertLast(cond); }
+    }
+    json_obj@ o = emud_state("emu_break", id, emud_stop("edit"));
+    json_obj@ conds = json_obj();
+    for (uint i = 0; i < g_emud_bps.length() && i < g_emud_conds.length(); i++)
+        if (g_emud_conds[i] != "") conds.set(hex_addr(g_emud_bps[i]), g_emud_conds[i]);
+    o.set("conditions", conds);
+    send_json(o);
+}
+
+void h_emu_set(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    string problem = emud_apply(r);
+    if (problem != "") { bad_args(id, problem); return; }
+    send_json(emud_state("emu_set", id, emud_stop("edit")));
+}
+
+void h_emu_read(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    uint64 a;
+    uint64 n = 256;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "size", 256, n)) { bad_args(id, "emu_read requires 'address' (and a numeric size)"); return; }
+    if (n == 0 || n > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "size must be 1..65536"); return; }
+    array<uint8> b;
+    if (!uc::mem_read(g_emud, a, uint(n), b))
+    {
+        if (!emud_ensure(a, n) || !uc::mem_read(g_emud, a, uint(n), b)) { send_error(id, E_FAILED, "operation failed", hex_addr(a) + " is not mapped in the emulator or the process"); return; }
+    }
+    json_obj@ o = ok_reply("emu_read", id);
+    o.set("address", hex_addr(a));
+    o.set("size", n);
+    o.set("data", hex_of(b, 0, uint(n)));
+    send_json(o);
+}
+
+void h_emu_state(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    send_json(emud_state("emu_state", id, emud_stop("state")));
+}
+
+void h_emu_close(json_obj@ r, int64 id)
+{
+    bool had = g_emud != 0;
+    emud_close();
+    json_obj@ o = ok_reply("emu_close", id);
+    o.set("closed", had);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Batch / bulk verbs: one round trip for work the app otherwise does with many small requests.
+// ---------------------------------------------------------------------------------------------
+
+const uint SIGB_MAX_PATTERNS = 512;
+const uint SIGB_MAX_HITS = 64;
+const uint64 DISFN_MAX_BYTES = 0x4000;
+const uint RF_MAX_FIELDS = 1024;
+
+uint64 module_or_main(const string &in mod)
+{
+    if (mod == "") return g_base;
+    return process::get_module_base(mod);
+}
+
+// sig_scan_batch: every IDA pattern scanned in Echo (process::find_signatures) in one request.
+void h_sig_scan_batch(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    string mod;
+    int64 max_hits = 16;
+    if (!opt_str(r, "module", "", mod) || !opt_int(r, "max_hits", 16, max_hits)) { bad_args(id, "module must be a string, max_hits a number"); return; }
+    if (!has_key(r, "patterns") || r.type("patterns") != json_type::array) { bad_args(id, "sig_scan_batch requires 'patterns' (array of IDA patterns)"); return; }
+    json_obj@ pats = r.get_obj("patterns");
+    if (pats.length() > SIGB_MAX_PATTERNS) { send_error(id, E_LIMIT, "limit exceeded", "at most 512 patterns"); return; }
+    if (max_hits < 1) max_hits = 1;
+    if (max_hits > SIGB_MAX_HITS) max_hits = SIGB_MAX_HITS;
+    uint64 base = module_or_main(mod);
+    if (base == 0) { send_error(id, E_FAILED, "module not found", mod); return; }
+    json_obj@ out_list = json::array();
+    for (uint i = 0; i < pats.length(); i++)
+    {
+        string p = pats.get_string_at(i);
+        json_obj@ e = json_obj();
+        e.set("pattern", p);
+        json_obj@ hits = json::array();
+        uint total = 0;
+        array<uint64>@ found = p == "" ? null : process::find_signatures(base, p);
+        if (found !is null)
+        {
+            total = found.length();
+            for (uint k = 0; k < found.length() && k < uint(max_hits); k++) hits.push(hex_addr(found[k]));
+        }
+        e.set("count", total);
+        e.set("results", hits);
+        out_list.push(e);
+    }
+    json_obj@ o = ok_reply("sig_scan_batch", id);
+    o.set("module_base", hex_addr(base));
+    o.set("results", out_list);
+    send_json(o);
+}
+
+// disasm_function: decode from `address` to the first ret (zydis::disasm_func), one read.
+void h_disasm_function(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    uint64 n = 0x1000;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "max_bytes", 0x1000, n)) { bad_args(id, "disasm_function requires 'address' (max_bytes optional)"); return; }
+    if (n == 0 || n > DISFN_MAX_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "max_bytes must be 1..16384"); return; }
+    array<uint8>@ b = process::read_bytes(a, uint(n));
+    if (b is null || b.length() == 0) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    array<disasm_insn@> insns;
+    bool complete = zydis::disasm_func(b, a, insns);
+    json_obj@ arr = json::array();
+    uint off = 0;
+    for (uint i = 0; i < insns.length(); i++)
+    {
+        json_obj@ x = json_obj();
+        x.set("address", hex_addr(a + off));
+        x.set("length", insns[i].length);
+        x.set("bytes", hex_of(b, off, insns[i].length));
+        x.set("text", insns[i].text);
+        arr.push(x);
+        off += insns[i].length;
+    }
+    json_obj@ o = ok_reply("disasm_function", id);
+    o.set("count", insns.length());
+    o.set("size", off);
+    o.set("complete", complete);
+    o.set("results", arr);
+    send_json(o);
+}
+
+// read_fields: many typed fields of one struct from a single process::read_buffer snapshot.
+void h_read_fields(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    uint64 size = 0;
+    if (!get_addr(r, "address", a) || !opt_addr(r, "size", 0, size)) { bad_args(id, "read_fields requires 'address'"); return; }
+    if (!has_key(r, "fields") || r.type("fields") != json_type::array) { bad_args(id, "read_fields requires 'fields' ([{offset, type}])"); return; }
+    json_obj@ fs = r.get_obj("fields");
+    if (fs.length() > RF_MAX_FIELDS) { send_error(id, E_LIMIT, "limit exceeded", "at most 1024 fields"); return; }
+    // the snapshot covers every field (u64 width for the last one when size is not given)
+    for (uint i = 0; i < fs.length(); i++)
+    {
+        json_obj@ f = fs.get_obj_at(i);
+        uint64 off = 0;
+        if (f is null || !get_addr(f, "offset", off)) { bad_args(id, "each field needs a numeric offset"); return; }
+        if (off + 8 > size) size = off + 8;
+    }
+    if (size == 0 || size > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "fields must lie within 64 KiB"); return; }
+    memory_buffer@ mb = process::read_buffer(a, size);
+    if (mb is null) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    json_obj@ out_list = json::array();
+    for (uint i = 0; i < fs.length(); i++)
+    {
+        json_obj@ f = fs.get_obj_at(i);
+        uint64 off = 0;
+        get_addr(f, "offset", off);
+        string t = "u64";
+        opt_str(f, "type", "u64", t);
+        json_obj@ e = json_obj();
+        e.set("offset", off);
+        e.set("type", t);
+        if (t == "u8") e.set("value", util::format_string("{}", mb.read_uint8(off)));
+        else if (t == "u16") e.set("value", util::format_string("{}", mb.read_uint16(off)));
+        else if (t == "u32") e.set("value", util::format_string("{}", mb.read_uint32(off)));
+        else if (t == "i8") e.set("value", util::format_string("{}", mb.read_int8(off)));
+        else if (t == "i16") e.set("value", util::format_string("{}", mb.read_int16(off)));
+        else if (t == "i32") e.set("value", util::format_string("{}", mb.read_int32(off)));
+        else if (t == "i64") e.set("value", util::format_string("{}", mb.read_int64(off)));
+        else if (t == "f32") e.set("value", util::format_string("{}", mb.read_float(off)));
+        else if (t == "f64") e.set("value", util::format_string("{}", mb.read_double(off)));
+        else if (t == "ptr" || t == "u64") e.set("value", t == "ptr" ? hex_addr(mb.read_uint64(off)) : util::format_string("{}", mb.read_uint64(off)));
+        else { bad_args(id, "unknown field type: " + t + " (u8..u64, i8..i64, f32, f64, ptr)"); return; }
+        out_list.push(e);
+    }
+    json_obj@ o = ok_reply("read_fields", id);
+    o.set("address", hex_addr(a));
+    o.set("fields", out_list);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Emulation extras, shared by emulate jobs (job thread) and the emu_* session (ws thread); each
+// owns its own EmuExtras, so the two never share state:
+//   * register-change traces (trace_regs): per instruction, the GPRs that changed
+//   * API stand-ins (stubs): common Win32 / CRT calls are simulated and return to the caller
+//   * unpacking layers (layers): writes to pages that later execute (write-then-execute)
+//   * unmapped policy (on_unmapped: "zero"): unmapped reads map a zero page and are logged
+//   * xmm0..xmm15 in requests and replies
+// ---------------------------------------------------------------------------------------------
+
+const uint EMUX_MAX_API_LOG = 2000;
+const uint EMUX_MAX_LAYERS = 256;
+const uint EMUX_MAX_FAULTS = 256;
+const uint64 EMUX_HEAP = 0x5f0000000000;
+
+array<string> g_gpr_names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+
+class EmuExtras
+{
+    bool regs_on;
+    uint regs_limit;
+    array<uint64> prev;
+    json_obj@ reg_trace;
+    bool stubs;
+    hash_map@ stub_at;          // address -> API name
+    json_obj@ api_calls;
+    uint api_count;
+    uint64 heap_next;
+    bool layers;
+    hash_set_uint64@ written;   // pages written during the run
+    hash_set_uint64@ entered;   // written pages that later executed (one layer each)
+    json_obj@ layer_out;
+    bool zero_unmapped;
+    json_obj@ faults;
+    uint fault_count;
+    bool blank;
+    EmuExtras()
+    {
+        regs_on = false; regs_limit = 0; stubs = false; api_count = 0; heap_next = EMUX_HEAP;
+        layers = false; zero_unmapped = false; fault_count = 0; blank = false;
+        @reg_trace = json::array(); @api_calls = json::array(); @layer_out = json::array(); @faults = json::array();
+        @stub_at = create_hash_map(); @written = create_hash_set_uint64(); @entered = create_hash_set_uint64();
+        prev.resize(16);
+    }
+}
+
+EmuExtras@ g_emu_x = EmuExtras();    // emulate job
+EmuExtras@ g_emud_x = EmuExtras();   // emu_* session
+
+// Reads the extras options; "" on success, else the problem.
+string emux_parse(json_obj@ r, EmuExtras@ x, int64 trace_limit)
+{
+    bool v;
+    if (!opt_bool(r, "trace_regs", false, v)) return "trace_regs must be a bool";
+    x.regs_on = v;
+    x.regs_limit = uint(trace_limit > 0 ? trace_limit : 2000);
+    if (!opt_bool(r, "stubs", false, v)) return "stubs must be a bool";
+    x.stubs = v;
+    if (!opt_bool(r, "layers", false, v)) return "layers must be a bool";
+    x.layers = v;
+    string un;
+    if (!opt_str(r, "on_unmapped", "stop", un) || (un != "stop" && un != "zero")) return "on_unmapped must be 'stop' or 'zero'";
+    x.zero_unmapped = un == "zero";
+    return "";
+}
+
+// The register-change baseline is the state at the start of each run.
+void emux_prepare_regs(uint64 h, EmuExtras@ x)
+{
+    x.prev.resize(16);
+    for (uint i = 0; i < 16; i++) x.prev[i] = emux_reg(h, g_gpr_names[i]);
+}
+
+void emux_reset_run(EmuExtras@ x)
+{
+    @x.reg_trace = json::array();
+    @x.api_calls = json::array();
+    x.api_count = 0;
+    @x.layer_out = json::array();
+    @x.faults = json::array();
+    x.fault_count = 0;
+}
+
+void emux_stub_module(EmuExtras@ x, const string &in mod, const array<string> &in names)
+{
+    uint64 base = process::get_module_base(mod);
+    if (base == 0) return;
+    for (uint i = 0; i < names.length(); i++)
+    {
+        uint64 a = process::get_module_export(base, names[i]);
+        if (a != 0) x.stub_at.set_string(a, names[i]);
+    }
+}
+
+// Resolves the stand-in table from the attached process (blank emulators have no imports to hit).
+void emux_prepare(uint64 h, EmuExtras@ x)
+{
+    x.prev.resize(16);
+    for (uint i = 0; i < 16; i++)
+    {
+        x86_reg reg;
+        emu_reg(g_gpr_names[i], reg);
+        uint64 v = 0;
+        uc::reg_read64(h, reg, v);
+        x.prev[i] = v;
+    }
+    if (!x.stubs || x.blank) return;
+    @x.stub_at = create_hash_map();
+    array<string> k32 = { "VirtualAlloc", "VirtualFree", "VirtualProtect", "GetProcAddress", "GetModuleHandleA", "GetModuleHandleW",
+                          "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "Sleep", "GetTickCount", "GetTickCount64",
+                          "QueryPerformanceCounter", "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "GetCurrentProcess",
+                          "GetCurrentProcessId", "GetCurrentThreadId", "GetProcessHeap", "HeapAlloc", "HeapFree", "OutputDebugStringA" };
+    emux_stub_module(x, "kernel32.dll", k32);
+    emux_stub_module(x, "kernelbase.dll", k32);
+    array<string> nt = { "RtlAllocateHeap", "RtlFreeHeap", "memcpy", "memmove", "memset", "strlen", "wcslen" };
+    emux_stub_module(x, "ntdll.dll", nt);
+    array<string> crt = { "memcpy", "memmove", "memset", "strlen", "wcslen", "malloc", "calloc", "free" };
+    emux_stub_module(x, "msvcrt.dll", crt);
+    emux_stub_module(x, "ucrtbase.dll", crt);
+    emux_stub_module(x, "vcruntime140.dll", crt);
+}
+
+bool emux_read(uint64 h, EmuExtras@ x, uint64 a, uint n, array<uint8> &out b)
+{
+    if (n == 0) { b.resize(0); return true; }
+    if (uc::mem_read(h, a, n, b)) return true;
+    if (x.blank) return false;
+    array<uint8>@ p = process::read_bytes(a, n);
+    if (p is null || p.length() < n) return false;
+    b = p;
+    return true;
+}
+
+// Writes into the emulator, faulting the pages in from the process first (or zeroes).
+bool emux_write(uint64 h, EmuExtras@ x, uint64 a, const array<uint8> &in b)
+{
+    if (b.length() == 0) return true;
+    for (uint64 p = a & ~uint64(0xFFF); p < a + b.length(); p += 0x1000)
+    {
+        if (uc::mem_query(h, p) >= 0) { array<uint8> t; if (uc::mem_read(h, p, 1, t)) continue; }
+        array<uint8>@ src = x.blank ? null : process::read_bytes(p, 0x1000);
+        if (!uc::mem_map(h, p, 0x1000, uint(uc::prot::all))) return false;
+        if (src !is null && src.length() == 0x1000) uc::mem_write(h, p, src);
+    }
+    return uc::mem_write(h, a, b);
+}
+
+string lower_ascii(const string &in s)
+{
+    string o = s;
+    for (uint i = 0; i < o.length(); i++)
+        if (o[i] >= 65 && o[i] <= 90) o[i] = o[i] + 32;
+    return o;
+}
+
+int str_index(const array<string> &in a, const string &in v)
+{
+    for (uint i = 0; i < a.length(); i++)
+        if (a[i] == v) return int(i);
+    return -1;
+}
+
+array<string> split_str(const string &in s, const string &in sep)
+{
+    array<string> out_list;
+    uint start = 0;
+    for (;;)
+    {
+        int at = s.findFirst(sep, start);
+        if (at < 0) { out_list.insertLast(s.substr(start)); break; }
+        out_list.insertLast(s.substr(start, uint(at) - start));
+        start = uint(at) + sep.length();
+    }
+    return out_list;
+}
+
+string chr8(uint8 c)
+{
+    string s = " ";
+    s[0] = c;
+    return s;
+}
+
+string emux_cstr(uint64 h, EmuExtras@ x, uint64 a, bool wide)
+{
+    if (a == 0) return "";
+    array<uint8> b;
+    if (!emux_read(h, x, a, 512, b)) return "";
+    string s;
+    if (wide)
+    {
+        for (uint i = 0; i + 1 < b.length() && (b[i] != 0 || b[i + 1] != 0); i += 2) s += chr8(b[i]);
+    }
+    else for (uint i = 0; i < b.length() && b[i] != 0; i++) s += chr8(b[i]);
+    return s;
+}
+
+uint64 emux_alloc(uint64 h, EmuExtras@ x, uint64 n)
+{
+    uint64 size = align_up(n == 0 ? 1 : n, 0x1000);
+    uint64 a = x.heap_next;
+    if (!uc::mem_map(h, a, size, uint(uc::prot::all))) return 0;
+    x.heap_next += size + 0x1000;   // a guard gap between blocks
+    return a;
+}
+
+uint64 emux_reg(uint64 h, const string &in n)
+{
+    x86_reg reg;
+    uint64 v = 0;
+    if (emu_reg(n, reg)) uc::reg_read64(h, reg, v);
+    return v;
+}
+
+// Simulates the API at `address`, then returns to the caller (Win64 ABI: rcx, rdx, r8, r9 -> rax).
+void emux_stub(uint64 h, EmuExtras@ x, uint64 address, const string &in name)
+{
+    uint64 a1 = emux_reg(h, "rcx"), a2 = emux_reg(h, "rdx"), a3 = emux_reg(h, "r8"), a4 = emux_reg(h, "r9");
+    uint64 ret = 0;
+    string note = "";
+    if (name == "VirtualAlloc" || name == "malloc" || name == "HeapAlloc" || name == "RtlAllocateHeap" || name == "calloc")
+    {
+        uint64 n = name == "VirtualAlloc" ? a2 : (name == "malloc" ? a1 : (name == "calloc" ? a1 * a2 : a3));
+        ret = (name == "VirtualAlloc" && a1 != 0) ? a1 : emux_alloc(h, x, n);
+        if (name == "VirtualAlloc" && a1 != 0 && uc::mem_query(h, a1) < 0) uc::mem_map(h, a1 & ~uint64(0xFFF), align_up(a2, 0x1000), uint(uc::prot::all));
+        note = hex_addr(n) + " bytes";
+    }
+    else if (name == "VirtualFree" || name == "HeapFree" || name == "RtlFreeHeap" || name == "free") ret = 1;
+    else if (name == "VirtualProtect")
+    {
+        if (a4 != 0) { array<uint8> old = { 0x40, 0, 0, 0 }; emux_write(h, x, a4, old); }
+        ret = 1;
+    }
+    else if (name == "memcpy" || name == "memmove")
+    {
+        array<uint8> b;
+        if (a3 <= 0x1000000 && emux_read(h, x, a2, uint(a3), b)) emux_write(h, x, a1, b);
+        ret = a1;
+    }
+    else if (name == "memset")
+    {
+        array<uint8> b;
+        if (a3 <= 0x1000000) { b.resize(uint(a3)); for (uint i = 0; i < b.length(); i++) b[i] = uint8(a2 & 0xFF); emux_write(h, x, a1, b); }
+        ret = a1;
+    }
+    else if (name == "strlen") ret = emux_cstr(h, x, a1, false).length();
+    else if (name == "wcslen") ret = emux_cstr(h, x, a1, true).length();
+    else if (name == "GetProcAddress")
+    {
+        string fn = emux_cstr(h, x, a2, false);
+        ret = a2 < 0x10000 ? 0 : process::get_module_export(a1, fn);
+        note = fn;
+    }
+    else if (name == "GetModuleHandleA" || name == "GetModuleHandleW" || name.findFirst("LoadLibrary") == 0)
+    {
+        string mod = emux_cstr(h, x, a1, name.substr(name.length() - 1) == "W");
+        ret = mod == "" ? g_base : process::get_module_base(mod);
+        note = mod;
+    }
+    else if (name == "GetTickCount" || name == "GetTickCount64") ret = util::tickcount();
+    else if (name == "QueryPerformanceCounter")
+    {
+        uint64 t = util::tickcount() * 10000;
+        array<uint8> b;
+        for (uint i = 0; i < 8; i++) b.insertLast(uint8((t >> (8 * i)) & 0xFF));
+        if (a1 != 0) emux_write(h, x, a1, b);
+        ret = 1;
+    }
+    else if (name == "CheckRemoteDebuggerPresent")
+    {
+        array<uint8> zero = { 0, 0, 0, 0 };
+        if (a2 != 0) emux_write(h, x, a2, zero);
+        ret = 1;
+    }
+    else if (name == "GetCurrentProcess") ret = uint64(0xFFFFFFFFFFFFFFFF);
+    else if (name == "GetCurrentProcessId") ret = g_pid;
+    else if (name == "GetProcessHeap") ret = 0x10000;
+    else ret = 0;   // IsDebuggerPresent, Sleep, OutputDebugStringA, GetCurrentThreadId, ...
+    // return to the caller: pop the return address
+    uint64 rsp = emux_reg(h, "rsp");
+    array<uint8> rb;
+    uint64 back = 0;
+    if (emux_read(h, x, rsp, 8, rb)) for (uint i = 0; i < 8; i++) back |= uint64(rb[i]) << (8 * i);
+    uc::reg_write64(h, x86_reg::rax, ret);
+    uc::reg_write64(h, x86_reg::rsp, rsp + 8);
+    uc::reg_write64(h, x86_reg::rip, back);
+    x.api_count++;
+    if (x.api_calls.length() < EMUX_MAX_API_LOG)
+    {
+        json_obj@ c = json_obj();
+        c.set("api", name);
+        c.set("address", hex_addr(address));
+        c.set("return_to", hex_addr(back));
+        c.set("result", hex_addr(ret));
+        c.set("args", hex_addr(a1) + ", " + hex_addr(a2) + ", " + hex_addr(a3) + ", " + hex_addr(a4));
+        if (note != "") c.set("note", note);
+        x.api_calls.push(c);
+    }
+}
+
+// Memory operands of the instruction at `address` (effective addresses, sizes, write flags).
+void emux_mem_ops(uint64 h, uint64 address, uint32 size, array<uint64> &out eas, array<uint> &out sizes, array<bool> &out writes)
+{
+    eas.resize(0); sizes.resize(0); writes.resize(0);
+    array<uint8> code;
+    if (!uc::mem_read(h, address, size, code)) return;
+    array<disasm_insn@> insns;
+    if (!zydis::disasm(code, address, insns) || insns.length() == 0) return;
+    disasm_insn@ insn = insns[0];
+    if (insn.text.findFirst("lea ") == 0 || insn.text.findFirst("nop") == 0) return;
+    for (uint8 i = 0; i < insn.operand_count_visible; i++)
+    {
+        disasm_operand op = insn.get_op(i);
+        if (op.type != op_type::mem) continue;
+        bool r = (op.action & (int(op_action::read) | int(op_action::condread))) != 0;
+        bool w = (op.action & (int(op_action::write) | int(op_action::condwrite))) != 0;
+        if (!r && !w) continue;
+        uint64 base = 0, index = 0;
+        uint64 next_rip = address + size;
+        if (!emu_addr_reg(h, op.mem_base, next_rip, base) || !emu_addr_reg(h, op.mem_index, next_rip, index)) continue;
+        uint64 ea = base + index * op.mem_scale + uint64(op.mem_disp);
+        string seg = op.mem_segment == 0 ? "" : zydis::reg_name(op.mem_segment);
+        uint64 sb = 0;
+        if (seg == "gs") uc::reg_read64(h, x86_reg::gs_base, sb);
+        else if (seg == "fs") uc::reg_read64(h, x86_reg::fs_base, sb);
+        eas.insertLast(ea + sb);
+        sizes.insertLast(emu_ptr_size(insn.text));
+        writes.insertLast(w);
+    }
+}
+
+// Per-instruction work for the extras.
+// Returns false when a stand-in ran (execution continues at the caller).
+bool emux_code(uint64 h, EmuExtras@ x, uint64 address, uint32 size)
+{
+    if (x.stubs && x.stub_at.contains(address))
+    {
+        string name;
+        x.stub_at.get_string(address, name);
+        emux_stub(h, x, address, name);
+        return false;
+    }
+    if (x.layers)
+    {
+        uint64 page = address & ~uint64(0xFFF);
+        if (x.written.contains(page) && !x.entered.contains(page))
+        {
+            x.entered.insert(page);
+            if (x.layer_out.length() < EMUX_MAX_LAYERS)
+            {
+                json_obj@ l = json_obj();
+                l.set("entry", hex_addr(address));
+                l.set("page", hex_addr(page));
+                x.layer_out.push(l);
+            }
+        }
+        array<uint64> eas;
+        array<uint> sizes;
+        array<bool> writes;
+        emux_mem_ops(h, address, size, eas, sizes, writes);
+        for (uint i = 0; i < eas.length(); i++)
+            if (writes[i]) { x.written.insert(eas[i] & ~uint64(0xFFF)); x.written.insert((eas[i] + sizes[i] - 1) & ~uint64(0xFFF)); }
+    }
+    if (x.regs_on && x.reg_trace.length() < x.regs_limit)
+    {
+        json_obj@ ch = json_obj();
+        uint n = 0;
+        for (uint i = 0; i < 16; i++)
+        {
+            x86_reg reg;
+            emu_reg(g_gpr_names[i], reg);
+            uint64 v = 0;
+            uc::reg_read64(h, reg, v);
+            if (v != x.prev[i]) { ch.set(g_gpr_names[i], hex_addr(v)); x.prev[i] = v; n++; }
+        }
+        json_obj@ e = json_obj();
+        e.set("rip", hex_addr(address));
+        if (n > 0) e.set("changes", ch);
+        x.reg_trace.push(e);
+    }
+    return true;
+}
+
+// on_unmapped "zero": map a zero page at the fault and continue; every fault is logged.
+bool emux_unmapped(EmuExtras@ x, uint64 h, uint64 address)
+{
+    x.fault_count++;
+    if (x.faults.length() < EMUX_MAX_FAULTS)
+    {
+        json_obj@ f = json_obj();
+        f.set("address", hex_addr(address));
+        f.set("rip", hex_addr(emux_reg(h, "rip")));
+        x.faults.push(f);
+    }
+    if (!x.zero_unmapped) return false;
+    return uc::mem_map(h, address & ~uint64(0xFFF), 0x1000, uint(uc::prot::all));
+}
+
+bool emu_unmapped_hook(uint64 h, uc::mem_type type, uint64 address, uint32 size, uint64 value) { return emux_unmapped(g_emu_x, h, address); }
+bool emud_unmapped_hook(uint64 h, uc::mem_type type, uint64 address, uint32 size, uint64 value) { return emux_unmapped(g_emud_x, h, address); }
+
+// "xmm": { "xmm0": "<32 hex chars>" } -> emulator registers; "" or the problem.
+string emux_set_xmm(uint64 h, json_obj@ r)
+{
+    if (!has_key(r, "xmm")) return "";
+    if (r.type("xmm") != json_type::object) return "xmm must be an object";
+    json_obj@ xm = r.get_obj("xmm");
+    array<string>@ keys = xm.keys();
+    for (uint i = 0; i < keys.length(); i++)
+    {
+        x86_reg reg;
+        if (!xmm_reg(keys[i], reg)) return "unknown xmm register: " + keys[i];
+        array<uint8> b;
+        string hx;
+        if (!opt_str(xm, keys[i], "", hx) || !parse_hex_bytes(hx, b) || b.length() != 16) return keys[i] + " must be 16 bytes of hex";
+        if (!uc::reg_write128(h, reg, b)) return "cannot write " + keys[i];
+    }
+    return "";
+}
+
+bool xmm_reg(const string &in n, x86_reg &out r)
+{
+    array<x86_reg> regs = { x86_reg::xmm0, x86_reg::xmm1, x86_reg::xmm2, x86_reg::xmm3, x86_reg::xmm4, x86_reg::xmm5, x86_reg::xmm6, x86_reg::xmm7,
+                            x86_reg::xmm8, x86_reg::xmm9, x86_reg::xmm10, x86_reg::xmm11, x86_reg::xmm12, x86_reg::xmm13, x86_reg::xmm14, x86_reg::xmm15 };
+    for (uint i = 0; i < 16; i++)
+        if (n == "xmm" + i) { r = regs[i]; return true; }
+    return false;
+}
+
+json_obj@ emux_xmm_json(uint64 h)
+{
+    json_obj@ o = json_obj();
+    for (uint i = 0; i < 16; i++)
+    {
+        x86_reg reg;
+        xmm_reg("xmm" + i, reg);
+        array<uint8> b;
+        if (uc::reg_read128(h, reg, b) && b.length() == 16) o.set("xmm" + i, hex_of(b, 0, 16));
+    }
+    return o;
+}
+
+// Adds the extras' results to a reply (xmm read while the handle is still open).
+void emux_report(json_obj@ o, EmuExtras@ x, json_obj@ xmm)
+{
+    if (x.regs_on) o.set("reg_trace", x.reg_trace);
+    if (x.stubs) { o.set("api_calls", x.api_calls); o.set("api_call_count", x.api_count); }
+    if (x.layers) o.set("layers", x.layer_out);
+    if (x.fault_count > 0) { o.set("faults", x.faults); o.set("fault_count", x.fault_count); }
+    if (xmm !is null) o.set("xmm", xmm);
+}
+
+// ---------------------------------------------------------------------------------------------
+// emu_* session additions: conditional breakpoints, memory watchpoints, snapshots
+// ---------------------------------------------------------------------------------------------
+
+array<string> g_emud_conds;        // parallel to g_emud_bps: "" or "rax==0x10"
+array<uint64> g_emud_wp_addr;
+array<uint64> g_emud_wp_size;
+array<uint> g_emud_wp_mode;        // 1 read, 2 write, 3 both
+bool g_emud_wp_hit_on = false;
+json_obj@ g_emud_wp_hit;
+
+class EmuSnap
+{
+    string name;
+    array<uint64> regs;
+    array<array<uint8> > xmm;
+    array<uint64> bases;
+    array<array<uint8> > data;
+    uint64 count;
+    uint64 bytes;
+    EmuSnap() { count = 0; bytes = 0; }
+}
+array<EmuSnap@> g_emud_snaps;
+const uint EMUD_MAX_SNAPS = 8;
+const uint64 EMUD_SNAP_BYTES = 0x8000000;   // 128 MiB across one snapshot
+
+// "rax==0x10", "rcx!=0", "rdx<0x100", "r8&0x1" (bit test): evaluated against the session registers.
+bool emud_cond_true(uint64 h, const string &in c)
+{
+    if (c == "") return true;
+    array<string> ops = { "==", "!=", "<=", ">=", "<", ">", "&" };
+    for (uint i = 0; i < ops.length(); i++)
+    {
+        int at = c.findFirst(ops[i]);
+        if (at <= 0) continue;
+        string lhs = c.substr(0, uint(at));
+        string rhs = c.substr(uint(at) + ops[i].length());
+        uint64 v;
+        if (!parse_hex_u64(rhs, v) && !parse_dec_u64(rhs, v)) return true;   // malformed: stop anyway
+        uint64 cur = emux_reg(h, lhs);
+        if (ops[i] == "==") return cur == v;
+        if (ops[i] == "!=") return cur != v;
+        if (ops[i] == "<=") return cur <= v;
+        if (ops[i] == ">=") return cur >= v;
+        if (ops[i] == "<") return cur < v;
+        if (ops[i] == ">") return cur > v;
+        return (cur & v) != 0;
+    }
+    return true;
+}
+
+// true when the instruction at `address` touches a watched range the way the watch asks.
+bool emud_watch_hit(uint64 h, uint64 address, uint32 size)
+{
+    if (g_emud_wp_addr.length() == 0) return false;
+    array<uint64> eas;
+    array<uint> sizes;
+    array<bool> writes;
+    emux_mem_ops(h, address, size, eas, sizes, writes);
+    for (uint i = 0; i < eas.length(); i++)
+        for (uint k = 0; k < g_emud_wp_addr.length(); k++)
+        {
+            bool overlap = eas[i] < g_emud_wp_addr[k] + g_emud_wp_size[k] && eas[i] + sizes[i] > g_emud_wp_addr[k];
+            uint want = g_emud_wp_mode[k];
+            bool kind = writes[i] ? (want & 2) != 0 : (want & 1) != 0;
+            if (overlap && kind)
+            {
+                @g_emud_wp_hit = json_obj();
+                g_emud_wp_hit.set("rip", hex_addr(address));
+                g_emud_wp_hit.set("address", hex_addr(eas[i]));
+                g_emud_wp_hit.set("size", sizes[i]);
+                g_emud_wp_hit.set("access", writes[i] ? "write" : "read");
+                g_emud_wp_hit.set("watch", hex_addr(g_emud_wp_addr[k]));
+                return true;
+            }
+        }
+    return false;
+}
+
+void h_emu_watch(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    bool clear = false, on = true;
+    if (!opt_bool(r, "clear", false, clear) || !opt_bool(r, "enabled", true, on)) { bad_args(id, "clear/enabled must be bools"); return; }
+    if (clear) { g_emud_wp_addr.resize(0); g_emud_wp_size.resize(0); g_emud_wp_mode.resize(0); }
+    if (has_key(r, "address"))
+    {
+        uint64 a, n = 8;
+        string mode;
+        if (!get_addr(r, "address", a) || !opt_addr(r, "size", 8, n) || !opt_str(r, "access", "rw", mode)) { bad_args(id, "emu_watch needs address, size?, access? (r|w|rw)"); return; }
+        uint m = mode == "r" ? 1 : (mode == "w" ? 2 : 3);
+        int at = u64_index(g_emud_wp_addr, a);
+        if (at >= 0) { g_emud_wp_addr.removeAt(uint(at)); g_emud_wp_size.removeAt(uint(at)); g_emud_wp_mode.removeAt(uint(at)); }
+        if (on) { g_emud_wp_addr.insertLast(a); g_emud_wp_size.insertLast(n == 0 ? 1 : n); g_emud_wp_mode.insertLast(m); }
+    }
+    json_obj@ o = ok_reply("emu_watch", id);
+    json_obj@ arr = json::array();
+    for (uint i = 0; i < g_emud_wp_addr.length(); i++)
+    {
+        json_obj@ w = json_obj();
+        w.set("address", hex_addr(g_emud_wp_addr[i]));
+        w.set("size", g_emud_wp_size[i]);
+        w.set("access", g_emud_wp_mode[i] == 1 ? "r" : (g_emud_wp_mode[i] == 2 ? "w" : "rw"));
+        arr.push(w);
+    }
+    o.set("watchpoints", arr);
+    send_json(o);
+}
+
+void h_emu_snapshot(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    string name;
+    if (!opt_str(r, "name", "default", name)) { bad_args(id, "name must be a string"); return; }
+    EmuSnap@ s = EmuSnap();
+    s.name = name;
+    s.count = g_emud_count;
+    array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
+    for (uint i = 0; i < names.length(); i++) s.regs.insertLast(emux_reg(g_emud, names[i]));
+    for (uint i = 0; i < 16; i++)
+    {
+        x86_reg reg;
+        xmm_reg("xmm" + i, reg);
+        array<uint8> b;
+        uc::reg_read128(g_emud, reg, b);
+        s.xmm.insertLast(b);
+    }
+    array<uc_memory_region> regions;
+    if (!uc::mem_regions(g_emud, regions)) { send_error(id, E_FAILED, "operation failed", "cannot list emulator memory"); return; }
+    for (uint i = 0; i < regions.length(); i++)
+    {
+        uint64 n = regions[i].end - regions[i].address;
+        if ((n & 0xFFF) == 0xFFF) n++;   // the end is inclusive in Unicorn
+        if (s.bytes + n > EMUD_SNAP_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "the session maps more than 128 MiB"); return; }
+        array<uint8> b;
+        if (!uc::mem_read(g_emud, regions[i].address, uint(n), b)) continue;
+        s.bases.insertLast(regions[i].address);
+        s.data.insertLast(b);
+        s.bytes += n;
+    }
+    for (uint i = 0; i < g_emud_snaps.length(); i++)
+        if (g_emud_snaps[i].name == name) { g_emud_snaps.removeAt(i); break; }
+    if (g_emud_snaps.length() >= EMUD_MAX_SNAPS) g_emud_snaps.removeAt(0);
+    g_emud_snaps.insertLast(s);
+    json_obj@ o = ok_reply("emu_snapshot", id);
+    o.set("name", name);
+    o.set("regions", s.bases.length());
+    o.set("bytes", s.bytes);
+    o.set("instructions", s.count);
+    json_obj@ list = json::array();
+    for (uint i = 0; i < g_emud_snaps.length(); i++) list.push(g_emud_snaps[i].name);
+    o.set("snapshots", list);
+    send_json(o);
+}
+
+void h_emu_restore(json_obj@ r, int64 id)
+{
+    if (!emud_ready(id)) return;
+    string name;
+    if (!opt_str(r, "name", "default", name)) { bad_args(id, "name must be a string"); return; }
+    EmuSnap@ s;
+    for (uint i = 0; i < g_emud_snaps.length(); i++)
+        if (g_emud_snaps[i].name == name) @s = g_emud_snaps[i];
+    if (s is null) { send_error(id, E_FAILED, "operation failed", "no snapshot named " + name); return; }
+    for (uint i = 0; i < s.bases.length(); i++) uc::mem_write(g_emud, s.bases[i], s.data[i]);
+    array<string> names = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags" };
+    for (uint i = 0; i < names.length(); i++)
+    {
+        x86_reg reg;
+        emu_reg(names[i], reg);
+        uc::reg_write64(g_emud, reg, s.regs[i]);
+    }
+    for (uint i = 0; i < 16 && i < s.xmm.length(); i++)
+    {
+        x86_reg reg;
+        xmm_reg("xmm" + i, reg);
+        if (s.xmm[i].length() == 16) uc::reg_write128(g_emud, reg, s.xmm[i]);
+    }
+    g_emud_count = s.count;
+    uc::flush_code(g_emud);
+    send_json(emud_state("emu_restore", id, emud_stop("restored")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page hashing (the relay's page monitor uses it instead of reading every page over the socket)
+// ---------------------------------------------------------------------------------------------
+
+const uint64 HASH_MAX_BYTES = 0x4000000;   // 64 MiB per request
+
+// 64-bit FNV-1a over the page's qwords (unreadable pages hash to 0).
+uint64 page_hash(memory_buffer@ buf, uint64 off)
+{
+    uint64 h = uint64(0xcbf29ce484222325);
+    for (uint64 o = off; o < off + 0x1000; o += 8)
+    {
+        h ^= buf.read_uint64(o);
+        h *= uint64(0x100000001b3);
+    }
+    return h | 1;
+}
+
+void h_hash_pages(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    if (!has_key(r, "ranges") || r.type("ranges") != json_type::array) { bad_args(id, "hash_pages requires 'ranges' ([{address, size}])"); return; }
+    json_obj@ ranges = r.get_obj("ranges");
+    json_obj@ out_list = json::array();
+    uint64 total = 0;
+    for (uint i = 0; i < ranges.length(); i++)
+    {
+        json_obj@ g = ranges.get_obj_at(i);
+        uint64 a, n;
+        if (g is null || !get_addr(g, "address", a) || !get_addr(g, "size", n)) { bad_args(id, "each range needs address and size"); return; }
+        a &= ~uint64(0xFFF);
+        n = align_up(n, 0x1000);
+        total += n;
+        if (total > HASH_MAX_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "at most 64 MiB per request"); return; }
+        // hashes packed as 16 hex digits per page keep the reply small
+        string packed;
+        for (uint64 pos = a; pos < a + n; pos += CHUNK)
+        {
+            uint64 len = umin(CHUNK, a + n - pos);
+            memory_buffer@ buf = process::read_buffer(pos, len);
+            for (uint64 o = 0; o < len; o += 0x1000)
+            {
+                uint64 h = 0;
+                if (buf !is null) h = page_hash(buf, o);
+                else
+                {
+                    memory_buffer@ one = process::read_buffer(pos + o, 0x1000);
+                    if (one !is null) h = page_hash(one, 0);
+                }
+                packed += bits_hex_be(h);
+            }
+        }
+        json_obj@ e = json_obj();
+        e.set("address", hex_addr(a));
+        e.set("pages", n / 0x1000);
+        e.set("hashes", packed);
+        out_list.push(e);
+    }
+    json_obj@ o = ok_reply("hash_pages", id);
+    o.set("ranges", out_list);
+    send_json(o);
+}
+
+// 16 hex digits, most significant first.
+string bits_hex_be(uint64 v)
+{
+    string s = "";
+    string d = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) s += d.substr(uint((v >> (4 * i)) & 0xF), 1);
+    return s;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Typed values for watches and freezes
+// ---------------------------------------------------------------------------------------------
+
+uint vt_width(const string &in vt)
+{
+    if (vt == "u8" || vt == "i8") return 1;
+    if (vt == "u16" || vt == "i16") return 2;
+    if (vt == "u32" || vt == "i32" || vt == "f32") return 4;
+    if (vt == "u64" || vt == "i64" || vt == "f64") return 8;
+    return 0;
+}
+
+// Little-endian bytes -> number as a double (ints sign-extended for i*).
+bool num_decode(const string &in vt, const array<uint8> &in b, double &out v)
+{
+    uint w = vt_width(vt);
+    if (w == 0 || b.length() < w) return false;
+    uint64 bits = 0;
+    for (uint i = 0; i < w; i++) bits |= uint64(b[i]) << (8 * i);
+    if (vt == "f32" || vt == "f64") return flt_decode(w, bits, v);
+    if (vt.substr(0, 1) == "i")
+    {
+        int64 sv = int64(bits);
+        if (w < 8) sv = (sv << (64 - w * 8)) >> (64 - w * 8);
+        v = double(sv);
+        return true;
+    }
+    v = double(bits);
+    return true;
+}
+
+bool num_read(const string &in vt, uint64 a, double &out v)
+{
+    array<uint8>@ b = process::read_bytes(a, vt_width(vt));
+    return b !is null && num_decode(vt, b, v);
+}
+
+bool num_write(const string &in vt, uint64 a, double v)
+{
+    if (vt == "f32") return process::write_float(a, float(v));
+    if (vt == "f64") return process::write_double(a, v);
+    if (vt == "u8") return process::write_uint8(a, uint8(int64(v)));
+    if (vt == "i8") return process::write_int8(a, int8(int64(v)));
+    if (vt == "u16") return process::write_uint16(a, uint16(int64(v)));
+    if (vt == "i16") return process::write_int16(a, int16(int64(v)));
+    if (vt == "u32") return process::write_uint32(a, uint32(int64(v)));
+    if (vt == "i32") return process::write_int32(a, int32(int64(v)));
+    if (vt == "u64") return process::write_uint64(a, uint64(v));
+    if (vt == "i64") return process::write_int64(a, int64(v));
+    return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Freeze groups
+// ---------------------------------------------------------------------------------------------
+
+void h_freeze_group(json_obj@ r, int64 id)
+{
+    string group;
+    bool on;
+    if (!opt_str(r, "group", "", group) || group == "" || !opt_bool(r, "enabled", true, on)) { bad_args(id, "freeze_group needs 'group' and 'enabled'"); return; }
+    uint n = 0;
+    g_freeze_mx.lock();
+    for (uint i = 0; i < g_freeze.length(); i++)
+        if (g_freeze[i].group == group) { g_freeze[i].paused = !on; n++; }
+    g_freeze_mx.unlock();
+    json_obj@ o = ok_reply("freeze_group", id);
+    o.set("group", group);
+    o.set("enabled", on);
+    o.set("entries", n);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Memory snapshots kept in the agent: only changed ranges cross the socket
+// ---------------------------------------------------------------------------------------------
+
+class MemSnap
+{
+    string name;
+    uint64 base;
+    uint64 size;
+    array<uint64> q;      // the range as qwords
+    array<bool> ok;       // per 64 KiB chunk: readable at snapshot time
+    MemSnap() { base = 0; size = 0; }
+}
+array<MemSnap@> g_snaps;
+mutex@ g_snap_mx = create_mutex();
+const uint64 SNAP_MAX_BYTES = 0x1000000;   // 16 MiB per snapshot
+const uint SNAP_MAX = 8;
+const uint64 SNAP_CHUNK = 0x10000;
+
+bool snap_fill(uint64 base, uint64 size, array<uint64> &out q, array<bool> &out ok)
+{
+    q.resize(uint(size / 8));
+    ok.resize(uint((size + SNAP_CHUNK - 1) / SNAP_CHUNK));
+    for (uint64 pos = 0; pos < size; pos += SNAP_CHUNK)
+    {
+        uint64 len = umin(SNAP_CHUNK, size - pos);
+        memory_buffer@ buf = process::read_buffer(base + pos, len);
+        ok[uint(pos / SNAP_CHUNK)] = buf !is null;
+        for (uint64 o = 0; o + 8 <= len; o += 8) q[uint((pos + o) / 8)] = buf is null ? 0 : buf.read_uint64(o);
+    }
+    return true;
+}
+
+// address/size, or module (its whole image)
+string snap_range(json_obj@ r, uint64 &out base, uint64 &out size)
+{
+    string mod;
+    if (!opt_str(r, "module", "", mod)) return "module must be a string";
+    if (mod != "")
+    {
+        array<module_entry>@ mods = process::get_module_list();
+        for (uint i = 0; mods !is null && i < mods.length(); i++)
+            if (lower_ascii(mods[i].name) == lower_ascii(mod)) { base = mods[i].base; size = mods[i].size; return ""; }
+        return "module not found: " + mod;
+    }
+    if (!get_addr(r, "address", base) || !get_addr(r, "size", size)) return "pass address and size, or module";
+    return "";
+}
+
+void h_mem_snapshot(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    string name;
+    if (!opt_str(r, "name", "default", name)) { bad_args(id, "name must be a string"); return; }
+    uint64 base = 0, size = 0;
+    string why = snap_range(r, base, size);
+    if (why != "") { bad_args(id, why); return; }
+    base &= ~uint64(7);
+    size = align_up(size, 8);
+    if (size == 0 || size > SNAP_MAX_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "a snapshot covers 8 bytes .. 16 MiB"); return; }
+    MemSnap@ s = MemSnap();
+    s.name = name; s.base = base; s.size = size;
+    snap_fill(base, size, s.q, s.ok);
+    g_snap_mx.lock();
+    for (uint i = 0; i < g_snaps.length(); i++)
+        if (g_snaps[i].name == name) { g_snaps.removeAt(i); break; }
+    if (g_snaps.length() >= SNAP_MAX) g_snaps.removeAt(0);
+    g_snaps.insertLast(s);
+    g_snap_mx.unlock();
+    json_obj@ o = ok_reply("mem_snapshot", id);
+    o.set("name", name);
+    o.set("address", hex_addr(base));
+    o.set("size", size);
+    send_json(o);
+}
+
+void h_mem_diff(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    string name;
+    bool update;
+    int64 max_ranges;
+    if (!opt_str(r, "name", "default", name) || !opt_bool(r, "update", false, update) || !opt_int(r, "max_ranges", 2000, max_ranges)) { bad_args(id, "name string, update bool, max_ranges number"); return; }
+    MemSnap@ s;
+    g_snap_mx.lock();
+    for (uint i = 0; i < g_snaps.length(); i++)
+        if (g_snaps[i].name == name) @s = g_snaps[i];
+    g_snap_mx.unlock();
+    if (s is null) { send_error(id, E_FAILED, "operation failed", "no snapshot named " + name); return; }
+    array<uint64> cur;
+    array<bool> ok;
+    snap_fill(s.base, s.size, cur, ok);
+    json_obj@ out_list = json::array();
+    uint64 changed = 0;
+    uint n = cur.length();
+    uint i = 0;
+    while (i < n)
+    {
+        if (cur[i] == s.q[i] || !ok[uint(uint64(i) * 8 / SNAP_CHUNK)]) { i++; continue; }
+        uint j = i;
+        // merge changed qwords separated by at most one unchanged qword
+        while (j + 1 < n && (cur[j + 1] != s.q[j + 1] || (j + 2 < n && cur[j + 2] != s.q[j + 2]))) j++;
+        changed += uint64(j - i + 1) * 8;
+        if (out_list.length() < uint(max_ranges))
+        {
+            json_obj@ e = json_obj();
+            e.set("address", hex_addr(s.base + uint64(i) * 8));
+            e.set("size", (j - i + 1) * 8);
+            string oh, nh;
+            for (uint k = i; k <= j && k < i + 4; k++) { oh += bits_hex(s.q[k], 8); nh += bits_hex(cur[k], 8); }
+            e.set("old", oh);
+            e.set("new", nh);
+            out_list.push(e);
+        }
+        i = j + 1;
+    }
+    if (update) { s.q = cur; s.ok = ok; }
+    json_obj@ o = ok_reply("mem_diff", id);
+    o.set("name", name);
+    o.set("changed_bytes", changed);
+    o.set("ranges", out_list);
+    o.set("truncated", out_list.length() >= uint(max_ranges));
+    send_json(o);
+}
+
+void h_mem_snapshot_list(json_obj@ r, int64 id)
+{
+    json_obj@ arr = json::array();
+    g_snap_mx.lock();
+    for (uint i = 0; i < g_snaps.length(); i++)
+    {
+        json_obj@ e = json_obj();
+        e.set("name", g_snaps[i].name);
+        e.set("address", hex_addr(g_snaps[i].base));
+        e.set("size", g_snaps[i].size);
+        arr.push(e);
+    }
+    g_snap_mx.unlock();
+    json_obj@ o = ok_reply("mem_snapshot_list", id);
+    o.set("snapshots", arr);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pointer maps: save pointer-scan results, intersect runs across restarts
+// ---------------------------------------------------------------------------------------------
+
+json_obj@ g_ptr_last;   // results of the last pointer_scan
+const string DATA_DIR = "echodebug";
+
+string ptr_key(json_obj@ e)
+{
+    string k = e.get_string("module") + "|" + hex_addr(e.get_uint64("module_offset"));
+    json_obj@ offs = e.get_obj("offsets");
+    for (uint i = 0; offs !is null && i < offs.length(); i++) k += "|" + offs.get_double_at(i);
+    return k;
+}
+
+void h_ptr_save(json_obj@ r, int64 id)
+{
+    string name;
+    if (!opt_str(r, "name", "", name) || name == "") { bad_args(id, "ptr_save needs 'name'"); return; }
+    if (g_ptr_last is null) { send_error(id, E_FAILED, "operation failed", "run pointer_scan first"); return; }
+    dir::create(DATA_DIR);
+    if (!file::write(DATA_DIR + "/pointers_" + name + ".json", json::stringify(g_ptr_last))) { send_error(id, E_FAILED, "operation failed", "cannot write the pointer map"); return; }
+    json_obj@ o = ok_reply("ptr_save", id);
+    o.set("name", name);
+    o.set("paths", g_ptr_last.length());
+    send_json(o);
+}
+
+json_obj@ ptr_load(const string &in name)
+{
+    if (name == "@last") return g_ptr_last;
+    string text;
+    if (!file::read(DATA_DIR + "/pointers_" + name + ".json", text)) return null;
+    string err;
+    return json::parse(text, err);
+}
+
+void h_ptr_compare(json_obj@ r, int64 id)
+{
+    if (!has_key(r, "names") || r.type("names") != json_type::array) { bad_args(id, "ptr_compare needs 'names' (saved maps; '@last' is the last scan)"); return; }
+    json_obj@ names = r.get_obj("names");
+    if (names.length() < 2) { bad_args(id, "compare at least two maps"); return; }
+    json_obj@ first = ptr_load(names.get_string_at(0));
+    if (first is null) { send_error(id, E_FAILED, "operation failed", "cannot load " + names.get_string_at(0)); return; }
+    array<string> keep;
+    array<json_obj@> keep_e;
+    for (uint i = 0; i < first.length(); i++) { keep.insertLast(ptr_key(first.get_obj_at(i))); keep_e.insertLast(first.get_obj_at(i)); }
+    for (uint m = 1; m < names.length(); m++)
+    {
+        json_obj@ other = ptr_load(names.get_string_at(m));
+        if (other is null) { send_error(id, E_FAILED, "operation failed", "cannot load " + names.get_string_at(m)); return; }
+        array<string> ks;
+        for (uint i = 0; i < other.length(); i++) ks.insertLast(ptr_key(other.get_obj_at(i)));
+        for (int i = int(keep.length()) - 1; i >= 0; i--)
+            if (str_index(ks, keep[uint(i)]) < 0) { keep.removeAt(uint(i)); keep_e.removeAt(uint(i)); }
+    }
+    json_obj@ out_list = json::array();
+    for (uint i = 0; i < keep_e.length(); i++) out_list.push(keep_e[i]);
+    json_obj@ o = ok_reply("ptr_compare", id);
+    o.set("common", out_list);
+    o.set("count", out_list.length());
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Object instances by vtable, MSVC RTTI names
+// ---------------------------------------------------------------------------------------------
+
+// vtable -> ".?AVName@@" via the Complete Object Locator at vtable[-1] (x64: self-relative RVAs).
+string msvc_rtti_name(uint64 vt)
+{
+    uint64 col = 0;
+    if (!process::read_uint64(vt - 8, col) || col == 0) return "";
+    uint32 sig = 0, td_rva = 0, self_rva = 0;
+    if (!process::read_uint32(col, sig) || sig != 1) return "";
+    if (!process::read_uint32(col + 12, td_rva) || !process::read_uint32(col + 20, self_rva)) return "";
+    uint64 base = col - uint64(self_rva);
+    string name;
+    if (!process::read_string(base + td_rva + 16, name)) return "";
+    return name;
+}
+
+// ".?AVGame@Player@@" -> "Player::Game"... keep it readable: strip the decoration, reverse scopes
+string msvc_pretty(const string &in raw)
+{
+    if (raw.length() < 5 || raw.substr(0, 4) != ".?AV" && raw.substr(0, 4) != ".?AU") return raw;
+    string body = raw.substr(4);
+    int end = body.findFirst("@@");
+    if (end >= 0) body = body.substr(0, uint(end));
+    array<string> parts = split_str(body, "@");
+    string out_list = "";
+    for (int i = int(parts.length()) - 1; i >= 0; i--) out_list += (out_list == "" ? "" : "::") + parts[uint(i)];
+    return out_list;
+}
+
+void h_rtti_name(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 a;
+    bool is_object;
+    if (!get_addr(r, "address", a) || !opt_bool(r, "object", false, is_object)) { bad_args(id, "rtti_name needs 'address' (a vtable, or an object with object=true)"); return; }
+    uint64 vt = a;
+    if (is_object && !process::read_uint64(a, vt)) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
+    string raw = msvc_rtti_name(vt);
+    json_obj@ o = ok_reply("rtti_name", id);
+    o.set("vtable", hex_addr(vt));
+    o.set("raw", raw);
+    o.set("name", msvc_pretty(raw));
+    send_json(o);
+}
+
+// Every 8-aligned qword in writable memory equal to the vtable: the objects of that class.
+void h_find_instances(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 vt;
+    int64 max;
+    if (!get_addr(r, "vtable", vt) || !opt_int(r, "max", 1000, max)) { bad_args(id, "find_instances needs 'vtable' (max optional)"); return; }
+    if (max < 1) max = 1;
+    if (max > 100000) max = 100000;
+    uint64 t0 = util::tickcount();
+    RegionList@ rl = RegionList();
+    walk_regions(t0, USER_LO, USER_HI, true, true, WALK_MAX_REGIONS, true, rl);
+    json_obj@ out_list = json::array();
+    bool trunc = false;
+    for (uint ri = 0; ri < rl.base.length() && !trunc; ri++)
+    {
+        uint64 re = rl.base[ri] + rl.size[ri];
+        for (uint64 pos = rl.base[ri]; pos < re && !trunc; pos += CHUNK)
+        {
+            if (time_up(t0)) { trunc = true; break; }
+            uint64 len = umin(CHUNK, re - pos);
+            memory_buffer@ buf = process::read_buffer(pos, len);
+            if (buf is null) continue;
+            for (uint64 o = 0; o + 8 <= len; o += 8)
+                if (buf.read_uint64(o) == vt)
+                {
+                    out_list.push(hex_addr(pos + o));
+                    if (out_list.length() >= uint(max)) { trunc = true; break; }
+                }
+        }
+    }
+    string raw = msvc_rtti_name(vt);
+    json_obj@ o = ok_reply("find_instances", id);
+    o.set("vtable", hex_addr(vt));
+    o.set("class", msvc_pretty(raw));
+    o.set("count", out_list.length());
+    o.set("instances", out_list);
+    o.set("truncated", trunc);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cross-references inside the agent: rel32 calls/jumps, RIP-relative operands, absolute pointers
+// ---------------------------------------------------------------------------------------------
+
+void h_xref_scan(json_obj@ r, int64 id)
+{
+    if (!require_attached(id)) return;
+    uint64 target;
+    string mod;
+    int64 max;
+    bool abs_ptrs;
+    if (!get_addr(r, "target", target) || !opt_str(r, "module", "", mod) || !opt_int(r, "max", 500, max) || !opt_bool(r, "pointers", true, abs_ptrs))
+    { bad_args(id, "xref_scan needs 'target' (module, max, pointers optional)"); return; }
+    uint64 lo = USER_LO, hi = USER_HI;
+    if (mod != "")
+    {
+        uint64 b = process::get_module_base(mod);
+        if (b == 0) { send_error(id, E_FAILED, "module not found", mod); return; }
+        array<module_entry>@ mods = process::get_module_list();
+        for (uint i = 0; mods !is null && i < mods.length(); i++)
+            if (mods[i].base == b) { lo = b; hi = b + mods[i].size; }
+    }
+    uint64 t0 = util::tickcount();
+    RegionList@ rl = RegionList();
+    walk_regions(t0, lo, hi, true, false, WALK_MAX_REGIONS, true, rl);
+    json_obj@ out_list = json::array();
+    bool trunc = false;
+    for (uint ri = 0; ri < rl.base.length() && !trunc; ri++)
+    {
+        bool exec = (rl.flags[ri] & RF_EXEC) != 0;
+        if (!exec && !abs_ptrs) continue;
+        uint64 re = rl.base[ri] + rl.size[ri];
+        for (uint64 pos = rl.base[ri]; pos < re && !trunc; pos += CHUNK)
+        {
+            if (time_up(t0)) { trunc = true; break; }
+            uint64 len = umin(CHUNK + 16, re - pos);
+            memory_buffer@ buf = process::read_buffer(pos, len);
+            if (buf is null) continue;
+            uint64 core = umin(CHUNK, len);
+            for (uint64 o = 0; o + 4 <= core; o++)
+            {
+                uint64 ip = pos + o;
+                if (exec)
+                {
+                    int64 d = int64(buf.read_int32(o));
+                    // disp32 ending the instruction (k = 0) or followed by an imm8 / imm32
+                    for (uint k = 0; k < 3; k++)
+                    {
+                        uint64 tail = k == 0 ? 0 : (k == 1 ? 1 : 4);
+                        if (ip + 4 + tail + uint64(d) != target) continue;
+                        uint8 b1 = o >= 1 ? buf.read_uint8(o - 1) : 0;
+                        string kind = tail == 0 && b1 == 0xE8 ? "call" : (tail == 0 && b1 == 0xE9 ? "jmp" : "riprel");
+                        json_obj@ e = json_obj();
+                        e.set("address", hex_addr(kind == "riprel" ? ip : ip - 1));
+                        e.set("kind", kind);
+                        out_list.push(e);
+                        break;
+                    }
+                }
+                if (abs_ptrs && (o & 7) == 0 && o + 8 <= core && buf.read_uint64(o) == target)
+                {
+                    json_obj@ e = json_obj();
+                    e.set("address", hex_addr(ip));
+                    e.set("kind", "pointer");
+                    out_list.push(e);
+                }
+                if (out_list.length() >= uint(max)) { trunc = true; break; }
+            }
+        }
+    }
+    json_obj@ o = ok_reply("xref_scan", id);
+    o.set("target", hex_addr(target));
+    o.set("count", out_list.length());
+    o.set("results", out_list);
+    o.set("truncated", trunc);
+    send_json(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-threaded first scan: workers take contiguous region shards; shards merge in order
+// ---------------------------------------------------------------------------------------------
+
+const uint SCAN_WORKERS = 4;   // the job thread plus three helpers
+RegionList@ g_par_rl;
+ScanSpec@ g_par_spec;
+array<ScanState@> g_par_out;
+array<uint> g_par_lo;
+array<uint> g_par_hi;
+uint g_par_next = 0;
+uint g_par_done = 0;
+uint64 g_par_t0 = 0;
+uint64 g_par_bytes = 0;
+bool g_par_stop = false;
+mutex@ g_par_mx = create_mutex();
+
+void par_scan_shard(uint k)
+{
+    ScanSpec@ s = g_par_spec;
+    ScanState@ st = g_par_out[k];
+    bool pattern = is_pattern(s.vtype);
+    uint64 w = s.width;
+    uint64 al = s.align;
+    uint cap = MAX_CANDIDATES;
+    if (pattern && PREV_RAW_CAP / s.width < cap) cap = uint(PREV_RAW_CAP / s.width);
+    for (uint ri = g_par_lo[k]; ri < g_par_hi[k]; ri++)
+    {
+        uint64 re = g_par_rl.base[ri] + g_par_rl.size[ri];
+        for (uint64 pos = g_par_rl.base[ri]; pos < re; pos += CHUNK)
+        {
+            if (g_par_stop || time_up(g_par_t0) || g_cancel.load()) { st.truncated = true; return; }
+            uint64 core = umin(CHUNK, re - pos);
+            uint64 want = umin(CHUNK + w - 1, re - pos);
+            g_par_mx.lock();
+            g_par_bytes += core;
+            g_par_mx.unlock();
+            if (want < w) continue;
+            memory_buffer@ buf = process::read_buffer(pos, want);
+            if (buf is null) continue;
+            uint64 limit = umin(want - w + 1, core);
+            uint64 first = align_up(pos, al) - pos;
+            bool full = pattern ? scan_pat_chunk(buf, pos, first, limit, want, s, st, cap)
+                                : scan_num_chunk(buf, pos, first, limit, s, st, cap);
+            if (full) { st.truncated = true; g_par_stop = true; return; }
+        }
+    }
+}
+
+void par_worker()
+{
+    for (;;)
+    {
+        g_par_mx.lock();
+        uint k = g_par_next;
+        if (k < g_par_out.length()) g_par_next++;
+        g_par_mx.unlock();
+        if (k >= g_par_out.length()) break;
+        par_scan_shard(k);
+    }
+    g_par_mx.lock();
+    g_par_done++;
+    g_par_mx.unlock();
+}
+
+// Numeric/pattern first scans over many regions; false when the scan should stay sequential.
+bool par_scan_new(int64 id, ScanSpec@ s, RegionList@ rl, ScanState@ st, string &out note)
+{
+    if (s.op == OP_UNKNOWN || rl.base.length() < 8) return false;
+    uint shards = SCAN_WORKERS * 4;
+    @g_par_rl = rl;
+    @g_par_spec = s;
+    g_par_out.resize(0); g_par_lo.resize(0); g_par_hi.resize(0);
+    uint n = rl.base.length();
+    for (uint k = 0; k < shards; k++)
+    {
+        g_par_out.insertLast(ScanState(s));
+        g_par_lo.insertLast(n * k / shards);
+        g_par_hi.insertLast(n * (k + 1) / shards);
+    }
+    g_par_next = 0; g_par_done = 0; g_par_stop = false; g_par_bytes = 0;
+    g_par_t0 = util::tickcount();
+    for (uint i = 1; i < SCAN_WORKERS; i++) create_thread(0, @par_worker);
+    par_worker();
+    Progress pg("scan_new", rl.total);
+    for (;;)
+    {
+        g_par_mx.lock();
+        uint done = g_par_done;
+        uint64 bytes = g_par_bytes;
+        g_par_mx.unlock();
+        pg.update(bytes);
+        if (done >= SCAN_WORKERS) break;
+        if (util::tickcount() - g_par_t0 > JOB_TIME_LIMIT_MS + 5000) { note = "a scan worker did not finish"; break; }
+    }
+    bool trunc = false;
+    uint cap = MAX_CANDIDATES;
+    for (uint k = 0; k < g_par_out.length(); k++)
+    {
+        ScanState@ p = g_par_out[k];
+        trunc = trunc || p.truncated;
+        for (uint i = 0; i < p.addrs.length() && st.addrs.length() < cap; i++)
+        {
+            st.addrs.insertLast(p.addrs[i]);
+            if (is_pattern(s.vtype)) { for (uint b = 0; b < s.width; b++) st.prev_raw.insertLast(p.prev_raw[i * s.width + b]); }
+            else st.prev.insertLast(p.prev[i]);
+        }
+    }
+    if (trunc && note == "") note = g_cancel.load() ? "cancelled" : "candidate cap or time limit reached";
+    st.truncated = trunc;
+    g_par_out.resize(0);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings file, write journal, event queue, stats, cancel
+// ---------------------------------------------------------------------------------------------
+
+int g_port = RELAY_PORT;
+string g_auto_attach = AUTO_ATTACH;
+bool g_alerts = true;
+bool g_pause_freeze = false;
+bool g_pause_watch = false;
+const string CONFIG_FILE = "echodebug/agent.json";
+const string JOURNAL_FILE = "echodebug/journal.jsonl";
+
+void load_config()
+{
+    string text;
+    if (!file::read(CONFIG_FILE, text)) return;
+    string err;
+    json_obj@ c = json::parse(text, err);
+    if (c is null) { console::warn(LOG_PREFIX + "ignoring " + CONFIG_FILE + ": " + err); return; }
+    int64 port;
+    if (opt_int(c, "port", RELAY_PORT, port) && port > 0 && port < 65536) g_port = int(port);
+    string aa;
+    if (opt_str(c, "auto_attach", AUTO_ATTACH, aa)) g_auto_attach = aa;
+    bool al;
+    if (opt_bool(c, "alerts", true, al)) g_alerts = al;
+}
+
+bool save_config()
+{
+    json_obj@ c = json_obj();
+    c.set("port", g_port);
+    c.set("auto_attach", g_auto_attach);
+    c.set("alerts", g_alerts);
+    dir::create(DATA_DIR);
+    return file::write(CONFIG_FILE, json::stringify(c));
+}
+
+void h_agent_config(json_obj@ r, int64 id)
+{
+    int64 port;
+    string aa;
+    bool al;
+    if (!opt_int(r, "port", g_port, port) || !opt_str(r, "auto_attach", g_auto_attach, aa) || !opt_bool(r, "alerts", g_alerts, al)) { bad_args(id, "port number, auto_attach string, alerts bool"); return; }
+    if (port <= 0 || port >= 65536) { bad_args(id, "port must be 1..65535"); return; }
+    bool port_changed = int(port) != g_port;
+    g_port = int(port); g_auto_attach = aa; g_alerts = al;
+    bool saved = save_config();
+    json_obj@ o = ok_reply("agent_config", id);
+    o.set("port", g_port);
+    o.set("auto_attach", g_auto_attach);
+    o.set("alerts", g_alerts);
+    o.set("saved", saved);
+    o.set("note", port_changed ? "the new port is used on the next script load" : "");
+    send_json(o);
+}
+
+void journal(const string &in kind, uint64 addr, const string &in old_hex, const string &in new_hex)
+{
+    json_obj@ e = json_obj();
+    e.set("t", util::system_time());
+    e.set("kind", kind);
+    e.set("target", g_name);
+    e.set("address", hex_addr(addr));
+    e.set("old", old_hex);
+    e.set("new", new_hex);
+    dir::create(DATA_DIR);
+    file::append(JOURNAL_FILE, json::stringify(e) + "\n");
+}
+
+void h_journal(json_obj@ r, int64 id)
+{
+    int64 limit;
+    bool clear;
+    if (!opt_int(r, "limit", 200, limit) || !opt_bool(r, "clear", false, clear)) { bad_args(id, "limit number, clear bool"); return; }
+    string text;
+    file::read(JOURNAL_FILE, text);
+    array<string> lines = split_str(text, "\n");
+    json_obj@ out_list = json::array();
+    uint start = lines.length() > uint(limit) + 1 ? lines.length() - uint(limit) - 1 : 0;
+    for (uint i = start; i < lines.length(); i++)
+    {
+        if (lines[i] == "") continue;
+        string err;
+        json_obj@ e = json::parse(lines[i], err);
+        if (e !is null) out_list.push(e);
+    }
+    if (clear) file::remove(JOURNAL_FILE);
+    json_obj@ o = ok_reply("journal", id);
+    o.set("entries", out_list);
+    o.set("cleared", clear);
+    send_json(o);
+}
+
+// events raised while the app is away are kept (newest 500) and sent on reconnect
+array<string> g_evq;
+mutex@ g_evq_mx = create_mutex();
+const uint EVQ_MAX = 500;
+
+void flush_events()
+{
+    g_evq_mx.lock();
+    array<string> q = g_evq;
+    g_evq.resize(0);
+    g_evq_mx.unlock();
+    for (uint i = 0; i < q.length(); i++)
+    {
+        g_send_mx.lock();
+        ws::send(q[i]);
+        g_send_mx.unlock();
+    }
+    if (q.length() > 0) console::log(LOG_PREFIX + "sent " + q.length() + " queued events");
+}
+
+// per-verb call counts and handler time (ws thread)
+array<string> g_stat_verb;
+array<uint64> g_stat_n;
+array<uint64> g_stat_ms;
+
+void stat_add(const string &in verb, uint64 ms)
+{
+    int at = str_index(g_stat_verb, verb);
+    if (at < 0) { g_stat_verb.insertLast(verb); g_stat_n.insertLast(0); g_stat_ms.insertLast(0); at = int(g_stat_verb.length()) - 1; }
+    g_stat_n[uint(at)]++;
+    g_stat_ms[uint(at)] += ms;
+}
+
+void h_stats(json_obj@ r, int64 id)
+{
+    json_obj@ verbs = json::array();
+    for (uint i = 0; i < g_stat_verb.length(); i++)
+    {
+        json_obj@ e = json_obj();
+        e.set("verb", g_stat_verb[i]);
+        e.set("calls", g_stat_n[i]);
+        e.set("ms", g_stat_ms[i]);
+        verbs.push(e);
+    }
+    g_state_mx.lock_shared();
+    string job = g_job;
+    uint64 since = g_job == "" ? 0 : util::tickcount() - g_job_t0;
+    g_state_mx.unlock_shared();
+    json_obj@ o = ok_reply("stats", id);
+    o.set("verbs", verbs);
+    o.set("job", job);
+    o.set("job_ms", since);
+    o.set("queued_events", g_evq.length());
+    o.set("frozen", g_freeze.length());
+    o.set("watched", g_watch.length());
+    o.set("snapshots", g_snaps.length());
+    send_json(o);
+}
+
+void h_cancel(json_obj@ r, int64 id)
+{
+    g_state_mx.lock_shared();
+    string job = g_job;
+    g_state_mx.unlock_shared();
+    if (job != "") g_cancel.store(true);
+    json_obj@ o = ok_reply("cancel", id);
+    o.set("job", job);
+    o.set("cancelling", job != "");
+    send_json(o);
+}
+
+void notify(const string &in msg, int r, int g, int b)
+{
+    if (g_alerts) alert::show_tag("EchoDebug: " + msg, TAG, r, g, b);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Panel inside Echo (ui::): status, settings and the safety switches, no desktop app needed
+// ---------------------------------------------------------------------------------------------
+
+checkbox g_ui_alerts;
+checkbox g_ui_pause_freeze;
+checkbox g_ui_pause_watch;
+
+void ui_alerts_cb(bool v) { g_alerts = v; save_config(); }
+void ui_pause_freeze_cb(bool v) { g_pause_freeze = v; }
+void ui_pause_watch_cb(bool v) { g_pause_watch = v; }
+
+void ui_status()
+{
+    g_state_mx.lock_shared();
+    string t = g_attached ? g_name + " (pid " + g_pid + ")" : "no target";
+    string job = g_job;
+    g_state_mx.unlock_shared();
+    string msg = "relay " + (ws::is_connected() ? "connected" : "offline") + " on port " + g_port + " · " + t
+               + " · " + g_freeze.length() + " frozen · " + g_watch.length() + " watched" + (job != "" ? " · running " + job : "");
+    alert::show_tag("EchoDebug: " + msg, TAG, 120, 200, 255);
+    console::log(LOG_PREFIX + msg);
+}
+
+void ui_reconnect() { ws::reconnect(); }
+
+void ui_cancel()
+{
+    g_cancel.store(true);
+    alert::show_tag("EchoDebug: cancelling the running job", TAG, 255, 200, 80);
+}
+
+// restore frozen bytes and detach, from inside Echo
+void ui_panic()
+{
+    if (was_attached())
+    {
+        restore_freeze();
+        clear_freeze();
+        clear_watch();
+        process::detach();
+        mark_detached("panic button");
+    }
+    alert::show_tag("EchoDebug: restored frozen values and detached", TAG, 255, 120, 80);
+}
+
+void ui_save() { alert::show_tag(save_config() ? "EchoDebug: settings saved" : "EchoDebug: could not save settings", TAG, 120, 255, 120); }
+
+void build_menu()
+{
+    ui::add_tab("EchoDebug");
+    ui::add_category("Status");
+    ui::add_button("Show status", @ui_status);
+    ui::add_button("Reconnect to the app", @ui_reconnect);
+    ui::add_button("Cancel running job", @ui_cancel);
+    ui::add_category("Safety");
+    g_ui_pause_freeze = ui::add_checkbox("Pause freezes", false, @ui_pause_freeze_cb);
+    g_ui_pause_watch = ui::add_checkbox("Pause watches", false, @ui_pause_watch_cb);
+    ui::add_button("Restore frozen values and detach", @ui_panic);
+    ui::add_category("Settings");
+    g_ui_alerts = ui::add_checkbox("Alerts for watch hits and finished jobs", g_alerts, @ui_alerts_cb);
+    ui::add_button("Save settings", @ui_save);
 }
 
 // Re-points Echo's native memory server at the relay. The relay asks for this when its /agent
@@ -2813,6 +4971,7 @@ void on_open()
     console::log(LOG_PREFIX + "connected to relay " + ext_url());
     alert::show_tag("EchoDebug: connected to app", TAG, 80, 255, 120);
     send_hello();
+    flush_events();
     // Re-announce the attach so the relay's status/target refresh after a reconnect or script reload.
     g_state_mx.lock_shared();
     bool a = g_attached;
@@ -2837,7 +4996,13 @@ void on_message(string msg)
     if (r is null) { send_error(0, E_BAD_ARGS, "invalid JSON", err); return; }
     int64 id = r.get_int64("id");
     string type = r.get_string("type");
+    uint64 t0 = util::tickcount();
+    dispatch(type, r, id);
+    stat_add(type, util::tickcount() - t0);
+}
 
+void dispatch(const string &in type, json_obj@ r, int64 id)
+{
     if (type == "attach") h_attach(r, id);
     else if (type == "detach") h_detach(r, id);
     else if (type == "alive") h_alive(r, id);
@@ -2851,6 +5016,17 @@ void on_message(string msg)
     else if (type == "scan_clear") h_scan_clear(r, id);
     else if (type == "pointer_scan") h_pointer_scan(r, id);
     else if (type == "emulate") h_emulate(r, id);
+    else if (type == "emu_start") h_emu_start(r, id);
+    else if (type == "emu_step") h_emu_go(r, id, true);
+    else if (type == "emu_run") h_emu_go(r, id, false);
+    else if (type == "emu_break") h_emu_break(r, id);
+    else if (type == "emu_set") h_emu_set(r, id);
+    else if (type == "emu_read") h_emu_read(r, id);
+    else if (type == "emu_state") h_emu_state(r, id);
+    else if (type == "emu_close") h_emu_close(r, id);
+    else if (type == "emu_watch") h_emu_watch(r, id);
+    else if (type == "emu_snapshot") h_emu_snapshot(r, id);
+    else if (type == "emu_restore") h_emu_restore(r, id);
     else if (type == "dump") h_dump(r, id);
     else if (type == "freeze") h_freeze(r, id);
     else if (type == "freeze_list") h_freeze_list(r, id);
@@ -2862,6 +5038,23 @@ void on_message(string msg)
     else if (type == "watch_list") h_watch_list(r, id);
     else if (type == "read_typed") h_read_typed(r, id);
     else if (type == "region_stats") h_region_stats(r, id);
+    else if (type == "sig_scan_batch") h_sig_scan_batch(r, id);
+    else if (type == "disasm_function") h_disasm_function(r, id);
+    else if (type == "read_fields") h_read_fields(r, id);
+    else if (type == "hash_pages") h_hash_pages(r, id);
+    else if (type == "freeze_group") h_freeze_group(r, id);
+    else if (type == "mem_snapshot") h_mem_snapshot(r, id);
+    else if (type == "mem_diff") h_mem_diff(r, id);
+    else if (type == "mem_snapshot_list") h_mem_snapshot_list(r, id);
+    else if (type == "ptr_save") h_ptr_save(r, id);
+    else if (type == "ptr_compare") h_ptr_compare(r, id);
+    else if (type == "find_instances") h_find_instances(r, id);
+    else if (type == "rtti_name") h_rtti_name(r, id);
+    else if (type == "xref_scan") h_xref_scan(r, id);
+    else if (type == "agent_config") h_agent_config(r, id);
+    else if (type == "journal") h_journal(r, id);
+    else if (type == "stats") h_stats(r, id);
+    else if (type == "cancel") h_cancel(r, id);
     else send_error(id, E_UNKNOWN_VERB, "unknown verb", type);
 }
 
@@ -2883,7 +5076,7 @@ void on_error(string msg)
 void try_auto_attach()
 {
     JobParams@ p = JobParams();
-    p.attach_name = AUTO_ATTACH;
+    p.attach_name = g_auto_attach;
     uint seq;
     if (!claim_job("auto_attach", 0, p, seq)) return;
     create_thread(0, @job_main);   // attach on a one-shot thread, not the 1 tps tick thread
@@ -2904,7 +5097,7 @@ void keepalive_tick()
 
     g_state_mx.lock();
     bool died = g_attached && !process::is_alive();   // even mid-job: the target is gone either way
-    if (died && AUTO_ATTACH != "") g_auto_pending = true;
+    if (died && g_auto_attach != "") g_auto_pending = true;
     bool auto_try = g_auto_pending && !g_attached && g_job == "" && g_ka_tick % 5 == 0;
     bool stuck = g_job != "" && util::tickcount() - g_job_t0 > JOB_WATCHDOG_MS;
     if (stuck) { g_job = ""; @g_job_params = null; }
@@ -2921,15 +5114,32 @@ void keepalive_tick()
 }
 
 // 20 tps: rewrite frozen values; report each failing entry once until it succeeds again.
+uint g_freeze_ticks = 0;
+
 void freeze_tick()
 {
-    if (!is_attached()) return;
+    g_freeze_ticks++;
+    if (!is_attached() || g_pause_freeze) return;
     array<uint64> failed;
     g_freeze_mx.lock();
     for (uint i = 0; i < g_freeze.length(); i++)
     {
         FreezeEntry@ e = g_freeze[i];
-        bool ok = process::write_bytes(e.data, e.address);
+        if (e.paused) continue;
+        bool ok = true;
+        if (e.mode == "set") ok = process::write_bytes(e.data, e.address);
+        else
+        {
+            double v;
+            if (!num_read(e.vtype, e.address, v)) ok = false;
+            else
+            {
+                double nv = v;
+                if (e.mode == "add") { if (g_freeze_ticks % 20 == 0) nv = v + e.step; }   // step per second (20 Hz tick)
+                else { if (nv < e.minv) nv = e.minv; if (nv > e.maxv) nv = e.maxv; }
+                if (nv != v) ok = num_write(e.vtype, e.address, nv);
+            }
+        }
         if (!ok && !e.failed) failed.insertLast(e.address);
         e.failed = !ok;
     }
@@ -2972,7 +5182,9 @@ bool main()
     string bad = self_test();
     if (bad != "") console::error(LOG_PREFIX + "self-test failed: " + bad);
 
-    if (AUTO_ATTACH != "")
+    load_config();
+    build_menu();
+    if (g_auto_attach != "")
     {
         g_auto_pending = true;
         try_auto_attach();

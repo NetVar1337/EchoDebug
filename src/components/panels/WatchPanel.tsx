@@ -16,7 +16,7 @@ const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64
 
 export default function WatchPanel() {
   const w = useWatch();
-  const { agent, modules } = useConn();
+  const { mem: agent, modules } = useConn();
   const patches = usePatches();
   const ui = useUi();
   const [values, setValues] = useState<Record<string, Uint8Array | null>>({});
