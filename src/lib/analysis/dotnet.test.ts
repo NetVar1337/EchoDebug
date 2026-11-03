@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseDotnet } from "./dotnet";
+import { openMetadata, parseDotnet } from "./dotnet";
+import { disassembleIl, formatIl, userStringRefs } from "./cil";
 
 /* ------------------------------------------------------------------ */
 /* little endian byte helpers                                         */
@@ -122,7 +123,7 @@ function buildMetadata(streams: { name: string; data: number[] }[]): Uint8Array 
 
 const kImageSize = 0x4000;
 const kCliRva = 0x2000;
-const kMetaRva = 0x2100;
+const kMetaRva = 0x3000; // clear of the method bodies at 0x2250 and 0x2300
 
 function buildPe(meta: Uint8Array, opts: { numDirs?: number; clrRva?: number } = {}): Uint8Array {
   const img = new Uint8Array(kImageSize);
@@ -172,7 +173,7 @@ function buildPe(meta: Uint8Array, opts: { numDirs?: number; clrRva?: number } =
 
 // `wide` selects 4 byte heap indexes (heapSizes 0x05) instead of the 2 byte
 // default, the way real assemblies with big heaps encode their rows.
-function buildManagedImage(wide = false): Uint8Array {
+function buildManagedImage(wide = false, extra: { us?: number[]; bodies?: { rva: number; bytes: number[] }[] } = {}): Uint8Array {
   const strs = buildStrings([
     ".ctor", "Compute", "Helper", "m_count", "m_value", "Nested", "ObsoleteAttribute",
     "Object", "Sample", "System", "Test.dll", "ToString", "Widget",
@@ -245,8 +246,11 @@ function buildManagedImage(wide = false): Uint8Array {
     { name: "#~", data: buildTables(tables, wide ? 0x05 : 0x00) },
     { name: "#Strings", data: strs.data },
     { name: "#Blob", data: blobs.data },
+    ...(extra.us ? [{ name: "#US", data: extra.us }] : []),
   ]);
-  return buildPe(meta);
+  const img = buildPe(meta);
+  for (const body of extra.bodies ?? []) img.set(body.bytes, body.rva);
+  return img;
 }
 
 /* ------------------------------------------------------------------ */
@@ -332,5 +336,65 @@ describe("dotnet", () => {
     const broken3 = buildManagedImage();
     new DataView(broken3.buffer).setUint32(kCliRva + 8, 0xffffff00, true); // metadata rva out of range
     expect(parseDotnet(broken3)).toBeNull();
+  });
+});
+
+describe("IL and user strings", () => {
+  // #US heap: index 1 = "hello" (len 11 = 5 chars * 2 + flag byte), index 13 = "x"
+  const us = [0, 11, ...Array.from("hello").flatMap((c) => [c.charCodeAt(0), 0]), 0, 3, 0x78, 0, 0];
+  // Compute (MethodDef #2, rva 0x2250), tiny header: ldstr "hello"; callvirt ToString; pop;
+  // ldarg.1; ldc.i4.s 5; add; brtrue.s +1; nop; ret
+  const tinyCode = [0x72, 0x01, 0, 0, 0x70, 0x6f, 0x01, 0, 0, 0x0a, 0x26, 0x03, 0x1f, 0x05, 0x58, 0x2d, 0x01, 0x00, 0x2a];
+  const tiny = [(tinyCode.length << 2) | 2, ...tinyCode];
+  // Helper (#3, rva 0x2300), fat header with a try/finally: switch(2 targets); leave.s; endfinally; ret
+  const fatCode = [0x45, 0x02, 0, 0, 0, 0x00, 0, 0, 0, 0x01, 0, 0, 0, 0xde, 0x00, 0xdc, 0x2a];
+  const fatHeader = [0x1b, 0x30, 0x02, 0x00, ...[fatCode.length, 0, 0, 0], 0, 0, 0, 0];
+  const pad = Array((4 - ((12 + fatCode.length) % 4)) % 4).fill(0);
+  // small EH section: kind=1 (EHTable), size 16, one clause: finally, try 0..15, handler 15..16
+  const eh = [0x01, 16, 0, 0, 0x02, 0x00, 0x00, 0x00, 15, 0x0f, 0x00, 1, 0, 0, 0, 0];
+  const img = buildManagedImage(false, { us, bodies: [{ rva: 0x2250, bytes: tiny }, { rva: 0x2300, bytes: [...fatHeader, ...fatCode, ...pad, ...eh] }] });
+
+  it("resolves tokens and reads the #US heap", () => {
+    const md = openMetadata(img)!;
+    expect(md).not.toBeNull();
+    expect(md.userStrings.map((u) => u.text)).toEqual(["hello", "x"]);
+    expect(md.userString(0x70000001)).toBe("hello");
+    expect(md.tokenName(0x06000002)).toBe("Sample.Widget::Compute");
+    expect(md.tokenName(0x06000003)).toBe("Sample.Widget/Nested::Helper");
+    expect(md.tokenName(0x0a000001)).toBe("System.Object::ToString");
+    expect(md.tokenName(0x01000002)).toBe("System.ObsoleteAttribute");
+    expect(md.tokenName(0x04000002)).toBe("Sample.Widget::m_count");
+    expect(md.methods.map((m) => m.name)).toEqual([".ctor", "Compute", "Helper"]);
+  });
+
+  it("disassembles tiny and fat bodies", () => {
+    const md = openMetadata(img)!;
+    const t = disassembleIl(img, 0x2250, md.tokenName);
+    expect(t.headerSize).toBe(1);
+    expect(formatIl(t)).toEqual([
+      'IL_0000: ldstr "hello"',
+      "IL_0005: callvirt System.Object::ToString",
+      "IL_000a: pop",
+      "IL_000b: ldarg.1",
+      "IL_000c: ldc.i4.s 5",
+      "IL_000e: add",
+      "IL_000f: brtrue.s IL_0012",
+      "IL_0011: nop",
+      "IL_0012: ret",
+    ]);
+    const f = disassembleIl(img, 0x2300, md.tokenName);
+    expect(f.headerSize).toBe(12);
+    expect(f.maxStack).toBe(2);
+    expect(f.code[0].opcode).toBe("switch");
+    expect(f.code[0].targets).toEqual([13, 14]);
+    expect(f.clauses).toEqual([{ kind: "finally", tryStart: 0, tryEnd: 15, handlerStart: 15, handlerEnd: 16 }]);
+    expect(() => disassembleIl(img, 0, md.tokenName)).toThrow(/no body/);
+  });
+
+  it("finds where each user string is loaded", () => {
+    const md = openMetadata(img)!;
+    const refs = userStringRefs(img, md.methods);
+    expect(refs.get(0x70000001)).toEqual([{ token: 0x70000001, method: "Sample.Widget::Compute", methodToken: 0x06000002, offset: 0 }]);
+    expect(refs.has(0x7000000d)).toBe(false);
   });
 });

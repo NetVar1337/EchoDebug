@@ -1,13 +1,13 @@
 // Names & comments panel: the user's own symbol names and annotations,
 // with IDA / Ghidra script export.
 import { useMemo, useState } from "react";
-import { Download, Save, Search, Trash2, Upload } from "lucide-react";
-import { labelAddr } from "@/lib/hex";
+import { Download, PenLine, Search, Trash2 } from "lucide-react";
+import { fmtAddr, labelAddr } from "@/lib/hex";
+import { countRelocation } from "@/lib/analysis/sigrepair";
+import { keepRvas, relocate, signProjects, useRelocation } from "@/lib/projects";
+import { attempt } from "@/store/output";
 import { toGhidra, toIdc, useNames } from "@/store/names";
 import { useConn } from "@/store/conn";
-import { attempt } from "@/store/output";
-import { acceptBuild, exportProject, importProject, relocate, saveProject, useProjects } from "@/store/projects";
-import { countRelocation } from "@/lib/projects";
 import { useUi } from "@/store/ui";
 import { copy, IconButton, Panel } from "../ui";
 
@@ -16,8 +16,8 @@ export default function NamesPanel() {
   const modules = useConn((s) => s.modules);
   const ui = useUi();
   const [filter, setFilter] = useState("");
-  const project = useProjects();
-  const counts = project.last && countRelocation(project.last.map((r) => r.status));
+  const reloc = useRelocation();
+  const counts = reloc.last && countRelocation(reloc.last.rows.map((r) => r.status));
 
   const shown = useMemo(() => {
     const f = filter.toLowerCase();
@@ -46,27 +46,25 @@ export default function NamesPanel() {
           </button>
           <button className="btn small" disabled={!names.names.length} onClick={() => void copy(JSON.stringify(names.names, null, 2))}>Copy JSON</button>
         </div>
-        <div className="label">Project · saved per module as RVAs</div>
+        <div className="label">Module project · names and bookmarks by RVA</div>
         <div className="row wrap">
-          <button className="btn small" disabled={!modules.length || !!project.busy} title="Make a relocation signature for every name, comment and bookmark, and remember each module's build"
-            onClick={() => void attempt("project", saveProject())}><Save size={12} /> Save</button>
-          <button className="btn small" onClick={() => void attempt("project", exportProject())}><Download size={12} /> Export</button>
-          <button className="btn small" onClick={() => void attempt("project", importProject())}><Upload size={12} /> Import</button>
-          {project.busy && <span className="faint" style={{ fontSize: 12 }}>{project.busy}…</span>}
+          <button className="btn small" disabled={!modules.length || !!reloc.busy} title="Make a relocation signature for every name, comment and bookmark, so they can be re-located when the module's build changes"
+            onClick={() => void attempt("project", signProjects())}><PenLine size={12} /> Sign</button>
+          {reloc.busy && <span className="faint" style={{ fontSize: 12 }}>{reloc.busy}…</span>}
         </div>
-        {project.changed.map((c) => (
-          <div key={c.module} className="row wrap" style={{ fontSize: 12 }}>
-            <span className="warn grow">{c.module} is a different build (size 0x{c.from.size.toString(16)} → 0x{c.to.size.toString(16)}{c.from.timestamp !== c.to.timestamp ? ", new timestamp" : ""})</span>
-            <button className="btn small primary" disabled={!!project.busy} onClick={() => void attempt("project", relocate(c))}>Re-locate</button>
-            <button className="btn small" disabled={!!project.busy} onClick={() => acceptBuild(c.module, c.to)}>Keep RVAs</button>
+        {reloc.changed.map((c) => (
+          <div key={c.toKey} className="row wrap" style={{ fontSize: 12 }}>
+            <span className="warn grow">{c.module} is a different build than its saved project</span>
+            <button className="btn small primary" disabled={!!reloc.busy} onClick={() => void attempt("project", relocate(c))}>Re-locate</button>
+            <button className="btn small" disabled={!!reloc.busy} onClick={() => keepRvas(c)}>Keep RVAs</button>
           </div>
         ))}
-        {project.last && counts && (
+        {reloc.last && counts && (
           <div style={{ fontSize: 12 }}>
-            <span className="faint">Last re-locate: </span>{counts.matched} matched · {counts.moved} moved · <span className={counts.lost ? "warn" : ""}>{counts.lost} lost</span>
-            {project.last.filter((r) => r.status !== "same").map((r, i) => (
+            <span className="faint">Last re-locate ({reloc.last.module}): </span>{counts.matched} matched · {counts.moved} moved · <span className={counts.lost ? "warn" : ""}>{counts.lost} lost</span>
+            {reloc.last.rows.filter((r) => r.status !== "ok").map((r, i) => (
               <div key={i} className="mono faint ellipsis" title={r.status}>
-                {r.kind} {r.label}: {r.oldRva} {r.status === "moved" ? `→ ${r.newRva}` : `(${r.status === "nosig" ? "no signature" : r.status})`}
+                {r.kind} {r.label}: {fmtAddr(BigInt(r.oldRva))} {r.status === "moved" && r.newRva !== undefined ? `→ ${fmtAddr(BigInt(r.newRva))}` : `(${r.status === "nosig" ? "no signature" : r.status})`}
               </div>
             ))}
           </div>

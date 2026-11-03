@@ -3,9 +3,9 @@
 // writes an IDC-style script for IDA and a .json sidecar.
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { migrateAnchored, type Anchor } from "@/lib/projects";
+import { record } from "@/lib/history";
 
-export type NameEntry = { address: string; name: string; comment: string; anchor?: Anchor };
+export type NameEntry = { address: string; name: string; comment: string };
 
 type NamesStore = {
   names: NameEntry[];
@@ -22,39 +22,48 @@ type NamesStore = {
   list: () => NameEntry[];
 };
 
-export const norm = (a: string) => a.toLowerCase().replace(/^0x/, "").padStart(16, "0");
+const norm = (a: string) => a.toLowerCase().replace(/^0x/, "").padStart(16, "0");
 
 export const useNames = create<NamesStore>()(
   persist(
-    (set, get) => ({
+    (rawSet, get) => {
+      /** every edit is one undo step */
+      const set = (label: string, f: (s: NamesStore) => Partial<NamesStore>) => {
+        const before = get().names;
+        rawSet(f);
+        const after = get().names;
+        if (after !== before) record({ label, undo: () => rawSet({ names: before }), redo: () => rawSet({ names: after }) });
+      };
+      return {
       names: [],
       rename: (address, name) =>
-        set((s) => {
+        set(`rename ${address}`, (s) => {
           const key = norm(address);
           const rest = s.names.filter((n) => norm(n.address) !== key);
           if (!name.trim()) return { names: rest };
           const prev = s.names.find((n) => norm(n.address) === key);
-          return { names: [...rest, { ...prev, address: key, name: name.trim(), comment: prev?.comment ?? "" }] };
+          return { names: [...rest, { address: key, name: name.trim(), comment: prev?.comment ?? "" }] };
         }),
       comment: (address, text) =>
-        set((s) => {
+        set(`comment ${address}`, (s) => {
           const key = norm(address);
           const prev = s.names.find((n) => norm(n.address) === key);
           if (!text.trim() && !prev?.name) return { names: s.names.filter((n) => norm(n.address) !== key) };
           return {
             names: [
               ...s.names.filter((n) => norm(n.address) !== key),
-              { ...prev, address: key, name: prev?.name ?? "", comment: text.trim() },
+              { address: key, name: prev?.name ?? "", comment: text.trim() },
             ],
           };
         }),
-      remove: (address) => set((s) => ({ names: s.names.filter((n) => norm(n.address) !== norm(address)) })),
-      setNames: (entries) => set({ names: entries }),
+      remove: (address) => set(`remove ${address}`, (s) => ({ names: s.names.filter((n) => norm(n.address) !== norm(address)) })),
+      setNames: (entries) => set("replace names", () => ({ names: entries })),
       nameOf: (address) => get().names.find((n) => norm(n.address) === norm(address))?.name ?? "",
       commentOf: (address) => get().names.find((n) => norm(n.address) === norm(address))?.comment ?? "",
       list: () => get().names,
-    }),
-    { name: "echodebug.names", version: 1, migrate: migrateAnchored("names") },
+      };
+    },
+    { name: "echodebug.names" },
   ),
 );
 

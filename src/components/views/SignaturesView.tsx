@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Copy, Download, HeartPulse, Save, Search, Trash2, Upload, X } from "lucide-react";
+import { Copy, Save, Search, Trash2, Upload } from "lucide-react";
 import { request } from "@/lib/client";
 import { fmtAddr, hexToBytes, labelAddr, moduleOf, parseAddress, toBig } from "@/lib/hex";
 import { loadImage, readBytes } from "@/lib/memory";
@@ -10,17 +10,15 @@ import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useFlirt } from "@/store/flirt";
 import { useSigs, toYara } from "@/store/sigs";
-import { sigHits as hits } from "@/store/projects";
-import { classify, findModule, type ScanStatus } from "@/lib/projects";
-import { saveTextFile } from "@/lib/session";
 import { useUi } from "@/store/ui";
 import { isTauri, pickBinaryFile } from "@/lib/tauri";
 import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
 
-type Health = { id: string; name: string; module: string; oldRva: string | null; newRva?: string; hits: number; status: ScanStatus | "unloaded" };
-
-const kHealthLabel: Record<Health["status"], string> = { same: "OK", moved: "moved", multiple: "multiple", broken: "broken", unloaded: "module not loaded" };
+async function hits(pattern: string, module: string): Promise<string[]> {
+  const r = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern, module, find_all: true }, true);
+  return r.success ? r.results ?? [] : [];
+}
 
 export default function SignaturesView() {
   const ui = useUi();
@@ -37,7 +35,6 @@ export default function SignaturesView() {
   const [name, setName] = useState("");
   const [note, setNote] = useState("");
   const [catalogFilter, setCatalogFilter] = useState("");
-  const [health, setHealth] = useState<Health[] | null>(null);
   const addr = ui.sigAt ? parseAddress(ui.sigAt, modules) : null;
   const mod = addr !== null ? moduleOf(addr, modules) : undefined;
 
@@ -75,6 +72,7 @@ export default function SignaturesView() {
       name: name.trim() || `sig_${pattern.length}`,
       address: ui.sigAt ?? "",
       module: mod?.name ?? "",
+      rva: mod && addr !== null ? fmtAddr(addr - toBig(mod.base)) : undefined,
       pattern: trim(pattern),
       note: note.trim(),
       hits: found?.length ?? 0,
@@ -82,44 +80,6 @@ export default function SignaturesView() {
     log("info", "sig", `saved "${name.trim() || `sig_${pattern.length}`}" to the catalog`);
     setName("");
     setNote("");
-  };
-
-  /** Re-scans every saved signature in its module and compares the match with the RVA it was saved at. */
-  const checkAll = async () => {
-    setBusy(true);
-    const out: Health[] = [];
-    for (const s of catalog.sigs) {
-      const module = s.anchor?.module ?? s.module;
-      const m = findModule(module, modules);
-      const row: Health = { id: s.id, name: s.name, module, oldRva: s.anchor?.rva ?? null, hits: 0, status: "unloaded" };
-      if (m) {
-        const at = row.oldRva === null ? parseAddress(s.address, modules) : null;
-        if (at !== null && moduleOf(at, modules) === m) row.oldRva = fmtAddr(at - toBig(m.base));
-        const found = (await attempt("sig", hits(s.ida, m.name))) ?? [];
-        const c = classify(row.oldRva === null ? null : toBig(row.oldRva), found.map((h) => toBig(h) - toBig(m.base)));
-        Object.assign(row, { hits: found.length, status: c.status, newRva: c.newRva === undefined ? undefined : fmtAddr(c.newRva) });
-        catalog.update(s.id, { hits: found.length });
-      }
-      out.push(row);
-    }
-    setBusy(false);
-    setHealth(out);
-    const n = (k: Health["status"]) => out.filter((r) => r.status === k).length;
-    log("info", "sig", `health: ${n("same")} OK, ${n("moved")} moved, ${n("multiple")} multiple, ${n("broken")} broken${n("unloaded") ? `, ${n("unloaded")} not loaded` : ""}`);
-  };
-
-  /** Points every moved signature at its new match; the anchor follows the address. */
-  const updateMoved = () => {
-    if (!health) return;
-    for (const r of health) {
-      const m = findModule(r.module, modules);
-      if (r.status === "moved" && r.newRva && m) catalog.update(r.id, { address: fmtAddr(toBig(m.base) + toBig(r.newRva)) });
-    }
-    setHealth(health.map((r) => (r.status === "moved" ? { ...r, status: "same", oldRva: r.newRva ?? r.oldRva } : r)));
-  };
-
-  const exportHealth = () => {
-    if (health) void attempt("sig", saveTextFile("echodebug-signature-health.json", JSON.stringify({ checkedAt: new Date().toISOString(), signatures: health }, null, 2), "Signature health report"));
   };
 
   const ida = toIda(trim(pattern));
@@ -179,7 +139,6 @@ export default function SignaturesView() {
           <div className="toolbar">
             <span className="panel-title grow">Catalog</span>
             <span className="faint" style={{ fontSize: 12 }}>{catalog.sigs.length}</span>
-            <IconButton tip="Check all: re-scan every saved signature in the loaded modules" disabled={busy || !catalog.sigs.length} onClick={() => void checkAll()}><HeartPulse size={13} /></IconButton>
           </div>
           <div className="toolbar">
             <label className="search grow"><Search size={13} /><input placeholder="Filter…" value={catalogFilter} onChange={(e) => setCatalogFilter(e.target.value)} /></label>
@@ -203,29 +162,6 @@ export default function SignaturesView() {
             <span className="mono faint ellipsis grow">{addr !== null ? labelAddr(fmtAddr(addr), modules) : ""}</span>
           </div>
           <div className="vlist">
-            {health && (
-              <div className="panel-section">
-                <div className="row">
-                  <span className="label grow">Signature health · {health.length} checked</span>
-                  <button className="btn small" disabled={!health.some((r) => r.status === "moved")} onClick={updateMoved}>Update {health.filter((r) => r.status === "moved").length} moved</button>
-                  <button className="btn small" onClick={exportHealth}><Download size={12} /> Report</button>
-                  <IconButton tip="Close report" onClick={() => setHealth(null)}><X size={12} /></IconButton>
-                </div>
-                <table className="table mono">
-                  <thead><tr><th>Signature</th><th>Status</th><th>RVA</th><th>Hits</th></tr></thead>
-                  <tbody>
-                    {health.map((r) => (
-                      <tr key={r.id}>
-                        <td className="ellipsis">{r.name} <span className="faint">{r.module}</span></td>
-                        <td className={r.status === "same" ? "" : "warn"}>{kHealthLabel[r.status]}</td>
-                        <td className="dim">{r.status === "moved" ? `${r.oldRva ?? "?"} → ${r.newRva}` : r.oldRva ?? "—"}</td>
-                        <td className="dim">{r.status === "unloaded" ? "—" : r.hits}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
             {pattern.length > 0 && (
               <div className="panel-section">
                 <div className="label">Pattern · click a byte to toggle wildcard</div>

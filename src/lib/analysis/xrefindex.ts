@@ -4,6 +4,7 @@
 // The byte-pattern finder in xrefs.ts answers "what points at this address";
 // this builds the whole graph in one pass so the UI can list both directions
 // and draw the callers of a function.
+import { isElf } from "./elf";
 import { parsePe, type PeInfo } from "./pe";
 
 export type XrefKind = "call" | "jmp" | "jcc" | "rip";
@@ -80,6 +81,7 @@ export function buildXrefIndex(img: Uint8Array, ranges: readonly { rva: number; 
 export function executableRanges(img: Uint8Array, pe?: PeInfo): { rva: number; size: number }[] {
   let info = pe;
   if (!info) {
+    if (isElf(img)) return elfExecutableRanges(img);
     try {
       info = parsePe(img);
     } catch {
@@ -87,4 +89,25 @@ export function executableRanges(img: Uint8Array, pe?: PeInfo): { rva: number; s
     }
   }
   return info.sections.filter((s) => s.x && s.vsize > 0).map((s) => ({ rva: s.rva, size: s.vsize }));
+}
+
+/**
+ * A mapped ELF image (indexed from its load base): the executable PT_LOAD segments, read from the
+ * program headers, which are mapped with the image.
+ */
+export function elfExecutableRanges(img: Uint8Array): { rva: number; size: number }[] {
+  if (img.length < 64 || img[4] !== 2) return [];
+  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const phoff = Number(dv.getBigUint64(32, true));
+  const phnum = dv.getUint16(56, true);
+  const loads: { vaddr: number; memsz: number; x: boolean }[] = [];
+  for (let i = 0; i < phnum && i < 128; i++) {
+    const o = phoff + i * 56;
+    if (o + 56 > img.length) break;
+    if (dv.getUint32(o, true) !== 1) continue; // PT_LOAD
+    loads.push({ vaddr: Number(dv.getBigUint64(o + 16, true)), memsz: Number(dv.getBigUint64(o + 40, true)), x: (dv.getUint32(o + 4, true) & 1) !== 0 });
+  }
+  if (!loads.length) return [];
+  const lowest = Math.min(...loads.map((l) => l.vaddr)) & ~0xfff;
+  return loads.filter((l) => l.x).map((l) => ({ rva: l.vaddr - lowest, size: Math.max(0, Math.min(l.memsz, img.length - (l.vaddr - lowest))) })).filter((r) => r.size > 0);
 }

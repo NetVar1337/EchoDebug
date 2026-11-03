@@ -3,7 +3,6 @@
 // and are never applied automatically.
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { migrateAnchored, type Anchor } from "@/lib/projects";
 
 export type Patch = {
   id: string;
@@ -15,7 +14,6 @@ export type Patch = {
   note: string;
   created: number;
   reverted: boolean;
-  anchor?: Anchor;
 };
 
 type PatchStore = {
@@ -44,7 +42,7 @@ export const usePatches = create<PatchStore>()(
       clear: () => set({ patches: [] }),
       pending: () => get().patches.filter((p) => !p.reverted),
     }),
-    { name: "echodebug.patches", version: 1, migrate: migrateAnchored("patches") },
+    { name: "echodebug.patches" },
   ),
 );
 

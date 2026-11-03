@@ -3,7 +3,6 @@
 // x64dbg, YARA or a C array without re-deriving anything.
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { migrateAnchored, type Anchor } from "@/lib/projects";
 import { toByteArray, toCode, toIda, type Pattern } from "@/lib/analysis/sigmaker";
 
 export type Signature = {
@@ -21,7 +20,8 @@ export type Signature = {
   created: number;
   /** how many hits the last scan found */
   hits: number;
-  anchor?: Anchor;
+  /** address - module base when it was saved or last checked ("0x…"); lets the health check tell a moved match from an ASLR rebase */
+  rva?: string;
 };
 
 type SigStore = {
@@ -55,7 +55,7 @@ export const useSigs = create<SigStore>()(
       remove: (id) => set((st) => ({ sigs: st.sigs.filter((s) => s.id !== id) })),
       clear: () => set({ sigs: [] }),
     }),
-    { name: "echodebug.sigs", version: 1, migrate: migrateAnchored("sigs") },
+    { name: "echodebug.sigs" },
   ),
 );
 
