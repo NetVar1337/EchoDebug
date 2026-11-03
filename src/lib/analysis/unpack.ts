@@ -104,6 +104,8 @@ export function buildDumpPe(dump: Uint8Array, base: bigint, oepRva: number, bloc
   // for a 2 GiB buffer. PE section alignment is a power of two; 64 KiB is the largest in use.
   if (sectAlign & (sectAlign - 1) || sectAlign > 0x10000) throw new Error(`implausible SectionAlignment 0x${sectAlign.toString(16)}`);
   const sizeOfHeaders = dv0.getUint32(oh + 60, true) || 0x400;
+  // every header field below is rewritten in place: they must all lie inside the dump
+  if (sizeOfHeaders > dump.length || oh + 240 > sizeOfHeaders) throw new Error("the dump's headers are cut short");
   if (st + (nsec + 1) * 40 > sizeOfHeaders) throw new Error("no room in the headers for another section");
 
   // .edimp contents
