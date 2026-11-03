@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import tools from "@/lib/tools.json";
 import { providedVerbs } from "@/lib/provider";
 import { useNames } from "@/store/names";
-import { checkVerb, kRawWrites, kStateful, makePluginContext, PermissionError } from "./api";
+import { checkVerb, kAnnotate, kRawWrites, kStateful, makePluginContext, PermissionError } from "./api";
 import { activateModule, checkFolders, unloadPlugin } from "./loader";
 import { describePermissions, safeEntry, validateManifest, type Manifest } from "./manifest";
 import { checkResult, register, unregisterPlugin, usePluginRegistry } from "./registry";
@@ -102,7 +102,7 @@ describe("plugin permissions", () => {
     expect(destructive.length).toBeGreaterThan(2);
     expect(stateful.length).toBeGreaterThan(10);
     for (const v of destructive) expect(kRawWrites.has(v), v).toBe(true);
-    for (const v of stateful) expect(kStateful.has(v) || v === "ui_set_name" || v === "ui_set_comment", v).toBe(true);
+    for (const v of stateful) expect(kStateful.has(v) || kAnnotate.has(v), v).toBe(true);
   });
 });
 

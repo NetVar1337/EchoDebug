@@ -6,7 +6,7 @@
 /** What a plugin may do beyond reading. Without any of these it is read-only. */
 export const kPermissions = {
   write: "Write target memory through the journal (every write is listed in Patches and can be reverted), use stateful verbs (scanner, emulator, attach)",
-  annotate: "Change your names and comments",
+  annotate: "Change your names, comments and struct types",
 } as const;
 export type Permission = keyof typeof kPermissions;
 

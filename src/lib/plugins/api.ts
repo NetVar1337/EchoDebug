@@ -24,8 +24,8 @@ export const kStateful = new Set([
   "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
   "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove",
 ]);
-/** Verbs that change names and comments. Need `annotate`. */
-export const kAnnotate = new Set(["ui_set_name", "ui_set_comment"]);
+/** Verbs that change names, comments and the struct catalog. Need `annotate`. */
+export const kAnnotate = new Set(["ui_set_name", "ui_set_comment", "ui_import_pdb_type"]);
 const kCatalog = new Set((tools as { verb: string }[]).map((t) => t.verb));
 
 export class PermissionError extends Error {

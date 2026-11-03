@@ -3,7 +3,7 @@ import { useEffect } from "react";
 import { useUi } from "@/store/ui";
 
 const kGroups: [string, [string, string][]][] = [
-  ["Navigate", [["Ctrl+G", "Go to an address (module+0x… works)"], ["Ctrl+K · Ctrl+Shift+P", "Command palette"], ["Ctrl+Shift+V", "All views"], ["Ctrl+W", "Close the current tab"], ["Middle-click a tab", "Close it"], ["Mouse wheel over tabs", "Scroll the tab strip"]]],
+  ["Navigate", [["Ctrl+G", "Go to an address (module+0x… works)"], ["Ctrl+K · Ctrl+Shift+P", "Command palette"], ["Ctrl+Shift+F", "Search everything: names, comments, bookmarks, signatures, types, exports, strings"], ["Ctrl+Shift+V", "All views"], ["Ctrl+W", "Close the current tab"], ["Middle-click a tab", "Close it"], ["Mouse wheel over tabs", "Scroll the tab strip"]]],
   ["Panels", [["Ctrl+B", "Side panel (or click the active rail icon)"], ["Ctrl+Alt+S", "Scanner"], ["Ctrl+J", "Output"], ["Ctrl+Alt+I", "Inspector"]]],
   ["Edit", [["Ctrl+Z", "Undo a name / comment / type edit"], ["Ctrl+Y · Ctrl+Shift+Z", "Redo"]]],
   ["Disassembly", [["F3", "Next search match"], ["Enter · Shift+Enter", "In the go-to box: disassembly · memory"], ["Double-click", "Follow / edit"]]],

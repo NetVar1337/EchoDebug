@@ -1,9 +1,13 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use echo_debug_relay::{auth, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
+use echo_debug_relay::{assistant, auth, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
 use serde::Serialize;
+use serde_json::Value;
+use tauri::ipc::Channel;
 use tauri::Manager;
 
 mod plugins;
@@ -136,6 +140,58 @@ fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|e| format!("read {}: {e}", path))
 }
 
+/// Running assistant requests by the UI's id, so the UI can cancel them.
+#[derive(Default)]
+struct AssistantState {
+    streams: Mutex<HashMap<u32, Arc<AtomicBool>>>,
+}
+
+/// Whether an Anthropic API key is stored, and how (never the key itself).
+#[tauri::command]
+fn assistant_key_status() -> Value {
+    assistant::key_info()
+}
+
+#[tauri::command]
+fn assistant_set_key(key: String) -> Result<Value, String> {
+    assistant::save_key(&key)
+}
+
+#[tauri::command]
+fn assistant_clear_key() -> Result<Value, String> {
+    assistant::clear_key()?;
+    Ok(assistant::key_info())
+}
+
+/// Streams one Messages API request. The body comes from the UI and is checked by
+/// `assistant::prepare_body` (read-only tools only, no fields that send data elsewhere); the key is
+/// added here and goes nowhere but api.anthropic.com. Every SSE event is sent on `on_event`.
+#[tauri::command]
+async fn assistant_send(state: tauri::State<'_, AssistantState>, id: u32, body: Value, on_event: Channel<Value>) -> Result<(), String> {
+    let key = assistant::load_key().ok_or("no Anthropic API key: add one in Settings → Assistant")?;
+    let body = assistant::prepare_body(body)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.streams.lock().unwrap_or_else(|e| e.into_inner()).insert(id, cancel.clone());
+    let flag = cancel.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        assistant::stream(&key, &body, &flag, |ev| {
+            let _ = on_event.send(ev);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    state.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    result
+}
+
+#[tauri::command]
+fn assistant_cancel(state: tauri::State<'_, AssistantState>, id: u32) {
+    if let Some(c) = state.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -186,6 +242,7 @@ pub fn run() {
                 eprintln!("host os '{}': skipping Echo agent install (Windows-only); local /proc backend active", std::env::consts::OS);
             }
             app.manage(RelayState { port, error, relay, token: Mutex::new(token) });
+            app.manage(AssistantState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -200,7 +257,12 @@ pub fn run() {
             read_binary_file,
             plugins::plugins_dir,
             plugins::list_plugins,
-            plugins::read_plugin_file
+            plugins::read_plugin_file,
+            assistant_key_status,
+            assistant_set_key,
+            assistant_clear_key,
+            assistant_send,
+            assistant_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

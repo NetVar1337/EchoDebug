@@ -1,4 +1,4 @@
-import { ArrowLeftRight, Bookmark, Boxes, Network, Settings, Tag, Target } from "lucide-react";
+import { ArrowLeftRight, Bookmark, Boxes, Network, Settings, Sparkles, Tag, Target } from "lucide-react";
 import { useUi, type RailView } from "@/store/ui";
 import { togglePanel, useVisiblePanels } from "@/lib/layout";
 
@@ -9,6 +9,7 @@ const kItems: { id: RailView; label: string; Icon: typeof Target }[] = [
   { id: "names", label: "Names & Comments", Icon: Tag },
   { id: "mcp", label: "MCP Server", Icon: Network },
   { id: "sync", label: "Disassembler sync", Icon: ArrowLeftRight },
+  { id: "assistant", label: "Assistant", Icon: Sparkles },
 ];
 
 export default function ActivityRail() {
