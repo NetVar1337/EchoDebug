@@ -977,7 +977,9 @@ pub fn handle(relay: &Relay, req: &Map<String, Value>, default_pid: Option<u32>,
         end_session();
         return failed("debug session ended");
     }
-    let reply = rrx.recv_timeout(Duration::from_secs(20)).unwrap_or_else(|_| failed("debugger did not answer"));
+    // a trace recording (`dbg_record`, ptrace) single-steps for as long as its limits allow
+    let wait = if verb == "dbg_record" { Duration::from_secs(4 * 3600) } else { Duration::from_secs(20) };
+    let reply = rrx.recv_timeout(wait).unwrap_or_else(|_| failed("debugger did not answer"));
     if verb == "dbg_detach" || reply["detached"] == true {
         end_session();
     }

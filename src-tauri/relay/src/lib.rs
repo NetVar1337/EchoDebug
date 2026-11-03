@@ -39,6 +39,9 @@ pub mod monitor;
 pub mod pdbinfo;
 pub mod symbols;
 pub mod sync;
+pub mod trace;
+pub mod trace_emu;
+pub mod trace_rec;
 pub mod unwind;
 pub mod windbg;
 #[cfg(windows)]
@@ -367,6 +370,12 @@ impl Relay {
                 v["id"] = orig;
                 return v;
             }
+            // Time-travel traces: recorded from the emulator or ptrace, stored and queried here.
+            v if crate::trace_rec::VERBS.contains(&v) => {
+                let mut v = crate::trace_rec::handle(self, req).await;
+                v["id"] = orig;
+                return v;
+            }
             // Monitors built on modules/read, so they work with every backend.
             "module_monitor" | "page_monitor" | "module_timeline" | "page_monitor_list" => {
                 let mut v = match verb.as_str() {
@@ -496,11 +505,7 @@ impl Relay {
         } else {
             Value::Object(req)
         };
-        let sent = up_tx.send(frame.to_string());
-        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
-        if sent.is_err() {
-            return error(orig, 2004, "upstream disconnected");
-        }
+        // register the reply slot before sending: a fast upstream can answer before the insert
         self.lock().pending.insert(
             id,
             Pending {
@@ -510,6 +515,12 @@ impl Relay {
                 reply: tx,
             },
         );
+        let sent = up_tx.send(frame.to_string());
+        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
+        if sent.is_err() {
+            self.lock().pending.remove(&id);
+            return error(orig, 2004, "upstream disconnected");
+        }
 
         match tokio::time::timeout(self.0.timeout, &mut rx).await {
             Ok(Ok(mut reply)) => {
@@ -1173,7 +1184,7 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
         "decrypt_strings" => vec![text("address",
             "Treat {{address}} as a string-decryption routine: call ui_xrefs_to to find its call sites, then ui_batch_decrypt to run the routine on the arguments set up at each site, and list the decrypted strings with their call sites.")],
         "deobfuscate_function" => vec![text("address",
-            "Deobfuscate the function at {{address}} (stop address: {{end}}). First call lift_block on it to see its blocks and any opaque predicates. Then call lift_trace with start={{address}} (and end if given): it emulates the function against live memory, keeps only the instructions that affect the final registers and memory, and simplifies the expressions (including MBA). Report the cleaned listing, the final register/memory effects as formulas, the opaque predicates, and a short C-like reconstruction.")],
+            "Deobfuscate the function at {{address}} (stop address: {{end}}). First call lift_block on it to see its blocks and any opaque predicates. Then call lift_trace with start={{address}} (and end if given): it emulates the function against live memory, keeps only the instructions that affect the final registers and memory, and simplifies the expressions (including MBA). If the function is control-flow flattened (one dispatcher block that every block returns to, switching on a state variable), call unflatten on it: it rebuilds the original graph and returns its pseudocode; decompile gives the pseudocode of an ordinary function. Report the cleaned listing, the final register/memory effects as formulas, the opaque predicates, and a short C-like reconstruction.")],
         "devirtualize" => vec![text("address",
             "Treat {{address}} as the entry of a virtualized routine. Call devirt with start={{address}} and max_insns={{max_insns}} (default 200000). From the result: name the dispatcher and the VIP register, give each handler a mnemonic from its lifted effects (e.g. vpush, vadd, vload, vjmp), then rewrite virtual_trace as a virtual-instruction listing and summarize what the virtual program computes. If no dispatcher is found, raise max_insns or check that emulation reached the VM loop (see 'emulation').")],
         _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],

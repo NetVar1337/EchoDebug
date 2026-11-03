@@ -7,6 +7,7 @@ import { readBytes } from "./memory";
 import { readCodeView } from "./analysis/peextra";
 import { pdbCatalog, type PdbLayout } from "./analysis/pdbtypes";
 import type { Proto } from "./analysis/pseudocode";
+import { registerPrototypeProvider, type Prototype } from "./analysis/prototypes";
 import { modulePath } from "./modfile";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
@@ -193,6 +194,17 @@ export function protoAt(address: string): Proto | undefined {
   if (!s || s.kind !== "function" || !s.params) return undefined;
   return { name: s.name, ret: s.ret ?? "int", params: s.params.map((p) => ({ name: p.name, type: p.type })) };
 }
+
+/** protoAt in the decompiler's terms (`...` parameters become `variadic`). */
+export function pdbPrototype(address: string): Prototype | null {
+  const p = protoAt(address);
+  if (!p) return null;
+  const params = p.params.filter((x) => x.type !== "...");
+  return { name: p.name, returns: p.ret, args: params.map((x) => ({ name: x.name || undefined, type: x.type })), ...(params.length < p.params.length ? { variadic: true } : {}) };
+}
+
+// PDB signatures are exact: asked before the decompiler's built-in table and the callee-analysis guesses
+registerPrototypeProvider("pdb", (address) => (address ? pdbPrototype(address) : null));
 
 /** `ret name(type a, type b)` of a PDB function symbol. */
 export function protoText(s: PdbSym): string {

@@ -7,7 +7,7 @@ export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
   | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors" | "engines" | "lifter"
-  | "symbols" | "values" | "threads" | "handlers" | "accesses" | "apimon" | "plugins";
+  | "symbols" | "values" | "threads" | "handlers" | "accesses" | "apimon" | "plugins" | "trace" | "heap";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -22,8 +22,10 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "sigtools", label: "Sig Tools" },
   { id: "yara", label: "YARA" },
   { id: "pointers", label: "Pointers" },
+  { id: "heap", label: "Heap" },
   { id: "emulator", label: "Emulator" },
   { id: "emudbg", label: "Emu Debugger" },
+  { id: "trace", label: "Trace" },
   { id: "lifter", label: "Lifter" },
   { id: "graph", label: "Graph" },
   { id: "dotnet", label: ".NET" },
@@ -56,16 +58,16 @@ export const kTabs: { id: TabId; label: string }[] = [
 export type ViewGroup = "Code" | "Memory" | "Binary" | "Dynamic";
 export const kViewGroups: Record<ViewGroup, { blurb: string; tabs: TabId[] }> = {
   Code: { blurb: "disassembly, graphs, references, signatures", tabs: ["disassembly", "cfg", "graph", "xrefs", "strings", "signatures", "sigtools", "yara"] },
-  Memory: { blurb: "bytes, structures, pointers, snapshots, patches", tabs: ["memory", "structs", "pointers", "snapshots", "map", "patches"] },
+  Memory: { blurb: "bytes, structures, pointers, snapshots, patches", tabs: ["memory", "structs", "pointers", "heap", "snapshots", "map", "patches"] },
   Binary: { blurb: "PE, .NET, RTTI, triage, unpacking, engines", tabs: ["pe", "symbols", "dotnet", "rtti", "triage", "crypto", "caves", "antidebug", "hooks", "handlers", "bindiff", "unpack", "decrypt", "engines"] },
-  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "threads", "accesses", "apimon", "emudbg", "lifter", "emulator", "monitors", "values", "script", "plugins"] },
+  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "threads", "accesses", "apimon", "emudbg", "trace", "lifter", "emulator", "monitors", "values", "script", "plugins"] },
 };
 export const kTabHints: Partial<Record<TabId, string>> = {
   disassembly: "functions and instructions", cfg: "control-flow graph of a function", graph: "call graph", xrefs: "who references an address",
   strings: "ASCII / UTF-16 strings of a module", signatures: "make and test byte patterns", sigtools: "signature catalog, health and repair", yara: "YARA rules over memory",
-  memory: "hex view with find and edit", structs: "typed structure view", pointers: "pointer scanner and chains", snapshots: "diff memory over time", map: "module layout and entropy", patches: "every byte you changed, with undo",
+  memory: "hex view with find and edit", structs: "typed structure view", pointers: "pointer scanner and chains", heap: "malloc arenas, NT / segment heaps, chunks and bins", snapshots: "diff memory over time", map: "module layout and entropy", patches: "every byte you changed, with undo",
   pe: "headers, sections, imports, exports, resources", symbols: "PDBs: symbol servers, functions, types, source lines", dotnet: ".NET metadata and IL", rtti: "C++ classes and vtables", triage: "suspicious imports", crypto: "crypto constants", caves: "free space in code sections", antidebug: "anti-debugging tricks", hooks: "inline / IAT hooks and patched code", handlers: "TLS callbacks and SEH handlers / scope tables", bindiff: "compare with an older build", unpack: "find the OEP, rebuild imports", decrypt: "run string decryptors in the emulator", engines: "Unreal / Unity IL2CPP / Source dumps",
-  debugger: "breakpoints on the live process", threads: "threads, call stacks of every thread, handles", accesses: "find what writes / accesses an address", apimon: "log API calls with arguments", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", emulator: "run a routine once", monitors: "module loads, page changes", values: "plot watched values over time", script: "automate with JavaScript", plugins: "views and analyses from plugins",
+  debugger: "breakpoints on the live process", threads: "threads, call stacks of every thread, handles", accesses: "find what writes / accesses an address", apimon: "log API calls with arguments", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", trace: "record and replay a run: time travel, last write, where a value came from", emulator: "run a routine once", monitors: "module loads, page changes", values: "plot watched values over time", script: "automate with JavaScript", plugins: "views and analyses from plugins",
 };
 export const kDefaultOpenTabs: TabId[] = ["disassembly", "memory", "structs", "strings", "pe", "xrefs", "emudbg", "script"];
 export type PanelId = "left" | "scanner" | "inspector" | "output";
@@ -86,7 +88,7 @@ type UiStore = {
   paletteOpen: boolean;
   /** Ctrl+Shift+F search-everything dialog */
   searchOpen: boolean;
-  /** struct type the Structs view should open (set by search, cleared by the view) */
+  /** struct type the Structs view should open (set by search and the Heap view, cleared by the view) */
   structType: string | null;
   sessionExportOpen: boolean;
   sessionImportOpen: boolean;
