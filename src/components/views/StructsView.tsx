@@ -12,6 +12,7 @@ import { fieldValue, kFieldSizes, layout, toCpp, type Field, type FieldType } fr
 import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
 import { useTypes, type TypeDef } from "@/store/types";
+import { useStructCtx } from "@/store/structctx";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent, copy } from "../ui";
 import AutoDetect from "./structs/AutoDetect";
@@ -40,6 +41,25 @@ export default function StructsView() {
   const lay = useMemo(() => layout(cls.fields), [cls.fields]);
   const size = lay.length ? lay[lay.length - 1].offset + lay[lay.length - 1].size : 0;
   const base = ui.structAt;
+
+  // the assistant reads what is shown here and hands accepted fields back
+  useEffect(() => {
+    useStructCtx.setState({ name: cls.name, base: base ?? null, fields: cls.fields, data, rtti: (base && rtti[base]) || "" });
+  }, [cls.name, cls.fields, base, data, rtti]);
+  const pending = useStructCtx((s) => s.pending);
+  useEffect(() => {
+    if (!pending) return;
+    useStructCtx.setState({ pending: null });
+    setCls((c) => ({ ...c, fields: pending }));
+  }, [pending]);
+
+  // search everything → a struct type: open it here
+  useEffect(() => {
+    const t = ui.structType ? catalog.types.find((x) => x.id === ui.structType) : undefined;
+    if (!ui.structType) return;
+    ui.set({ structType: null });
+    if (t) { setActiveId(t.id); setCls(t); }
+  }, [ui.structType]);
 
   // Undo/redo changes the catalog: pick that up in the editor.
   const stored = catalog.types.find((t) => t.id === activeId);

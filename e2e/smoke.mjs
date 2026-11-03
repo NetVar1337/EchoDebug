@@ -275,6 +275,45 @@ await step("module projects bring the name back after the target restarts at a n
   await until(async () => (await page.locator(".fn-row", { hasText: "classify_e2e" }).count()) > 0, 20000);
 });
 
+await step("value graph plots the counter from the watchlist", async () => {
+  await page.locator(".rail-button[aria-label='Watchlist & Bookmarks']").click();
+  const box = page.locator('input[placeholder="address or module+0x…"]').first();
+  await box.fill(`e2e-target+${sym("counter")}`);
+  await box.press("Enter");
+  await page.locator("[aria-label='Graph this']").first().click();
+  await until(async () => (await page.locator(".tabs-wrap .tab[data-active=true]").innerText()).startsWith("Value Graphs"));
+  // samples arrive (10 Hz poll) and the stats row fills in
+  await until(async () => Number(await page.locator(".vgraph-stats tbody tr td.faint").first().innerText()) > 5);
+  const plot = page.locator(".vgraph-plot");
+  const bb = await plot.boundingBox();
+  await page.mouse.move(bb.x + bb.width - 40, bb.y + bb.height / 2);
+  await until(async () => (await page.locator(".vgraph-tip").count()) > 0);
+  await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height / 2);
+  await page.mouse.wheel(0, -300);
+  await page.locator("[aria-label='Pause sampling']").click();
+  await until(async () => (await page.locator(".vgraph-note", { hasText: "Paused" }).count()) > 0);
+  await page.locator("[aria-label='Resume sampling']").click();
+});
+
+await step("search everything finds a name and jumps to it", async () => {
+  await page.keyboard.press("Control+Shift+F");
+  await page.locator(".search-dialog .palette-input").fill("clasify e2e");
+  await until(async () => (await page.locator(".search-dialog .palette-item", { hasText: "classify_e2e" }).count()) > 0);
+  // exports / modules are indexed too
+  await page.locator(".search-dialog .palette-input").fill("e2e-target");
+  await until(async () => (await page.locator(".search-dialog .palette-group", { hasText: "Modules" }).count()) > 0);
+  await page.locator(".search-dialog .palette-input").fill("classify_e2e");
+  await until(async () => (await page.locator(".search-dialog .palette-item[data-active=true]", { hasText: "classify_e2e" }).count()) > 0);
+  await page.keyboard.press("Enter");
+  await until(async () => (await page.locator(".search-dialog").count()) === 0);
+  await until(async () => (await page.locator(".tabs-wrap .tab[data-active=true]").innerText()).startsWith("Disassembly"));
+});
+
+await step("assistant panel explains it needs the desktop app in a browser", async () => {
+  await page.locator(".rail-button[aria-label='Assistant']").click();
+  await until(async () => (await page.locator(".panel", { hasText: "runs in the EchoDebug desktop app" }).count()) > 0);
+});
+
 await step("views menu, tab close and panel toggles", async () => {
   await page.locator("[aria-label='All views']").click();
   await page.locator('input[placeholder="Find a view…"]').fill("hooks");

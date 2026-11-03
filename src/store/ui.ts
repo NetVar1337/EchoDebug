@@ -2,11 +2,11 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
+export type RailView = "targets" | "modules" | "watch" | "names" | "mcp" | "assistant";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors" | "engines" | "lifter" | "heap";
+  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors" | "engines" | "lifter" | "values" | "heap";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -37,6 +37,7 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "antidebug", label: "Anti-Debug" },
   { id: "hooks", label: "Hooks" },
   { id: "monitors", label: "Monitors" },
+  { id: "values", label: "Value Graphs" },
   { id: "engines", label: "Engines" },
   { id: "bindiff", label: "BinDiff" },
   { id: "unpack", label: "Unpack" },
@@ -51,14 +52,14 @@ export const kViewGroups: Record<ViewGroup, { blurb: string; tabs: TabId[] }> = 
   Code: { blurb: "disassembly, graphs, references, signatures", tabs: ["disassembly", "cfg", "graph", "xrefs", "strings", "signatures", "sigtools", "yara"] },
   Memory: { blurb: "bytes, structures, pointers, snapshots, patches", tabs: ["memory", "structs", "pointers", "heap", "snapshots", "map", "patches"] },
   Binary: { blurb: "PE, .NET, RTTI, triage, unpacking, engines", tabs: ["pe", "dotnet", "rtti", "triage", "crypto", "caves", "antidebug", "hooks", "bindiff", "unpack", "decrypt", "engines"] },
-  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "emudbg", "lifter", "emulator", "monitors", "script"] },
+  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "emudbg", "lifter", "emulator", "monitors", "values", "script"] },
 };
 export const kTabHints: Partial<Record<TabId, string>> = {
   disassembly: "functions and instructions", cfg: "control-flow graph of a function", graph: "call graph", xrefs: "who references an address",
   strings: "ASCII / UTF-16 strings of a module", signatures: "make and test byte patterns", sigtools: "signature catalog, health and repair", yara: "YARA rules over memory",
   memory: "hex view with find and edit", structs: "typed structure view", pointers: "pointer scanner and chains", heap: "malloc arenas, NT / segment heaps, chunks and bins", snapshots: "diff memory over time", map: "module layout and entropy", patches: "every byte you changed, with undo",
   pe: "headers, sections, imports, exports, resources", dotnet: ".NET metadata and IL", rtti: "C++ classes and vtables", triage: "suspicious imports", crypto: "crypto constants", caves: "free space in code sections", antidebug: "anti-debugging tricks", hooks: "inline / IAT hooks and patched code", bindiff: "compare with an older build", unpack: "find the OEP, rebuild imports", decrypt: "run string decryptors in the emulator", engines: "Unreal / Unity IL2CPP / Source dumps",
-  debugger: "breakpoints on the live process", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", emulator: "run a routine once", monitors: "module loads, page changes", script: "automate with JavaScript",
+  debugger: "breakpoints on the live process", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", emulator: "run a routine once", monitors: "module loads, page changes", values: "plot watched values over time", script: "automate with JavaScript",
 };
 export const kDefaultOpenTabs: TabId[] = ["disassembly", "memory", "structs", "strings", "pe", "xrefs", "emudbg", "script"];
 export type PanelId = "left" | "scanner" | "inspector" | "output";
@@ -77,6 +78,10 @@ type UiStore = {
   settingsOpen: boolean;
   gotoOpen: boolean;
   paletteOpen: boolean;
+  /** Ctrl+Shift+F search-everything dialog */
+  searchOpen: boolean;
+  /** struct type the Structs view should open (set by search, cleared by the view) */
+  structType: string | null;
   sessionExportOpen: boolean;
   sessionImportOpen: boolean;
   theme: Theme;
@@ -140,6 +145,8 @@ export const useUi = create<UiStore>()(
       settingsOpen: false,
       gotoOpen: false,
       paletteOpen: false,
+      searchOpen: false,
+      structType: null,
       sessionExportOpen: false,
       sessionImportOpen: false,
       theme: "obsidian",
