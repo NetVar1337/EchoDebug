@@ -9,7 +9,7 @@
 //! Verbs (`dbg_*`, ext routing): `dbg_attach`, `dbg_detach`, `dbg_status`, `dbg_break`
 //! {address, enabled}, `dbg_hwbreak` {slot 0-3, address, kind exec|write|rw, len 1|2|4|8,
 //! enabled}, `dbg_continue`, `dbg_step` {tid?}, `dbg_pause`, `dbg_regs` {tid?}, `dbg_set_regs`
-//! {tid?, regs}. Stops broadcast `{type:"event", event:"dbg_stop", reason, tid, address, regs}`;
+//! {tid?, regs}, `dbg_all_regs` (every thread). Stops broadcast `{type:"event", event:"dbg_stop", reason, tid, address, regs}`;
 //! process exit broadcasts `dbg_exit`.
 
 use std::collections::BTreeMap;
@@ -50,8 +50,14 @@ pub fn handle(_relay: &Relay, _req: &Map<String, Value>) -> Value {
 #[cfg(not(target_os = "linux"))]
 pub fn detach_all() {}
 
+/// Is a ptrace debug session attached? (Its threads cannot be seized a second time.)
+#[cfg(not(target_os = "linux"))]
+pub fn active() -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
-pub use imp::{detach_all, handle};
+pub use imp::{active, detach_all, handle};
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -124,11 +130,17 @@ mod imp {
             *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return failed("debug session ended");
         }
-        let reply = rrx.recv_timeout(Duration::from_secs(15)).unwrap_or_else(|_| failed("debugger did not answer"));
+        // a trace recording single-steps for as long as its limits allow
+        let wait = if verb == "dbg_record" { Duration::from_secs(4 * 3600) } else { Duration::from_secs(15) };
+        let reply = rrx.recv_timeout(wait).unwrap_or_else(|_| failed("debugger did not answer"));
         if verb == "dbg_detach" {
             *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         reply
+    }
+
+    pub fn active() -> bool {
+        SESSION.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// Detach (restoring breakpoints) when the local backend detaches from its target.
@@ -597,11 +609,96 @@ mod imp {
                         Err(e) => failed(e),
                     }
                 }
+                "dbg_record" => {
+                    self.need_stopped();
+                    let tid = self.tid_arg(req);
+                    let lim = crate::trace_rec::Limits::from_req(req);
+                    let meta = crate::trace::Meta {
+                        name: req.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                        source: "ptrace".into(),
+                        created_ms: crate::trace_rec::now_ms(),
+                        pid: Some(self.pid),
+                        tid: Some(tid as i64),
+                        ..Default::default()
+                    };
+                    let save = req.get("save").and_then(Value::as_bool).unwrap_or(true);
+                    let r = crate::trace_rec::record_steps(&mut Stepping { d: self, tid }, meta, &lim);
+                    let ev = self.stop_event(tid, "step", json!({ "trace": true }));
+                    self.relay.emit(ev.clone());
+                    match r {
+                        Ok(t) => json!({ "type": "dbg_record_result", "success": true, "tid": tid, "address": ev["address"], "regs": ev["regs"], "trace": crate::trace_rec::deposit(t, save) }),
+                        Err(e) => failed(e),
+                    }
+                }
+                // every thread's registers at once (the Threads view while a session is active)
+                "dbg_all_regs" => {
+                    let was_running = self.running;
+                    self.need_stopped();
+                    let threads: Vec<Value> = self.threads.keys().map(|t| json!({ "tid": t, "regs": regs_json(*t) })).collect();
+                    if was_running {
+                        let _ = self.resume_all();
+                    }
+                    json!({ "type": "dbg_all_regs_result", "success": true, "threads": threads, "was_running": was_running })
+                }
                 "dbg_detach" => {
                     self.detach();
                     json!({ "type": "dbg_detach_result", "success": true })
                 }
                 other => json!({ "type": "error", "code": 3000, "message": "unknown verb", "detail": other }),
+            }
+        }
+    }
+
+    /// One thread single-stepped for a trace recording (breakpoints are stepped over, their
+    /// bytes hidden from the reads).
+    struct Stepping<'a> {
+        d: &'a mut Dbg,
+        tid: i32,
+    }
+
+    impl crate::trace_rec::Stepper for Stepping<'_> {
+        fn regs(&mut self) -> Result<crate::trace::Regs, String> {
+            let r = ptrace::getregs(Pid::from_raw(self.tid)).map_err(|e| format!("registers of {}: {e}", self.tid))?;
+            Ok([r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp, r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15, r.rip, r.eflags, r.fs_base, r.gs_base])
+        }
+
+        fn read(&mut self, addr: u64, buf: &mut [u8]) -> bool {
+            if !matches!(self.d.mem.read_at(addr, buf), Ok(n) if n == buf.len()) {
+                return false;
+            }
+            unshadow(addr, buf);
+            true
+        }
+
+        fn step(&mut self) -> Result<Option<String>, String> {
+            let tid = self.tid;
+            let at = rip(tid);
+            let orig = self.d.bps.get(&at).copied();
+            if let Some(o) = orig {
+                self.d.write_byte(at, o)?;
+            }
+            let r = ptrace::step(Pid::from_raw(tid), self.d.signals.remove(&tid)).map_err(|e| e.to_string()).and_then(|_| wait_stop(tid, Duration::from_secs(3)));
+            if orig.is_some() {
+                let _ = self.d.write_byte(at, 0xcc);
+            }
+            match r {
+                Ok(WaitStatus::Stopped(_, Signal::SIGTRAP)) => Ok(None),
+                Ok(WaitStatus::Stopped(_, sig)) => {
+                    self.d.signals.insert(tid, sig);
+                    Err(format!("signal {}", sig.as_str()))
+                }
+                Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => {
+                    self.d.threads.remove(&tid);
+                    Err("thread exited".into())
+                }
+                Ok(WaitStatus::PtraceEvent(..)) => Ok(Some("ptrace event (clone/exec/exit)".into())),
+                Ok(_) => Ok(None),
+                Err(e) if e.contains("did not stop") => {
+                    let _ = ptrace::interrupt(Pid::from_raw(tid));
+                    let _ = wait_stop(tid, Duration::from_secs(2));
+                    Err(format!("blocked in a system call at {}", hex_addr(at)))
+                }
+                Err(e) => Err(e),
             }
         }
     }

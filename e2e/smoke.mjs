@@ -183,6 +183,22 @@ await step("emulated debugger steps classify and runs it to its return", async (
   await until(async () => (await page.locator("text=the function returned").count()) > 0);
 });
 
+await step("trace records classify in the emulator and scrubs back through it", async () => {
+  await tab("Trace");
+  await page.locator('input[placeholder="empty: the current session"]').fill(`e2e-target+${sym("classify")}`);
+  await page.getByRole("button", { name: "Record", exact: true }).click();
+  await until(async () => (await page.locator("text=stopped: returned").count()) > 0, 20000);
+  const n = Number(await page.locator("input[type=range]").getAttribute("max"));
+  expect(n > 3, `too few steps: ${n}`);
+  expect((await page.locator("table tbody tr").count()) > 3, "the instruction list is empty");
+  // scrub: to the end with the slider, then one step back
+  await page.locator("input[title=position]").fill(String(n));
+  await page.locator("[aria-label='Step back (←)']").click();
+  await until(async () => (await page.locator(".label", { hasText: `Registers at ${n - 1}` }).count()) > 0);
+  await page.locator(".kv span[title='Where did this value come from?']").first().click();
+  await until(async () => (await page.locator("text=/Where did \\w+ come from/").count()) > 0);
+});
+
 await step("page monitor sees the counter's page change", async () => {
   await tab("Monitors");
   await page.locator('input[placeholder="address · module+0x…"]').last().fill(`e2e-target+${sym("counter")}`);
@@ -237,6 +253,27 @@ await step("YARA matches the greeting", async () => {
   await until(async () => (await page.locator(".accent.mono", { hasText: "greeting" }).count()) > 0);
 });
 
+await step("heap explorer walks the target's malloc arena (view and MCP tools)", async () => {
+  await tab("Heap");
+  await until(async () => (await page.locator(".mono", { hasText: /^main_arena$/ }).count()) > 0, 20000);
+  const call = async (name, args) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/mcp`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
+    const j = await r.json();
+    expect(!j.result?.isError, `${name}: ${JSON.stringify(j).slice(0, 400)}`);
+    return j.result.structuredContent;
+  };
+  const heaps = await call("heaps", {});
+  expect(heaps.platform === "glibc" && heaps.heaps.some((h) => h.label === "main_arena"), `heaps: ${JSON.stringify(heaps).slice(0, 400)}`);
+  const mods = await call("list_modules", {});
+  const base = BigInt(mods.modules.find((m) => m.name === "e2e-target").base);
+  const ptr = await call("read_memory", { address: "0x" + (base + BigInt(sym("heap_note"))).toString(16), size: 8 });
+  const note = BigInt("0x" + ptr.data.match(/../g).reverse().join(""));
+  const found = await call("heap_find", { address: "0x" + (note + 5n).toString(16) });
+  expect(found.found && found.chunk.state === "in-use" && found.chunk.user === "0x" + note.toString(16) && found.chunk.user_size >= 0x123, `heap_find: ${JSON.stringify(found).slice(0, 400)}`);
+  const page1 = await call("heap_chunks", { state: "used", limit: 5 });
+  expect(page1.total >= 1 && page1.chunks.length >= 1, `heap_chunks: ${JSON.stringify(page1).slice(0, 400)}`);
+});
+
 await step("script console runs against the ed API", async () => {
   await tab("Script");
   await page.locator("textarea").first().fill('const m = ed.module(); ed.names.set(ed.addr(m.name + "+' + sym("classify") + '"), "classify_e2e"); return m.name;');
@@ -252,6 +289,19 @@ await step("module projects bring the name back after the target restarts at a n
   await attach(target.p.pid);
   await tab("Disassembly");
   await until(async () => (await page.locator(".fn-row", { hasText: "classify_e2e" }).count()) > 0, 20000);
+});
+
+await step("threads view unwinds the target's main thread into main()", async () => {
+  await tab("Threads");
+  await until(async () => (await page.locator("td", { hasText: /^main(\+0x[0-9a-f]+)?$/ }).count()) > 0, 20000);
+  expect((await page.locator(".pill", { hasText: /^main$/ }).count()) > 0, "main thread not marked");
+  await page.locator("button", { hasText: "Handles" }).click();
+  await until(async () => (await page.locator("td", { hasText: /^(file|device|pipe|socket)$/ }).count()) > 0);
+});
+
+await step("TLS & SEH says an ELF module has no PE tables", async () => {
+  await tab("TLS & SEH");
+  await until(async () => (await page.locator(".empty-title", { hasText: "is not a PE module" }).count()) > 0);
 });
 
 await step("value graph plots the counter from the watchlist", async () => {

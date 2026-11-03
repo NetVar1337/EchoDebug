@@ -21,8 +21,12 @@ import { useUi } from "@/store/ui";
 import { startUpdateLoop } from "@/store/update";
 import { Boundary, Lazy } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
+import { startSymbols } from "@/lib/pdb";
 import { startMcpPolicy } from "@/store/mcp";
 import { startMonitors } from "@/store/monitors";
+import { startSync } from "@/store/sync";
+import { startPlugins } from "@/store/plugins";
+import AddressMenu from "@/components/AddressMenu";
 import { startGraphs } from "@/store/graphs";
 import { startSearchCaches } from "@/lib/searchsources";
 import ApprovalDialog from "@/components/ApprovalDialog";
@@ -43,6 +47,7 @@ const kLeft = {
   watch: lazy(() => import("@/components/panels/WatchPanel")),
   names: lazy(() => import("@/components/panels/NamesPanel")),
   mcp: lazy(() => import("@/components/panels/McpPanel")),
+  sync: lazy(() => import("@/components/panels/SyncPanel")),
   assistant: lazy(() => import("@/components/panels/AssistantPanel")),
 };
 const SettingsModal = lazy(() => import("@/components/SettingsModal"));
@@ -63,11 +68,14 @@ export default function App() {
     startProvider();
     startMcpPolicy();
     startMonitors();
+    startSync();
+    if (isTauri()) startPlugins();
     startGraphs();
     startSearchCaches();
     startProjects();
     startWorkspace();
     startAutoPatches();
+    startSymbols();
     if (appRef.current) applyLayout(appRef.current);
     if (isTauri()) {
       void hostOs().then((os) => {
@@ -212,6 +220,7 @@ export default function App() {
       <ApprovalDialog />
       {ui.shortcutsOpen && <ShortcutsDialog />}
       <Toasts />
+      <AddressMenu />
     </div>
   );
 }

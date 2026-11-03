@@ -4,6 +4,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { record } from "@/lib/history";
+import { pdbSymbolAt } from "./symbols";
 
 export type NameEntry = { address: string; name: string; comment: string };
 
@@ -16,13 +17,37 @@ type NamesStore = {
   remove: (address: string) => void;
   /** replaces the whole list, used by the session importer */
   setNames: (entries: NameEntry[]) => void;
+  /** many names in one undo step (PDB symbols); existing names stay unless `overwrite`; returns how many were set */
+  bulkRename: (entries: readonly { address: string; name: string }[], overwrite?: boolean, label?: string) => number;
+  /** the user's name, else the loaded PDB's symbol starting there */
   nameOf: (address: string) => string;
+  /** only what the user (or an import) set */
+  userNameOf: (address: string) => string;
   commentOf: (address: string) => string;
   /** every entry, for the names panel and the exporter */
   list: () => NameEntry[];
 };
 
 const norm = (a: string) => a.toLowerCase().replace(/^0x/, "").padStart(16, "0");
+
+function pdbName(address: string): string {
+  try {
+    return pdbSymbolAt(BigInt("0x" + norm(address)))?.sym.name ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** address -> entry, rebuilt lazily when the list changes (lookups run per rendered row) */
+let indexed: NameEntry[] | null = null;
+let index = new Map<string, NameEntry>();
+function lookup(names: NameEntry[], address: string): NameEntry | undefined {
+  if (indexed !== names) {
+    index = new Map(names.map((n) => [norm(n.address), n]));
+    indexed = names;
+  }
+  return index.get(norm(address));
+}
 
 export const useNames = create<NamesStore>()(
   persist(
@@ -58,8 +83,23 @@ export const useNames = create<NamesStore>()(
         }),
       remove: (address) => set(`remove ${address}`, (s) => ({ names: s.names.filter((n) => norm(n.address) !== norm(address)) })),
       setNames: (entries) => set("replace names", () => ({ names: entries })),
-      nameOf: (address) => get().names.find((n) => norm(n.address) === norm(address))?.name ?? "",
-      commentOf: (address) => get().names.find((n) => norm(n.address) === norm(address))?.comment ?? "",
+      bulkRename: (entries, overwrite = false, label = "import names") => {
+        const cur = get().names;
+        const by = new Map(cur.map((n) => [norm(n.address), n]));
+        let n = 0;
+        for (const e of entries) {
+          const key = norm(e.address);
+          const prev = by.get(key);
+          if (!e.name.trim() || (prev?.name && !overwrite) || prev?.name === e.name) continue;
+          by.set(key, { address: key, name: e.name.trim(), comment: prev?.comment ?? "" });
+          n++;
+        }
+        if (n) set(label, () => ({ names: [...by.values()] }));
+        return n;
+      },
+      nameOf: (address) => lookup(get().names, address)?.name || pdbName(address),
+      userNameOf: (address) => lookup(get().names, address)?.name ?? "",
+      commentOf: (address) => lookup(get().names, address)?.comment ?? "",
       list: () => get().names,
       };
     },

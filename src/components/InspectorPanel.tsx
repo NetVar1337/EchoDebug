@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { request } from "@/lib/client";
-import { labelAddr, toBig } from "@/lib/hex";
+import { toBig } from "@/lib/hex";
+import { symAddr } from "@/lib/pdb";
 import { readBytes } from "@/lib/memory";
 import { decode, type ValueType } from "@/lib/analysis/values";
 import { useConn } from "@/store/conn";
@@ -49,7 +50,7 @@ export default function InspectorPanel() {
             <div className="panel-section">
               <div className="label">Selection</div>
               <div className="mono selectable">{sel}</div>
-              <div className="mono dim ellipsis">{labelAddr(sel, modules)}</div>
+              <div className="mono dim ellipsis">{symAddr(sel, modules)}</div>
               {rtti && <div className="pill accent ellipsis" title={rtti}>{rtti}</div>}
               {region && (
                 <div className="mono faint">

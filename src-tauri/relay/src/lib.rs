@@ -19,24 +19,39 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+pub mod a64;
+pub mod arch;
 pub mod assistant;
 pub mod auth;
 pub mod local;
 pub mod local_dbg;
 pub mod local_emu;
+pub mod local_emu_a64;
 pub mod local_emudbg;
 pub mod local_ext;
 pub mod local_more;
+pub mod local_threads;
 pub mod emux;
 pub mod lift;
 pub mod mcp;
 pub mod monitor;
+pub mod pdbinfo;
 pub mod symbols;
+pub mod sync;
+pub mod trace;
+pub mod trace_emu;
+pub mod trace_rec;
+pub mod unwind;
+#[cfg(windows)]
+pub mod win_threads;
 #[cfg(test)]
 mod fuzz;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Reply (code 2006) to `threads` / `stack` / `handles` while the Echo agent is the backend.
+pub const THREADS_ECHO_UNSUPPORTED: &str = "the Echo backend can't list threads, call stacks or handles: Echo's script API has no thread enumeration, thread context or handle access (they work on the local Linux backend and natively on Windows without Echo)";
 
 const NATIVE_VERBS: &[&str] = &[
     "ping",
@@ -177,6 +192,8 @@ struct Inner {
     policy: Mutex<mcp::Policy>,
     /// module / page monitors (monitor.rs)
     monitors: Mutex<monitor::Monitors>,
+    /// IDA / Ghidra / Binary Ninja sync hub (sync.rs)
+    sync: Mutex<sync::Hub>,
 }
 
 /// Shared relay state. Cheap to clone.
@@ -200,6 +217,7 @@ impl Relay {
             token: Mutex::new(None),
             policy: Mutex::new(mcp::Policy::default()),
             monitors: Mutex::new(monitor::Monitors::default()),
+            sync: Mutex::new(sync::Hub::default()),
         }))
     }
 
@@ -294,6 +312,17 @@ impl Relay {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        // AArch64 code behind the Echo backend: Echo's disassembler is x86-64 only, so the relay
+        // reads the bytes through `read` and decodes them itself (the local backend decodes arm64
+        // natively).
+        let a64_via_read = matches!(verb.as_str(), "disassemble" | "disasm_function")
+            && arch::from_req(&req) == Some(arch::Arch::Arm64)
+            && self.lock().agent.is_some();
+        if a64_via_read {
+            let mut v = self.a64_disassemble(&verb, &req).await;
+            v["id"] = orig;
+            return v;
+        }
         let kind = match verb.as_str() {
             "" => return error(orig, 2000, "missing type"),
             "status" => {
@@ -308,9 +337,10 @@ impl Relay {
                     .unwrap_or_default();
                 return json!({ "type": "processes_result", "id": orig, "success": true, "processes": processes });
             }
-            // PDB symbols from a symbol server (or a local file), any backend.
-            "pdb_symbols" => {
-                let r = tokio::task::spawn_blocking(move || symbols::handle(&req)).await;
+            // PDB symbols, types and lines: local files, symbol stores and servers, any backend.
+            "pdb_symbols" | "pdb_fetch" | "pdb_progress" | "pdb_image" | "pdb_types" | "pdb_type" | "pdb_lines" => {
+                let v2 = verb.clone();
+                let r = tokio::task::spawn_blocking(move || symbols::handle_verb(&v2, &req)).await;
                 let mut v = r.unwrap_or_else(|e| error(Value::Null, 3003, &e.to_string()));
                 v["id"] = orig;
                 return v;
@@ -332,6 +362,12 @@ impl Relay {
                 v["id"] = orig;
                 return v;
             }
+            // Time-travel traces: recorded from the emulator or ptrace, stored and queried here.
+            v if crate::trace_rec::VERBS.contains(&v) => {
+                let mut v = crate::trace_rec::handle(self, req).await;
+                v["id"] = orig;
+                return v;
+            }
             // Monitors built on modules/read, so they work with every backend.
             "module_monitor" | "page_monitor" | "module_timeline" | "page_monitor_list" => {
                 let mut v = match verb.as_str() {
@@ -340,6 +376,12 @@ impl Relay {
                     "module_timeline" => monitor::module_timeline(self),
                     _ => monitor::page_monitor_list(self),
                 };
+                v["id"] = orig;
+                return v;
+            }
+            // Disassembler sync hub (IDA / Ghidra / Binary Ninja on /sync); see sync.rs.
+            "sync_status" | "sync_config" | "sync_send" | "sync_log" => {
+                let mut v = self.sync_verb(&verb, &req);
                 v["id"] = orig;
                 return v;
             }
@@ -375,6 +417,35 @@ impl Relay {
                     "tools": TOOLS.len(),
                     "policy": self.policy().to_json(),
                 });
+            }
+            // Threads / call stacks / handles: Echo's script API has no thread enumeration,
+            // thread context or handle access, so the Echo agent cannot answer them. Without Echo the
+            // relay serves them itself (Linux local backend, or natively on Windows).
+            "threads" | "stack" | "handles" => {
+                let (ext_up, target_pid) = {
+                    let s = self.lock();
+                    (s.ext.is_some(), s.target.get("pid").and_then(Value::as_u64))
+                };
+                if ext_up {
+                    return error(orig, 2006, THREADS_ECHO_UNSUPPORTED);
+                }
+                #[cfg(windows)]
+                {
+                    let pid = req.get("pid").and_then(Value::as_u64).or(target_pid).map(|p| p as u32);
+                    let Some(pid) = pid else {
+                        return error(orig, 3001, "not attached: pass 'pid' or attach to a process first");
+                    };
+                    let mut r = tokio::task::spawn_blocking(move || win_threads::handle(&req, pid))
+                        .await
+                        .unwrap_or_else(|e| error(json!(0), 3003, &e.to_string()));
+                    r["id"] = orig;
+                    return r;
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = target_pid;
+                    Kind::Ext
+                }
             }
             v if v.starts_with(PROVIDER_PREFIX) => Kind::Provider,
             v if NATIVE_VERBS.contains(&v) => Kind::Agent,
@@ -413,11 +484,7 @@ impl Relay {
         } else {
             Value::Object(req)
         };
-        let sent = up_tx.send(frame.to_string());
-        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
-        if sent.is_err() {
-            return error(orig, 2004, "upstream disconnected");
-        }
+        // register the reply slot before sending: a fast upstream can answer before the insert
         self.lock().pending.insert(
             id,
             Pending {
@@ -427,6 +494,12 @@ impl Relay {
                 reply: tx,
             },
         );
+        let sent = up_tx.send(frame.to_string());
+        drop(up_tx); // a cloned sender held across the await would keep the old upstream alive
+        if sent.is_err() {
+            self.lock().pending.remove(&id);
+            return error(orig, 2004, "upstream disconnected");
+        }
 
         match tokio::time::timeout(self.0.timeout, &mut rx).await {
             Ok(Ok(reply)) => reply,
@@ -825,6 +898,56 @@ impl Relay {
         lift::Pages(pages)
     }
 
+    /// `disassemble` / `disasm_function` for AArch64 over any backend's `read`. Size 0 (and
+    /// `disasm_function`) decodes the function at `address`: up to the first ret, at most 64 KiB,
+    /// read page by page so a function near the end of a mapping still decodes.
+    async fn a64_disassemble(&self, verb: &str, req: &Map<String, Value>) -> Value {
+        let Some(addr) = req.get("address").and_then(Value::as_str).and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()) else {
+            return json!({ "type": "error", "code": 1002, "message": "invalid or missing arguments", "detail": "disassemble requires 'address'" });
+        };
+        let want = req.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let function_mode = want == 0 || verb == "disasm_function";
+        let read = |a: u64, n: u64| {
+            let mut r = Map::new();
+            r.insert("type".into(), json!("read"));
+            r.insert("address".into(), json!(format!("0x{a:x}")));
+            r.insert("size".into(), json!(n));
+            async move {
+                let v = Box::pin(self.request(Value::Object(r))).await;
+                v["data"].as_str().and_then(|h| (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()).filter(|b| !b.is_empty())
+            }
+        };
+        let mut v = if function_mode {
+            let mut code = Vec::new();
+            let mut a = addr;
+            while code.len() < 0x10000 {
+                let n = 0x1000 - (a & 0xfff);
+                let Some(chunk) = read(a, n).await else { break };
+                code.extend_from_slice(&chunk);
+                a += chunk.len() as u64;
+                if crate::a64::disasm(&chunk, 0).iter().any(|l| crate::a64::ends_function(&l.text)) {
+                    break;
+                }
+            }
+            if code.is_empty() {
+                return json!({ "type": "error", "code": 1005, "message": "memory read failed" });
+            }
+            local::a64_listing(&code, addr, true)
+        } else {
+            let n = want.clamp(1, 1_048_576);
+            match read(addr, n).await {
+                Some(code) if code.len() as u64 == n => local::a64_listing(&code, addr, false),
+                _ => return json!({ "type": "error", "code": 1005, "message": "memory read failed" }),
+            }
+        };
+        if verb == "disasm_function" {
+            let size: u64 = v["results"].as_array().map(|a| a.len() as u64 * 4).unwrap_or(0);
+            v["type"] = json!("disasm_function_result");
+            v["size"] = json!(size);
+        }
+        v
+    }
+
     /// lift_block / lift_trace / devirt. Traces come from `trace` (addresses) or from an emulated
     /// run (`start`, `end`, `max_insns`, `regs`), which the relay requests itself.
     async fn lift_verb(&self, verb: &str, req: &Map<String, Value>) -> Value {
@@ -957,6 +1080,12 @@ fn disasm_bytes(req: &Map<String, Value>) -> Value {
     let Some(bytes) = bytes.filter(|b| !b.is_empty() && b.len() <= 1 << 20 && hex.len().is_multiple_of(2)) else {
         return json!({ "type": "error", "code": 2000, "message": "disasm_bytes needs hex 'data' (up to 1 MiB)" });
     };
+    if arch::from_req(req) == Some(arch::Arch::Arm64) {
+        let mut v = local::a64_listing(&bytes[..bytes.len() & !3], addr, false);
+        v["type"] = json!("disasm_bytes_result");
+        v["complete"] = json!(bytes.len().is_multiple_of(4));
+        return v;
+    }
     let mut out = Vec::new();
     let mut off = 0usize;
     while off < bytes.len() {
@@ -1023,7 +1152,7 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
         "decrypt_strings" => vec![text("address",
             "Treat {{address}} as a string-decryption routine: call ui_xrefs_to to find its call sites, then ui_batch_decrypt to run the routine on the arguments set up at each site, and list the decrypted strings with their call sites.")],
         "deobfuscate_function" => vec![text("address",
-            "Deobfuscate the function at {{address}} (stop address: {{end}}). First call lift_block on it to see its blocks and any opaque predicates. Then call lift_trace with start={{address}} (and end if given): it emulates the function against live memory, keeps only the instructions that affect the final registers and memory, and simplifies the expressions (including MBA). Report the cleaned listing, the final register/memory effects as formulas, the opaque predicates, and a short C-like reconstruction.")],
+            "Deobfuscate the function at {{address}} (stop address: {{end}}). First call lift_block on it to see its blocks and any opaque predicates. Then call lift_trace with start={{address}} (and end if given): it emulates the function against live memory, keeps only the instructions that affect the final registers and memory, and simplifies the expressions (including MBA). If the function is control-flow flattened (one dispatcher block that every block returns to, switching on a state variable), call unflatten on it: it rebuilds the original graph and returns its pseudocode; decompile gives the pseudocode of an ordinary function. Report the cleaned listing, the final register/memory effects as formulas, the opaque predicates, and a short C-like reconstruction.")],
         "devirtualize" => vec![text("address",
             "Treat {{address}} as the entry of a virtualized routine. Call devirt with start={{address}} and max_insns={{max_insns}} (default 200000). From the result: name the dispatcher and the VIP register, give each handler a mnemonic from its lifted effects (e.g. vpush, vadd, vload, vjmp), then rewrite virtual_trace as a virtual-instruction listing and summarize what the virtual program computes. If no dispatcher is found, raise max_insns or check that emulation reached the VM loop (see 'emulation').")],
         _ => vec![json!({ "role": "user", "content": { "type": "text", "text": format!("Run the {name} workflow.") } })],
@@ -1150,6 +1279,22 @@ async fn client_ws(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     ws.on_upgrade(move |s| relay.client(s))
+}
+
+/// `/sync`: disassembler plugins (IDA, Ghidra, Binary Ninja). Token-protected like `/client`.
+async fn sync_ws(
+    State(relay): State<Relay>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !origin_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !auth::authorized(relay.token().as_deref(), &headers, query.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    ws.on_upgrade(move |s| relay.sync_socket(s))
 }
 
 fn upstream_ws(relay: Relay, kind: Kind, headers: &HeaderMap, ws: WebSocketUpgrade) -> Response {
@@ -1300,6 +1445,7 @@ pub fn router(relay: Relay) -> Router {
         .route("/agent", get(agent_ws))
         .route("/ext", get(ext_ws))
         .route("/client", get(client_ws))
+        .route("/sync", get(sync_ws))
         .route("/health", get(health))
         .route("/mcp", post(mcp).get(mcp_events))
         .with_state(relay)

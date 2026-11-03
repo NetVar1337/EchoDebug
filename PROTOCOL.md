@@ -22,6 +22,7 @@ are lowercase hex strings without a prefix (`"4883ec28"`). Sizes and counts are 
 | `/agent` | Echo's native memory server (`process::open_socket(url)`) | Relay is the *requester*: it sends Echo native requests and receives `*_result` / `error` frames. One connection at a time; a new one replaces the old. |
 | `/ext` | `echo_debug.as` via `ws::connect` | Relay sends ext requests and receives replies + id-less events. One at a time; a new one replaces the old. |
 | `/client` | UI, scripts, anything | Sends requests `{ "type", "id", ... }`, receives replies with the same `id`, plus broadcast events. Many clients. |
+| `/sync` | IDA / Ghidra / Binary Ninja plugins (`integrations/`) | Disassembler sync, token-protected like `/client`. See [Disassembler sync](#disassembler-sync-sync). Many peers. |
 | `POST /mcp` | MCP clients | Streamable HTTP, JSON responses only (no SSE). Tools are defined in `src/lib/tools.json`. |
 | `GET /health` | anyone | `200 {"ok":true,"version":"x.y.z"}` |
 
@@ -81,9 +82,57 @@ plus the Linux-only verbs below. Only `reopen_socket` and the conditional alerts
 | `dbg_continue` / `dbg_pause` | – | `state` (steps over a breakpoint under rip first) |
 | `dbg_step` | `tid?` | `tid`, `from`, `address`, `regs`. A thread blocked in a system call only finishes the step when the call returns: the step is cancelled with an explanation instead of hanging |
 | `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base) |
+| `dbg_all_regs` | – | `threads:[{tid, regs}]`, `was_running` (stops the session for the read if it was running, then resumes) |
+
+**Architectures.** x86-64 is the default. `disassemble`, `disasm_function` and `disasm_bytes` take
+`arch` (`"x86_64"` | `"arm64"`, aliases `aarch64`, `x64`, …). The lines keep their shape
+(`address`, `length` = 4, `bytes`, `text`); PC-relative operands are printed as absolute addresses
+(`bl 0x210168`, `cbz x9, 0x210194`, `adrp x20, 0x220000`) and an `add`/`ldr`/`str` that completes an
+`adrp` pair ends in `  ; 0x<resolved address>`; undecodable words read `.inst 0x…`; the reply adds
+`"arch":"arm64"`. With an Echo upstream the relay serves `arch:"arm64"` itself (Echo's disassembler
+is x86-64 only): it reads the code with `read` and decodes it (size 0 / `disasm_function`: page by
+page up to the first ret, at most 64 KiB). The local backend detects the architecture from the
+module's ELF header when `arch` is omitted, reports `arch` per module in `modules_result` and on the
+attach target, and `emulate` with `arch:"arm64"` (or a start address inside an AArch64 module) runs
+Unicorn's AArch64 CPU: `regs` takes/returns `x0`…`x30` (`fp`, `lr` accepted), `sp`, `pc`, `nzcv`,
+`tpidr_el0`; `v` (`{"v0":"<32 hex>"}`) or `simd:true` adds `v0`…`v31` to the reply; `x30` starts at
+`end` so a `ret` ends the run; `mem_log` entries and `faults` carry `pc` instead of `rip`; `stubs`,
+`layers`, `trace_regs` and `xmm` are x86-64 only and refused. There is no ARM64 debugger backend
+(`dbg_*` is x86-64 ptrace), and the emulated debugger (`emu_*`) and lifter are x86-64 only.
 
 Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause", "tid", "address", "regs", "slot?", "watch?", "signal?" }`
 and `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`.
+
+### Threads, call stacks, handles (relay)
+
+Echo's script API has no thread enumeration, thread context or handle access, so these verbs are
+served by the relay: on the Linux local backend (`local_threads.rs`), and on Windows when no Echo agent
+is connected (`win_threads.rs`, `pid` argument or the attached target). **While the Echo agent is
+connected they fail with code `2006`** ("the Echo backend can't list threads, call stacks or handles").
+
+| verb | request | reply |
+|---|---|---|
+| `threads` | `stacks?` (bool, default false), `registers?` (default true; false lists without stopping anything), `max_frames?` (default 64, ≤ 512), `pid?` (Windows) | `pid`, `platform` (`linux`\|`windows`), `registers_from` (`ptrace`\|`debugger`\|`GetThreadContext`), `threads:[{tid, name?, main?, state, state_name, wait?, priority, nice? \| base_priority?, time_ms, start?, start_label?, start_source?, teb? (Windows), tls? (Linux fs_base), rip?, rsp?, registers?, registers_error?, suspend_count? (Windows), frames?}]` |
+| `stack` | `tid` (Linux default: the main thread), `max_frames?`, `pid?` (Windows) | `tid`, `registers`, `registers_from`, `frames` |
+| `handles` | `pid?` (Windows) | `handles:[…]`: Linux `{handle (fd), type (file\|socket\|pipe\|device\|eventfd\|epoll\|…), name (link target), position, flags:[O_*]}` from `/proc/<pid>/fd` + `fdinfo`; Windows `{handle, type (object type name), name?, access, object, attributes}` from `SystemExtendedHandleInformation`, `truncated` |
+
+A frame is `{index, address, sp, module, offset, symbol, symbol_offset, method, guessed}`. `method` says
+how the frame was recovered from the one below it: `context` (the thread's registers), `pdata` (PE
+`.pdata` + UNWIND_INFO, interpreted like `RtlVirtualUnwind`: all UWOP codes, chained info, machine
+frames, the prolog offset and `ret` / tail-call epilogs), `leaf` (PE function without unwind data),
+`cfi` (ELF `.eh_frame` through `PT_GNU_EH_FRAME`, DWARF CFA programs and expressions), or the
+fallbacks `frame-pointer` and `stack-scan` (a return address preceded by a `call`), which set
+`guessed: true`. Symbols are the nearest export (PE, bounded by the `.pdata` function) or ELF
+`.symtab`/`.dynsym` entry; the app shows the user's names first.
+
+How registers are read: on Linux every thread is `PTRACE_SEIZE`d, `PTRACE_INTERRUPT`ed, read with
+`GETREGS`, unwound while still stopped, then detached (signals that arrived meanwhile are re-delivered);
+while a `dbg_*` session owns the threads, the registers come from it (`dbg_all_regs`). On Windows each
+thread is `SuspendThread`ed, read with `GetThreadContext`, unwound and `ResumeThread`ed. Thread start
+addresses: Windows `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and the TEB from
+`ThreadBasicInformation`; Linux the entry point (`AT_ENTRY`) for the main thread and, for the others,
+the outermost frame below glibc's `start_thread` / `clone3` on the unwound stack. Nothing is written to
+the target.
 
 Requests that get no reply within **120 s** fail with code `2003` (`"timed out"`). If an upstream
 disconnects, all its in-flight requests fail with code `2004` (`"upstream disconnected"`).
@@ -253,6 +302,54 @@ from the changed registers and the memory left behind (stack slots below the fin
 Instructions outside the model turn their outputs into fresh unknowns and are counted in `unsupported`.
 The local emulators map a zeroed TLS block for `fs:`/`gs:` (`fs_base`/`gs_base` are settable registers).
 
+### Time-travel traces (relay)
+
+Recorded and stored by the relay for every backend (`trace.rs`, `trace_rec.rs`, `trace_emu.rs`). A trace is
+one thread's run, step by step: step `i` executed the instruction at `pc(i)`, changed some registers and
+read / wrote memory (reads keep the bytes read, writes the bytes before and after). **Position** `p`
+(0..=`steps`) is the state *before* step `p`; `p == steps` is the end. Registers: rax…r15, rip, eflags,
+fs_base, gs_base. Trace ids travel as `trace` in requests and `trace_id` in replies (the relay owns `id`).
+
+| verb | request | reply |
+|---|---|---|
+| `trace_record` | `source` (`emu` default \| `ptrace`), `max_steps?` (10000, ≤ 5M), `until?` (address), `max_mb?` (64, ≤ 1024), `keyframe?` (256), `name?`, `save?` (true), `tid?` (ptrace), `start?`/`code?`/`regs?`/`write?` (emu: `emu_start` first), `timeout_us?` | `trace:{trace_id, name, source, steps, stop_reason (count, until, returned, size limit, cancelled, fault, breakpoint, signal …), truncated, keyframe, unique_pcs, accesses, writes, initial_regs, final_regs, saved}` plus, for `emu`, the session state as `emu_*` replies carry it |
+| `trace_cancel` / `trace_status` | — | `cancelling` / `recording`, `steps` |
+| `trace_list` | — | `traces:[summary + file_size]`, `current`, `dir` |
+| `trace_info` | `trace?` | the summary (default the current trace; the list when there is none) |
+| `trace_query` | `trace?`, `kind`, `pos?` (default the end), kind arguments | see below |
+| `trace_export` / `trace_import` | `trace?` / `data` (base64 `.edt`), `name?` | `data`, `size` / the imported summary |
+| `trace_delete` | `trace` | `removed` |
+
+`trace_query` kinds: `reg_at` (`reg?` → `value`, else `regs`), `mem_at` (`address`, `size` ≤ 64 KiB → `data`, hex
+with `??` for bytes the trace never touched; a byte's value is the newest write before `pos`, else what its
+first access saw), `last_write` (`address`, `size?`, `changed_only?` (true: skip writes that stored the same
+bytes) → `write:{step, pc, address, size, old, new, text}` or null), `writes_to` / `reads_of` (`address`, `size?`,
+`limit?` → `writes` / `reads`, `total`), `executions_of` (`address` → `steps`, `total`), `seek` (`address`,
+`direction` forward\|back → the next / previous `step` from `pos`), `reg_series` (`reg`, `from?`, `to?`, `max?` →
+`points:[[pos, value]]`, every change or a sampled step function), `step` (`pos` → `pc`, `bytes`, `text`, `changes`,
+`accesses`, `regs_before`), `steps` (`from`, `count` ≤ 5000 → listing), `taint` (`reg`, or `address`+`size`,
+`max_hops?` → `hops:[{id, parent, step, pc, text, loc, value, kind, sources}]`: the producer of the value, then
+the producers of its sources; `kind` `mov` / `arith` / `const` (immediate, `xor r,r`) / `initial` (there before the
+trace) / `unmodeled` (an instruction the walk does not follow)), `touched` (merged ranges with read/write counts).
+
+Sources. **emu**, local backend: the Emu Debugger's Unicorn thread records with code and memory hooks
+(`emu_record`; breakpoints, watchpoints, stand-ins and `cancel` keep working). **emu**, Windows agent: the relay
+drives the agent's session with `emu_step {count:1}` and reads each instruction's memory operands (decoded with
+iced-x86 from the step's registers) with `emu_read` before and after: same trace, a few round trips per
+instruction. **ptrace** (Linux, after `dbg_attach`): `dbg_record` on the debugger thread single-steps the focused (or
+`tid`) thread the same way, stepping over int3 breakpoints with their original bytes; writes the kernel makes
+during a system call are not seen, and a thread blocked in a call ends the recording. While recording the relay
+broadcasts `{event:"trace_progress", steps, max_steps}` every 250 ms and `{event:"trace_done", trace_id, steps,
+stop_reason}` at the end. MCP: `trace_record` is stateful and gated by the ask / read-only policies (the ptrace
+source runs the real thread); `trace_info` and `trace_query` are read-only.
+
+**`.edt` file format** (little-endian, LEB128 varints, signed values zigzag): `"EDTRACE1"`, version `1`,
+JSON header (length-prefixed: name, source, created_ms, pid, tid, stop_reason, truncated, steps, keyframe,
+regs), the initial register file (20 × u64), the step count, then per step: Δpc (signed), a register change
+mask, `new XOR old` for each changed register, the access count and per access `len << 1 | write`, Δaddress
+(signed), the bytes (old, plus new for writes); then the instruction bytes per pc, the keyframes (full register
+file every `keyframe` steps, XOR-chained; checked against the steps on load) and an FNV-1a 64 checksum.
+
 ### Relay monitors
 
 Built on `modules` / `read`, so they work with every backend:
@@ -263,6 +360,28 @@ Built on `modules` / `read`, so they work with every backend:
 | `module_timeline` | — | `enabled`, `entries` (last 500 events) |
 | `page_monitor` | `address`, `size?`, `label?`, `interval_ms?`, `enabled?` | `page_changed` events (`address`, `size`, `label`, `count`, `pages`), FNV-1a per 4 KiB page; 64 MiB total |
 | `page_monitor_list` | — | `entries:[{address,size,label,interval_ms,changes,last_change}]` |
+
+### PDB symbols (relay)
+
+Relay-local, any backend; blocking work runs on a worker thread. `key` is the symbol-store key of the
+image's CodeView (RSDS) record: GUID (32 hex digits, no dashes) followed by the age in hex.
+
+| verb | request | reply |
+|---|---|---|
+| `pdb_symbols` | `pdb` (file name) + `key`, or `path`; `symbol_path?` (`_NT_SYMBOL_PATH` syntax), `use_env?` (default true: also `_NT_SYMBOL_PATH` / `_NT_ALT_SYMBOL_PATH`), `image_path?` (its folder is searched), `servers?`, `download?` (default **false**), `allow_mismatch?`, `max?` | `path`, `source` (`symbol path` / `cache` / `server` / `path` / `mismatch`), `guid`, `age`, `key`, `expected_key`, `matched`, `machine`, counts (`count`, `functions`, `types`, `lines`, `files`), `tried`, `symbols:[{rva,name,kind,size,type?,ret?,cc?,params?:[{name,type,size}],mangled?}]`. Not found locally: `success:false, found:false, code:3004`, `tried`, `mismatches:[{path,key}]` |
+| `pdb_fetch` | as `pdb_symbols` (name + key) | a matching local copy: `state:"done", path`; else starts a background download: `state:"downloading", job` |
+| `pdb_progress` | — | `jobs:[{job,pdb,key,state:"downloading" \| "done" \| "error",done,total,url,path,error,seconds}]` |
+| `pdb_image` | `image_path` (a PE on disk) | `pdb`, `pdb_path`, `guid`, `age`, `key` |
+| `pdb_types` | `path`, `filter?`, `max?` | `total`, `types:[{index,name,kind,size,fields or target}]` (struct/class/union/interface/enum/typedef) |
+| `pdb_type` | `path`, `name` or `index`, `depth?` | `index`, `name`, `kind`, `size`, `fields:[{name,offset,size,type,type_index,kind:"member" \| "base" \| "vtable",category,scalar?,udt?,points_to?,count?,elem?,bit_pos?,bit_len?}]`, enum `values`/`underlying`, `nested:[…same…]` (types embedded by value), `text` |
+| `pdb_lines` | `path`, `rva`, `size?` | `lines:[{rva,size,file,line}]`, `function` (the symbol containing `rva`) |
+
+Lookup order: the image's folder, the symbol path's folders (`<dir>/<pdb>` and `<dir>/<pdb>/<key>/<pdb>`),
+its stores and the app cache (`<config>/EchoDebug/symbols`) in store layout, each also as a compressed
+`<pdb minus last char>_` cabinet (expanded into the download store). Every candidate's GUID/age is checked.
+Downloads try `<server>/<pdb>/<key>/<pdb>`, then the `.pd_` name, and go to the first `srv*`/`cache*` store of
+the symbol path, else the app cache. Servers: `servers`, then the symbol path's `srv*` URLs, then
+`ECHODEBUG_SYMBOL_SERVERS` (`;`-separated), else `https://msdl.microsoft.com/download/symbols`.
 
 ## Provider verbs (`ui_*`) and authentication
 
@@ -285,6 +404,43 @@ Annotation verbs (MCP tools without the `ui_` prefix) read and change the app's 
 | `ui_revert_patch` (`revert_patch`) | `patch_id` | `patch_id`, `address`, `restored` (the app writes `before` back via `write`, then marks the patch reverted) |
 | `ui_list_signatures` (`list_signatures`) | – | `signatures:[{id,name,module,ida,address,hits,note}]` |
 
+Decompiler verbs (read-only; the function is disassembled through `disassemble`, bounded by `.pdata`, switch tables
+read from the module image; x86-64 only, a function in an AArch64 module is refused with an error):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_decompile` (`decompile`) | `address`, `unflatten?`, `with_addresses?`, `max_insns?` (default 8000) | `entry`, `signature`, `variables:[{name,type,location,argument,fields?:[{offset,size}]}]`, `pseudocode` (text), `lines?:[{address,text}]`, `unflatten?` (as below), `truncated` |
+| `ui_unflatten` (`unflatten`) | `address`, `with_pseudocode?` (default true), `max_insns?` | `flattened`, `dispatcher`, `state` (variable name), `dispatcherBlocks`, `states`, `recovered:[{block,next:[address],via:"const"\|"select"}]`, `unresolved:[{block,reason}]`, `note`, `original:{blocks,edges}`, `recovered_cfg?:{blocks,edges:[{from,to,kind,case?}]}`, `pseudocode?` |
+
+Prototypes: `src/lib/analysis/prototypes.ts` exposes `registerPrototypeProvider(id, (address, name) => Prototype | null,
+{ fallback? })`; a `Prototype` is `{ name?, returns?, args?: [{ name?, type? }], variadic?, noreturn? }`. Providers are asked
+in order (the app registers `pdb` first: the prototypes of a loaded PDB's function symbols), then a built-in table of common C runtime / Win32 functions, then fallback providers (the app registers one with the
+argument counts it reads from the callees' own code).
+
+Module tables read from the loaded image (every backend):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_tls_callbacks` (`tls_callbacks`) | `module?` | `directory` (raw data range, index, callbacks array), `callbacks:[{index,address,label,name?,section,executable,inModule}]` |
+| `ui_exception_handlers` (`exception_handlers`) | `module?`, `limit?` (default 2000) | `functions_with_unwind_info`, `chained_fragments`, `handler_routines:[{address,name,kind,functions}]`, `functions:[{function,end,flags,handler,handler_name,kind,handler_data,scopes?:[{try_begin,try_end,kind:"except"\|"finally",filter?,target?,finally?}],scopes_heuristic?}]`, `vectored_handlers` (why they are not listed) |
+
+Vectored exception handlers are not listed: ntdll keeps them in the private `LdrpVectorHandlerList`
+with pointers encoded by `RtlEncodePointer` (a per-process cookie), so they cannot be enumerated reliably
+without undocumented internals.
+
+Heap explorer verbs (read-only; the walk is cached per process, `refresh:true` walks again):
+
+| Verb (tool) | Args | Result |
+|---|---|---|
+| `ui_heaps` (`heaps`) | `refresh?` | `platform` (`glibc`/`windows`), `source` (how the heaps were found), `version?`, `heaps:[{id,kind,label,address,committed,reserved?,in_use,in_use_count,free,free_count,largest_free,fragmentation,chunks,counters,ranges,notes}]`, `bins:[{heap,kind,index,chunk_size,length,count?,total?,owner?,error?}]` (non-empty only), `errors:[{heap,address,message}]`, `notes`, `truncated` |
+| `ui_heap_chunks` (`heap_chunks`) | `heap?`, `state?` (a state, `free` or `used`), `min_size?`, `max_size?`, `offset?`, `limit?` (≤ 2000, default 200), `rtti?`, `refresh?` | `total`, `offset`, `limit`, `next_offset`, `chunks:[{address,user,size,user_size,state,flags,heap,bin?,note?,preview?,type?}]` |
+| `ui_heap_find` (`heap_find`) | `address`, `refresh?` | `found`, `chunk`, `offset_in_chunk`, `offset_in_user`, `heap`, `bins:[{kind,index,position,length}]` |
+
+Chunk states: `in-use`, `free`, `top`, `fencepost`, `mmapped`, `internal` (the allocator's own, e.g.
+`tcache_perthread_struct`), `tcache`, `fastbin`, `unsorted`, `smallbin`, `largebin` (glibc), `lfh` (a backend
+block holding an LFH subsegment; `note` has its busy count) and `large` (VirtualAlloc / segment-heap large
+allocations). Everything is read through the `read` verb, so the Windows heaps work on the Echo backend.
+
 `/client` and `/mcp` require the relay token: `Authorization: Bearer <token>` or `?token=<token>` (browser
 WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/EchoDebug/relay-token`
 (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere; created with mode 0600);
@@ -292,6 +448,35 @@ WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/Ech
 stay open (Echo cannot send headers; those endpoints only receive requests). The desktop app can
 regenerate the stored token (Settings or the MCP Server panel); the running relay switches to it at once
 (`Relay::set_token`), already-open sockets stay connected, and MCP clients must be re-added.
+
+## Disassembler sync (`/sync`)
+
+Disassembler plugins connect to `/sync` with the relay token (`Authorization: Bearer` or `?token=`;
+browser origins are refused) and send `hello` first: `{ "type":"hello", "tool":"ida"|"ghidra"|"binja",
+"version", "file", "protocol":1, "modules":[{ "name", "base", "size" }] }` → `{ "type":"hello_result",
+"peer", "protocol":1, "directions" }`. Then, both ways, `cursor` / `name` / `comment` frames with `module`
+(file name), `rva` (`"0x…"`) and `name` / `comment` (empty removes); the relay also sends `types`
+(`decls`, `names`) and `config` (`directions`); plugins may send `modules` and `ping` (→ `pong`). Frames
+from the relay carry `from`. Details and the plugins: [integrations/README.md](integrations/README.md).
+
+The relay keeps the hub state (sync.rs): direction toggles, a module map (disassembler file name → live
+module), the current value of every synced name and comment with its writer (**last writer wins**; a
+write that replaces another side's value is logged as a conflict; a write equal to the current value
+is dropped, as is a cursor equal to the last one, so applied changes do not echo), and a 300-entry log.
+
+App verbs on `/client` (relay-local):
+
+| verb | request | reply |
+|---|---|---|
+| `sync_status` (MCP `sync_status`, read-only) | `log_limit?` (default 100, max 300) | `protocol`, `peers:[{id,tool,version,file,modules:[{name,base,size,live}],connected_at,last_seen}]`, `directions`, `map`, `cursor:{module,rva,from,ts}`, `marks`, `log:[{seq,ts,kind,dir:"in"|"out"|"conflict"|"info",from,module,rva,text}]` |
+| `sync_config` | `directions?:{cursor_in,cursor_out,names_in,names_out,comments_in,comments_out,types_out}`, `map?:{toolModule: liveModule ("" removes)}`, `replace_map?` | the status (log omitted) |
+| `sync_send` | `kind: cursor\|name\|comment\|types`, `module`, `rva`, `name` / `comment` / `decls`+`names` | `peers` (tools reached) |
+| `sync_log` | `text`, `kind?`, `dir?` (`conflict`), `module?`, `rva?` | — (adds an entry, e.g. a name the app overwrote) |
+
+`*_in` is disassembler → EchoDebug, `*_out` EchoDebug → disassemblers (tool-to-tool forwarding counts as
+out). Broadcasts to every `/client`: `{ "type":"sync_event", "kind":"cursor"|"name"|"comment", "module",
+"rva", "name"|"comment", "from" }`, `{ "type":"sync_event", "kind":"log", "entry" }`, and `kind:"peers"` /
+`"config"` when those change. `sync_event` frames are not MCP notifications.
 
 ## In-app assistant (desktop app, not the relay)
 
@@ -326,13 +511,15 @@ Supported methods: `initialize` (advertises `tools`, `prompts`, `resources` (wit
 `resources/subscribe`/`unsubscribe`, `completion/complete`, `logging/setLevel`.
 
 **Tools** carry `title`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
-`openWorldHint`, derived from the verb) and an object `outputSchema`; results add `structuredContent`
+`openWorldHint`, derived from the verb; `ui_load_symbols` is the one open-world tool: it may download from
+the symbol servers, while `ui_pdb_symbols`, `ui_pdb_types`, `ui_pdb_type` and `ui_pdb_lookup` only read local
+copies and `ui_import_pdb_type` changes the Structs catalog) and an object `outputSchema`; results add `structuredContent`
 (the reply object) next to the text block.
 
 **Call policy.** The app pushes `{ "type":"mcp_policy", "mode":"allow"|"ask"|"readonly", "allow":[tool],
 "deny":[tool], "audit":bool }` (omitted fields keep their value; the reply echoes the policy and
 `audit_path`). Deny and allow lists apply to every tool. `ask` and `readonly` gate the calls that change
-the target (`write`, `freeze`, `ui_revert_patch`) and `dump`: `readonly` refuses them, `ask` sends the app window a
+the target (`write`, `freeze`, `ui_revert_patch`), `dump` and `trace_record` (its ptrace source runs the real thread): `readonly` refuses them, `ask` sends the app window a
 `ui_approve` provider call (`tool`, `verb`, `arguments` → `approved: bool`) and refuses when no window
 answers. Refusals are tool errors with code `4003`; the call log records `outcome: ok | error | denied`.
 With `audit` on, every call is appended to `<config>/EchoDebug/mcp-audit.jsonl`; `mcp_audit_export` returns
@@ -378,7 +565,8 @@ The tool set covers the whole backend: process control (`status`, `list_processe
 `detach`, `is_alive`), memory (`read_memory`, `read_memory_batch`, `write_memory`, `query_region`,
 `memory_regions`), analysis (`disassemble`, `enumerate_functions`, `signature_scan`,
 `signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
-`resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
+`resolve_export`, `peb_walk`), threads (`list_threads`, `thread_stack`, `list_handles`,
+`tls_callbacks`, `exception_handlers`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
 `value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
 watching (`watch_add`, `watch_remove`, `list_watched`), alerts (`alert_add`,
 `alert_remove`, `alert_list`),

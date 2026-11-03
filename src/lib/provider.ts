@@ -40,13 +40,16 @@ import { disassembleIl, formatIl, userStringRefs } from "./analysis/cil";
 import { findIat } from "./analysis/unpack";
 import { diffFunctions } from "./analysis/bindiff";
 import { mapPeFile, parseRuntimeFunctions } from "./analysis/pe";
-import { loadPdbSymbols, readModuleFileBytes } from "./modfile";
+import { readModuleFileBytes } from "./modfile";
+import { ensurePdb, importPdbType, loadPdb, pdbType, pdbTypes, protoText, sourceLines, symAddr } from "./pdb";
+import { pdbFunctionAt } from "@/store/symbols";
 import { batchDecrypt, exportIndex, oepCandidates } from "./unpacklive";
 import { functionsFromImage } from "./diffinput";
 import { parseSignature, authenticodeHash } from "./analysis/authenticode";
 import { invoke } from "@tauri-apps/api/core";
 import { guessFields } from "./analysis/structguess";
 import { toCpp } from "./analysis/struct";
+import { pdbDecl } from "./analysis/pdbtypes";
 import { toBinja, toC, toGhidra, toIdaPython, toReclassXml } from "./analysis/typeexport";
 import { pointerClassifier } from "./ptrkind";
 import { useTypes } from "@/store/types";
@@ -60,6 +63,11 @@ import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
+import { analyzeCallees, directCallees, liveOptions, loadFunction, notDecompilable, type LiveFunction } from "./decomplive";
+import { decompile, irGraph, type Decompiled } from "./analysis/decompile";
+import { useDecomp, varTypesOf } from "@/store/decomp";
+import { heapHandlers } from "./heaptools";
+import { sehForMcp, tlsReport } from "./threadslive";
 
 export type Args = Record<string, unknown>;
 export type Handler = (args: Args) => Promise<unknown>;
@@ -199,12 +207,12 @@ provide("ui_make_signature", async (args) => {
   const a = addrArg(args);
   const m = moduleOf(a, modules());
   if (!m) throw new Error("address is outside every module");
-  const r = await request<{ results: { address: string; length: number; bytes: string; text: string }[] }>("disassemble", { address: fmtAddr(a), size: 0x200 });
+  const r = await request<{ results: { address: string; length: number; bytes: string; text: string }[]; arch?: string }>("disassemble", { address: fmtAddr(a), size: 0x200 });
   const count = async (ida: string) => {
     const hits = await request<{ results: string[] }>("sig_scan_ida", { pattern: ida, module: m.name, find_all: true }, true);
     return hits.results?.length ?? 0;
   };
-  const sig = await makeSignature(r.results, count);
+  const sig = await makeSignature(r.results, count, 5, r.arch);
   if (!sig) throw new Error("no unique signature within 512 bytes");
   return { address: fmtAddr(a), module: m.name, ida: toIda(sig.pattern), ...toCode(sig.pattern), hits: sig.hits };
 });
@@ -261,6 +269,56 @@ provide("ui_cfg", async (args) => {
     entry: fmtAddr(cfg.entry), truncated: cfg.truncated,
     blocks: cfg.blocks.map((b) => ({ start: fmtAddr(b.start), end: fmtAddr(b.end), terminator: b.terminator, instructions: args.with_text ? b.lines.map((l) => `${l.address}  ${l.text}`) : b.lines.length })),
     edges: cfg.edges.map((e) => ({ from: fmtAddr(e.from), to: fmtAddr(e.to), kind: e.kind, ...(e.label ? { case: e.label } : {}) })),
+  };
+});
+
+/** Decompiles the function at `address` against the live target (shared by ui_decompile / ui_unflatten). */
+async function decompileAt(args: Args, unflatten: boolean): Promise<{ fn: LiveFunction; d: Decompiled }> {
+  const a = addrArg(args);
+  const fn = await loadFunction(a, modules(), num(args, "max_insns", 8000, 50000));
+  const why = notDecompilable(fn);
+  if (why) throw new Error(why);
+  const abi = useConn.getState().backend === "local" ? "sysv" : "win64";
+  const opts = () => liveOptions(fn, { abi, userName: useNames.getState().nameOf, types: useTypes.getState().types, varTypes: varTypesOf(useDecomp.getState().varTypes, fmtAddr(a)), unflatten });
+  let d = decompile(fn.structure, opts());
+  // callee argument counts come from the callees' own code; decompile again once they are known
+  if (await analyzeCallees(directCallees(d.ir), modules(), abi).catch(() => 0)) d = decompile(fn.structure, opts());
+  return { fn, d };
+}
+
+const pseudoText = (d: Decompiled) => d.lines.map((l) => "    ".repeat(l.indent) + l.text).join("\n");
+
+provide("ui_decompile", async (args) => {
+  const { fn, d } = await decompileAt(args, args.unflatten === true);
+  return {
+    entry: fmtAddr(fn.cfg.entry),
+    signature: d.signature,
+    variables: d.vars.map((v) => ({ name: v.name, type: v.type, location: v.loc, argument: v.arg, ...(v.fields.length ? { fields: v.fields.map((f) => ({ offset: `0x${f.offset.toString(16)}`, size: f.size })) } : {}) })),
+    pseudocode: pseudoText(d),
+    ...(args.with_addresses ? { lines: d.lines.filter((l) => l.addr).map((l) => ({ address: l.addr, text: l.text })) } : {}),
+    ...(d.report ? { unflatten: d.report } : {}),
+    truncated: fn.cfg.truncated,
+  };
+});
+
+provide("ui_unflatten", async (args) => {
+  const { fn, d } = await decompileAt(args, true);
+  const r = d.report!;
+  const g = irGraph(d.ir);
+  const addrOf = new Map(g.blocks.map((b) => [b.id, fmtAddr(b.start)]));
+  return {
+    entry: fmtAddr(fn.cfg.entry),
+    ...r,
+    original: { blocks: fn.cfg.blocks.length, edges: fn.cfg.edges.length },
+    ...(r.flattened
+      ? {
+          recovered_cfg: {
+            blocks: g.blocks.length,
+            edges: g.edges.map((e) => ({ from: addrOf.get(e.from), to: addrOf.get(e.to), kind: e.kind, ...(e.label ? { case: e.label } : {}) })),
+          },
+        }
+      : {}),
+    ...(args.with_pseudocode === false ? {} : { pseudocode: pseudoText(d) }),
   };
 });
 
@@ -390,6 +448,10 @@ provide("ui_pe_details", async (args) => {
   return out;
 });
 
+// TLS callbacks and .pdata exception handlers (threadslive.ts / analysis/seh.ts)
+provide("ui_tls_callbacks", async (args) => tlsReport(pickModule(args)));
+provide("ui_exception_handlers", async (args) => sehForMcp(pickModule(args), num(args, "limit", 2000, 20000)));
+
 provide("ui_resources", async (args) => {
   const { m, img } = await moduleImage(args);
   const r = summarizeResources(img);
@@ -407,6 +469,7 @@ provide("ui_approve", (args) => new Promise((resolve) => {
 
 // Names, comments, the patch journal and saved signatures (MCP tools list_names, set_name, …).
 for (const [verb, h] of Object.entries(annotationHandlers)) provide(verb, h);
+for (const [verb, h] of Object.entries(heapHandlers)) provide(verb, h);
 
 // Resource templates and completion (echodebug://names, memory/{address}/{size}, disasm/{address}, module/{name}/exports).
 provide("ui_names", async () => ({
@@ -501,7 +564,60 @@ provide("ui_source_netvars", async (args) => {
 
 provide("ui_load_symbols", async (args) => {
   const m = pickModule(args);
-  return { module: m.name, ...(await loadPdbSymbols(m, { overwrite: Boolean(args.overwrite) })) };
+  // this tool is the network one (openWorld): it may ask the symbol servers unless download:false
+  const e = await loadPdb(m, { applyNames: Boolean(args.apply_names), overwrite: Boolean(args.overwrite), download: args.download !== false, allowMismatch: Boolean(args.allow_mismatch) });
+  if (e.status !== "loaded") throw new Error(`${m.name}: ${e.error ?? e.status}${e.tried?.length ? ` (looked in: ${e.tried.slice(0, 12).join("; ")})` : ""}`);
+  return { module: m.name, pdb: e.pdb, path: e.path, source: e.source, expected_key: e.expected, key: e.key, guid: e.loadedGuid, age: e.loadedAge, matched: e.matched, ...e.counts };
+});
+
+provide("ui_pdb_symbols", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  const f = typeof args.filter === "string" ? args.filter.toLowerCase() : "";
+  const kind = typeof args.kind === "string" ? args.kind : "";
+  const b = toBig(m.base);
+  const list = e.symbols
+    .filter((s) => (!kind || s.kind === kind) && (!f || s.name.toLowerCase().includes(f) || (s.mangled ?? "").toLowerCase().includes(f)))
+    .map((s) => ({ address: fmtAddr(b + BigInt(s.rva)), rva: s.rva, name: s.name, kind: s.kind, size: s.size, prototype: s.params ? protoText(s) : undefined, type: s.params ? undefined : s.type, mangled: s.mangled }));
+  return { module: m.name, pdb: e.path, matched: e.matched, ...limitList(list, args, 500) };
+});
+
+provide("ui_pdb_types", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  const r = await pdbTypes(e, typeof args.filter === "string" ? args.filter : "", num(args, "limit", 500, 20000));
+  return { module: m.name, total: r.total, types: r.types };
+});
+
+provide("ui_pdb_type", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  if (typeof args.name !== "string" && typeof args.index !== "number") throw new Error("missing 'name' (or 'index') of the type");
+  const which = typeof args.name === "string" ? { name: args.name } : { index: Number(args.index) };
+  const l = await pdbType(e, which);
+  const decl = [pdbDecl(l), ...(l.nested ?? []).map(pdbDecl)].join("\n\n");
+  return { module: m.name, name: l.name, kind: l.kind, size: l.size, fields: l.fields, values: l.values, nested: (l.nested ?? []).map((n) => n.name), c: decl };
+});
+
+provide("ui_import_pdb_type", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  if (typeof args.name !== "string") throw new Error("missing 'name' of the type");
+  const r = await importPdbType(e, { name: args.name }, { nested: args.nested !== false });
+  const t = useTypes.getState().find(r.name);
+  return { module: m.name, imported: r.imported, name: r.name, fields: t?.fields.length ?? 0, cpp: t ? toCpp(t.name, t.fields) : undefined };
+});
+
+provide("ui_pdb_lookup", async (args) => {
+  const a = addrArg(args);
+  const f = pdbFunctionAt(a);
+  const m = moduleOf(a, modules());
+  const lines = m && f ? await sourceLines(m, a, a + 1n).catch(() => []) : [];
+  return {
+    address: fmtAddr(a), label: symAddr(a, modules()),
+    function: f ? { name: f.sym.name, start: fmtAddr(a - BigInt(f.offset)), offset: f.offset, size: f.sym.size, prototype: f.sym.params ? protoText(f.sym) : undefined } : null,
+    source: lines[0] ? { file: lines[0].file, line: lines[0].line } : null,
+  };
 });
 
 provide("ui_il", async (args) => {

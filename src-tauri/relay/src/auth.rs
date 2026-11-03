@@ -1,7 +1,7 @@
 //! Relay access token.
 //!
 //! The relay only listens on 127.0.0.1, but any local program can connect to it, and an `Origin`
-//! header is trivially forged by non-browser clients. Every `/client` and `/mcp` request therefore
+//! header is trivially forged by non-browser clients. Every `/client`, `/sync` and `/mcp` request therefore
 //! carries a shared secret: `Authorization: Bearer <token>` (MCP clients, scripts) or
 //! `?token=<token>` (browser WebSockets cannot set headers).
 //!

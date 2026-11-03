@@ -1,19 +1,24 @@
 // Control-flow graph of the function at the disassembly cursor: basic blocks laid out in layers,
 // taken (green), fall-through (red) and unconditional/switch (accent) edges, blocks inside natural
-// loops tinted. The Pseudocode mode structures the same instructions into if/else/while/goto
-// (structure.ts + pseudocode.ts).
+// loops tinted. The Pseudocode mode decompiles the same instructions (decompile.ts: variables,
+// calls with arguments, types, switch / for / else-if structuring); "raw" shows the older
+// per-instruction output (pseudocode.ts). "Unflattened" removes control-flow flattening
+// (unflatten.ts) and shows the recovered graph and its pseudocode.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Maximize2, RefreshCw, ZoomIn, ZoomOut } from "lucide-react";
-import { request } from "@/lib/client";
-import { labelAddr, moduleOf, showAddr, toBig } from "@/lib/hex";
-import { loadImage } from "@/lib/memory";
-import { pdataFunctions } from "@/lib/live";
-import { buildCfg, layoutCfg, type Block, type Cfg, type CfgLine } from "@/lib/analysis/cfg";
-import { buildStructure } from "@/lib/analysis/structure";
-import { pseudocode } from "@/lib/analysis/pseudocode";
-import { resolveSwitch } from "@/lib/analysis/jumptables";
+import { labelAddr, showAddr, toBig } from "@/lib/hex";
+import { layoutCfg, type Block, type Cfg, type CfgEdge, type CfgLine } from "@/lib/analysis/cfg";
+import { graphInfo } from "@/lib/analysis/structure";
+import { pseudocode, type PseudoLine } from "@/lib/analysis/pseudocode";
+import { decompile, irGraph, type Decompiled } from "@/lib/analysis/decompile";
+import { analyzeCallees, directCallees, liveOptions, loadFunction, notDecompilable, type LiveFunction } from "@/lib/decomplive";
 import { useConn } from "@/store/conn";
 import { useNames } from "@/store/names";
+import { useTypes } from "@/store/types";
+import { useDecomp, varTypesOf } from "@/store/decomp";
+import { useSymbols } from "@/store/symbols";
+// importing it also registers the PDB prototype provider the decompiler asks first
+import { protoAt, symAddr } from "@/lib/pdb";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { IconButton, NeedsAgent, Progress } from "../ui";
@@ -21,77 +26,119 @@ import { IconButton, NeedsAgent, Progress } from "../ui";
 const kLineH = 15;
 const kWidth = 340;
 const kMaxLines = 28;
+const kAutoDecompile = 4000;
 const blockH = (b: Block) => 22 + Math.min(b.lines.length, kMaxLines) * kLineH + (b.lines.length > kMaxLines ? kLineH : 0);
+
+/** The recovered graph of an unflattened function, in the graph view's terms. */
+function recoveredCfg(d: Decompiled, orig: Cfg): Cfg {
+  const byAddr = new Map<string, CfgLine>();
+  for (const b of orig.blocks) for (const l of b.lines) byAddr.set(toBig(l.address).toString(16), l);
+  const g = irGraph(d.ir);
+  const startOf = new Map(g.blocks.map((b) => [b.id, b.start]));
+  const blocks: Block[] = g.blocks.map((b) => {
+    const lines = b.insns.map((i) => byAddr.get(toBig(i.address).toString(16)) ?? { address: i.address, length: i.length, bytes: "", text: i.text });
+    const last = lines[lines.length - 1];
+    const t = d.ir.blocks[b.id].term;
+    return {
+      start: b.start,
+      end: last ? toBig(last.address) + BigInt(last.length) : b.start,
+      lines,
+      terminator: t.k === "cond" ? "jcc" : t.k === "jump" ? "jmp" : t.k === "switch" || t.k === "ijump" ? "indirect" : t.k === "stop" ? "stop" : t.k === "end" ? "fall" : "ret",
+    };
+  });
+  const edges: CfgEdge[] = g.edges.map((e) => ({ from: startOf.get(e.from)!, to: startOf.get(e.to)!, kind: e.kind, ...(e.label ? { label: e.label } : {}) }));
+  return { entry: orig.entry, blocks, edges, truncated: orig.truncated };
+}
+
+/** Natural-loop membership of the blocks of a drawn graph. */
+function loopsOf(cfg: Cfg): Map<bigint, "header" | "body"> {
+  const idx = new Map(cfg.blocks.map((b, i) => [b.start, i]));
+  const succ = cfg.blocks.map(() => [] as number[]);
+  const pred = cfg.blocks.map(() => [] as number[]);
+  for (const e of cfg.edges) {
+    const a = idx.get(e.from);
+    const b = idx.get(e.to);
+    if (a === undefined || b === undefined) continue;
+    succ[a].push(b);
+    pred[b].push(a);
+  }
+  const entry = idx.get(cfg.entry) ?? 0;
+  const info = graphInfo(cfg.blocks.length, (n) => succ[n], (n) => pred[n], entry);
+  const m = new Map<bigint, "header" | "body">();
+  for (const l of info.loops) for (const n of l.body) if (!m.has(cfg.blocks[n].start) || n === l.header) m.set(cfg.blocks[n].start, n === l.header ? "header" : "body");
+  return m;
+}
 
 export default function CfgView() {
   const ui = useUi();
   const modules = useConn((s) => s.modules);
   const backend = useConn((s) => s.backend);
   const names = useNames();
+  const types = useTypes((s) => s.types);
+  const decomp = useDecomp();
+  // bumps when a PDB loads: its names and prototypes change the decompiled output
+  const symVersion = useSymbols((s) => s.version);
   const [mode, setMode] = useState<"graph" | "pseudo">("graph");
   const root = ui.disasmAt;
-  const [cfg, setCfg] = useState<Cfg | null>(null);
+  const [fn, setFn] = useState<LiveFunction | null>(null);
   const [busy, setBusy] = useState(false);
   const [sel, setSel] = useState<bigint | null>(null);
   const [tick, setTick] = useState(0);
+  const [calleeTick, setCalleeTick] = useState(0);
+  const [force, setForce] = useState(false);
   const [zoom, setZoom] = useState(1);
   const wrap = useRef<HTMLDivElement>(null);
+  const abi = backend === "local" ? "sysv" : "win64";
 
   useEffect(() => {
     if (!root) return;
     let live = true;
     setBusy(true);
-    setCfg(null);
+    setFn(null);
     void (async () => {
-      const entry = toBig(root);
-      const m = moduleOf(entry, modules);
-      const img = m ? await loadImage(m).catch(() => null) : null;
-      const mbase = m ? toBig(m.base) : 0n;
-      // bounds: the .pdata range that holds the entry, else the module
-      let bounds = m ? { lo: mbase, hi: mbase + BigInt(m.size) } : undefined;
-      if (m) {
-        const fn = (await pdataFunctions(m).catch(() => [])).find((f) => toBig(f.address) <= entry && entry < toBig(f.address) + BigInt(f.size));
-        if (fn) bounds = { lo: toBig(fn.address), hi: toBig(fn.address) + BigInt(fn.size) };
-      }
-      const decode = async (a: bigint): Promise<CfgLine[]> => {
-        const r = await request<{ results: CfgLine[] }>("disassemble", { address: "0x" + a.toString(16), size: 0x100 }, true).catch(() => null);
-        return r?.results ?? [];
-      };
-      const g = await attempt("cfg", buildCfg(entry, decode, {
-        maxInsns: 8000,
-        bounds,
-        switchTargets: img ? (lines, i) => resolveSwitch(lines, i, img, mbase)?.targets ?? null : undefined,
-      }));
+      const f = await attempt("cfg", loadFunction(toBig(root), modules));
       if (!live) return;
       setBusy(false);
-      if (g) {
-        setCfg(g);
-        log("info", "cfg", `${g.blocks.length} blocks, ${g.edges.length} edges${g.truncated ? " (truncated)" : ""} at ${labelAddr(root, modules)}`);
+      if (f) {
+        setFn(f);
+        log("info", "cfg", `${f.cfg.blocks.length} blocks, ${f.cfg.edges.length} edges${f.cfg.truncated ? " (truncated)" : ""} at ${labelAddr(root, modules)}`);
       }
     })();
     return () => { live = false; };
   }, [root, tick]);
 
-  const pos = useMemo(() => (cfg ? layoutCfg(cfg, blockH, kWidth) : new Map()), [cfg]);
-  // the discovered instructions in address order, re-split for dominators / loops / structuring
-  const structure = useMemo(() => {
-    if (!cfg) return null;
-    const lines = cfg.blocks.flatMap((b) => b.lines).sort((a, b) => (toBig(a.address) < toBig(b.address) ? -1 : 1));
-    return buildStructure(lines);
-  }, [cfg]);
-  const loopOf = useMemo(() => {
-    const m = new Map<bigint, "header" | "body">();
-    if (!cfg || !structure) return m;
-    const starts = structure.blocks.map((b) => b.start);
-    for (const b of cfg.blocks) {
-      // the structural block that holds this block's first instruction
-      let i = starts.length - 1;
-      while (i > 0 && starts[i] > b.start) i--;
-      const s = structure.blocks[i];
-      if (s?.inLoop) m.set(b.start, s.loopHeader && s.start === b.start ? "header" : "body");
+  const varTypes = varTypesOf(decomp.varTypes, root);
+  const insnCount = useMemo(() => fn?.structure.blocks.reduce((n, b) => n + b.insns.length, 0) ?? 0, [fn]);
+  // decompiling runs on the UI thread: very large functions only on request
+  const tooBig = insnCount > kAutoDecompile && !force;
+  useEffect(() => setForce(false), [root]);
+  // AArch64 functions get the graph only: the lifter and the raw pseudocode are x86-64
+  const noDecomp = fn ? notDecompilable(fn) : null;
+  const needDecompile = !!fn && !noDecomp && !tooBig && ((mode === "pseudo" && !decomp.raw) || decomp.unflatten);
+  const dec = useMemo((): { d: Decompiled | null; error: string | null } => {
+    if (!fn || !needDecompile) return { d: null, error: null };
+    try {
+      return { d: decompile(fn.structure, liveOptions(fn, { abi, userName: names.nameOf, types, varTypes, unflatten: decomp.unflatten })), error: null };
+    } catch (e) {
+      return { d: null, error: e instanceof Error ? e.message : String(e) };
     }
-    return m;
-  }, [cfg, structure]);
+  }, [fn, needDecompile, abi, names, types, varTypes, decomp.unflatten, calleeTick, symVersion]);
+
+  // argument counts of the direct callees, from their own entry code; redraws once known
+  useEffect(() => {
+    if (!dec.d) return;
+    let live = true;
+    void analyzeCallees(directCallees(dec.d.ir), modules, abi).then((n) => live && n > 0 && setCalleeTick((t) => t + 1)).catch(() => undefined);
+    return () => { live = false; };
+  }, [dec.d?.ir]);
+
+  const showRaw = mode === "pseudo" && !noDecomp && (decomp.raw || !dec.d);
+  const rawLines = useMemo(() => (fn && showRaw ? pseudocode(fn.structure, { abi, nameOf: names.nameOf, protoOf: protoAt }) : []), [fn, showRaw, abi, names, symVersion]);
+  const report = decomp.unflatten ? dec.d?.report ?? null : null;
+  const cfg = useMemo(() => (fn && report?.flattened && dec.d ? recoveredCfg(dec.d, fn.cfg) : fn?.cfg ?? null), [fn, report, dec.d]);
+  const pos = useMemo(() => (cfg ? layoutCfg(cfg, blockH, kWidth) : new Map()), [cfg]);
+  const loopOf = useMemo(() => (cfg ? loopsOf(cfg) : new Map<bigint, "header" | "body">()), [cfg]);
+  const loopCount = useMemo(() => new Set([...loopOf].filter(([, k]) => k === "header").map(([a]) => a)).size, [loopOf]);
   const width = Math.max(400, ...[...pos.values()].map((p) => p.x + p.w + 20));
   const height = Math.max(200, ...[...pos.values()].map((p) => p.y + p.h + 20));
   const fit = () => {
@@ -114,7 +161,15 @@ export default function CfgView() {
           <span className="panel-title">CFG</span>
           <button className="btn small" data-active={mode === "graph"} onClick={() => setMode("graph")}>Graph</button>
           <button className="btn small" data-active={mode === "pseudo"} onClick={() => setMode("pseudo")}>Pseudocode</button>
-          <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || labelAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges · ${structure?.loops.length ?? 0} loops` : ""}</span>
+          <label className="row" style={{ fontSize: 12 }} title="Detect an OLLVM-style dispatcher, recover each block's successor from the state it sets and rebuild the original graph">
+            <input type="checkbox" checked={decomp.unflatten} onChange={(e) => decomp.setUnflatten(e.target.checked)} />unflattened
+          </label>
+          {mode === "pseudo" && (
+            <label className="row" style={{ fontSize: 12 }} title="The older per-instruction output: registers stay registers, no types">
+              <input type="checkbox" checked={decomp.raw} onChange={(e) => decomp.setRaw(e.target.checked)} />raw
+            </label>
+          )}
+          <span className="mono faint ellipsis grow">{root ? `${names.nameOf(root) || symAddr(root, modules)}` : "no function — open one in the disassembly"}{cfg ? ` · ${cfg.blocks.length} blocks · ${cfg.edges.length} edges · ${loopCount} loops` : ""}</span>
           {mode === "graph" && (
             <>
               <span className="faint" style={{ fontSize: 12 }}><span style={{ color: "var(--success)" }}>taken</span> · <span style={{ color: "var(--danger)" }}>fall-through</span> · <span style={{ color: "var(--accent)" }}>jump / case</span> · <span style={{ color: "var(--warning)" }}>loop</span></span>
@@ -126,9 +181,29 @@ export default function CfgView() {
           <IconButton tip="Rebuild" onClick={() => setTick((t) => t + 1)} disabled={!root}><RefreshCw size={14} /></IconButton>
         </div>
         {busy && <Progress value={0.5} />}
+        {decomp.unflatten && fn && dec.d && <UnflattenNote report={dec.d.report} onGo={ui.goDisasm} />}
         {mode === "pseudo" ? (
-          structure && structure.blocks.length ? (
-            <Pseudo structure={structure} abi={backend === "local" ? "sysv" : "win64"} nameOf={names.nameOf} onGo={ui.goDisasm} />
+          noDecomp ? (
+            <div className="empty"><div className="empty-title">{noDecomp}</div></div>
+          ) : fn && fn.structure.blocks.length ? (
+            showRaw || !dec.d ? (
+              <>
+              {tooBig && !decomp.raw && (
+                <div className="toolbar" style={{ fontSize: 12 }}>
+                  <span className="warn">{insnCount} instructions: not decompiled automatically</span>
+                  <button className="btn small" onClick={() => setForce(true)}>Decompile anyway</button>
+                </div>
+              )}
+              <Pseudo lines={rawLines} onGo={ui.goDisasm}
+                note={`${dec.error ? `decompiler failed (${dec.error}); showing the raw output · ` : ""}raw pseudocode · registers stay registers, types come only from a loaded PDB (signature and callee arguments); calls show the ${abi === "win64" ? "rcx/rdx/r8/r9" : "rdi/rsi/rdx/rcx/r8/r9"} arguments written before them`} />
+              </>
+            ) : (
+              <>
+                <VarTypes d={dec.d} types={types.map((t) => t.name)} mapped={varTypes ?? {}} onSet={(v, t) => root && decomp.setVarType(root, v, t)} />
+                <Pseudo lines={dec.d.lines} onGo={ui.goDisasm}
+                  note="decompiled (experimental) · variables, calls with arguments and types are recovered from use and may be wrong; map a pointer to a Structs type for field names; unmodelled instructions stay as __asm" />
+              </>
+            )
           ) : (
             <div className="empty"><div className="empty-title">{busy ? "Disassembling…" : root ? "No instructions." : "Open a function in the disassembly."}</div></div>
           )
@@ -188,19 +263,52 @@ export default function CfgView() {
   );
 }
 
-function Pseudo({ structure, abi, nameOf, onGo }: { structure: ReturnType<typeof buildStructure>; abi: "win64" | "sysv"; nameOf: (a: string) => string; onGo: (a: string) => void }) {
-  const out = useMemo(() => pseudocode(structure, { abi, nameOf }), [structure, abi, nameOf]);
+function UnflattenNote({ report, onGo }: { report: Decompiled["report"]; onGo: (a: string) => void }) {
+  if (!report) return null;
+  if (!report.flattened) return <div className="pseudo-note">unflattened: {report.note}</div>;
+  return (
+    <div className="pseudo-note">
+      flattening removed · dispatcher <span className="mono link" onClick={() => onGo(report.dispatcher!)}>{report.dispatcher}</span> on <span className="mono">{report.state}</span> ·
+      {" "}{report.recovered.length} blocks rewired, {report.states} states, {report.dispatcherBlocks.length} dispatcher blocks
+      {report.unresolved.length > 0 && (
+        <> · <span className="warn">{report.unresolved.length} unresolved:</span>{" "}
+          {report.unresolved.map((u, i) => <span key={u.block} className="mono link" title={u.reason} onClick={() => onGo(u.block)}>{i ? ", " : ""}{u.block}</span>)}
+          {" "}(still routed through the dispatcher)</>
+      )}
+    </div>
+  );
+}
+
+/** Maps a pointer variable to a Structs type, so its field accesses use the type's field names. */
+function VarTypes({ d, types, mapped, onSet }: { d: Decompiled; types: string[]; mapped: Record<string, string>; onSet: (v: string, t: string | null) => void }) {
+  const ptrs = d.vars.filter((v) => v.type.endsWith("*"));
+  const [v, setV] = useState("");
+  const cur = v || ptrs[0]?.name || "";
+  if (!ptrs.length) return null;
+  return (
+    <div className="toolbar" style={{ fontSize: 12 }}>
+      <span className="faint">struct type of</span>
+      <select className="select" value={cur} onChange={(e) => setV(e.target.value)}>
+        {ptrs.map((p) => <option key={p.name} value={p.name}>{p.name}{mapped[p.name] ? ` (${mapped[p.name]})` : ""}</option>)}
+      </select>
+      <select className="select" value={mapped[cur] ?? ""} onChange={(e) => onSet(cur, e.target.value || null)} disabled={!types.length}>
+        <option value="">{types.length ? "— none —" : "no types in Structs"}</option>
+        {types.map((t) => <option key={t} value={t}>{t}</option>)}
+      </select>
+      <span className="mono faint ellipsis grow">{d.signature}</span>
+    </div>
+  );
+}
+
+function Pseudo({ lines, note, onGo }: { lines: PseudoLine[]; note: string; onGo: (a: string) => void }) {
   return (
     <div className="vlist listing pseudo">
-      <div className="pseudo-note">
-        structured pseudocode (experimental) · registers stay registers, no types are recovered, calls show the {abi === "win64" ? "rcx/rdx/r8/r9" : "rdi/rsi/rdx/rcx/r8/r9"} arguments
-        written before them, switch jump tables are not structured, anything unrecognised is kept as the asm line in a comment
-      </div>
-      {out.map((l, i) => (
+      <div className="pseudo-note">{note}</div>
+      {lines.map((l, i) => (
         <div
           key={i}
           className="pseudo-line"
-          data-kind={l.text.startsWith("//") ? "comment" : /^loc_\w+:$/.test(l.text) ? "label" : undefined}
+          data-kind={l.text.startsWith("//") || l.text.startsWith("__asm") ? "comment" : /^loc_\w+:$/.test(l.text) ? "label" : undefined}
           data-link={l.addr ? "true" : undefined}
           style={{ paddingLeft: `calc(${l.indent * 2}ch + 10px)` }}
           title={l.addr ? `${showAddr(l.addr)} · click to open in the disassembly` : undefined}

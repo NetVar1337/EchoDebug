@@ -11,9 +11,9 @@ const DESTRUCTIVE: &[&str] = &["write", "freeze", "freeze_group", "ui_revert_pat
 /// Verbs that change state but not the target's memory: attach/detach, execution control, files.
 const STATEFUL: &[&str] = &[
     "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
-    "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
+    "ui_load_symbols", "ui_import_pdb_type", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
     "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
-    "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment",
+    "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment", "trace_record",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.
@@ -35,9 +35,10 @@ pub fn is_read_only(verb: &str) -> bool {
 }
 
 /// What the ask / read-only policies gate: calls that change the target's memory, plus dumps
-/// (they write files). Attach, scans and the emulator change only EchoDebug's own state.
+/// (they write files), and trace recording (its ptrace source runs the real thread). Attach, scans
+/// and the emulator change only EchoDebug's own state.
 pub fn is_gated(verb: &str) -> bool {
-    DESTRUCTIVE.contains(&verb) || verb == "dump"
+    DESTRUCTIVE.contains(&verb) || verb == "dump" || verb == "trace_record"
 }
 
 /// What MCP clients may call. Set by the app (Settings → MCP), kept in memory by the relay.
@@ -209,13 +210,32 @@ mod tests {
         assert_eq!(annotations("attach", "a")["readOnlyHint"], false);
         assert_eq!(annotations("attach", "a")["destructiveHint"], false);
         assert_eq!(annotations("ui_load_symbols", "s")["openWorldHint"], true);
+        assert_eq!(annotations("ui_load_symbols", "s")["readOnlyHint"], false);
+        // PDB queries stay offline and read-only; importing a type changes the Structs catalog
+        assert_eq!(annotations("ui_pdb_symbols", "s")["openWorldHint"], false);
+        assert_eq!(annotations("ui_pdb_type", "s")["readOnlyHint"], true);
+        assert_eq!(annotations("ui_import_pdb_type", "s")["readOnlyHint"], false);
+        assert_eq!(annotations("ui_import_pdb_type", "s")["openWorldHint"], false);
         // the app window's annotation tools
         assert_eq!(annotations("ui_list_names", "n")["readOnlyHint"], true);
         assert_eq!(annotations("ui_list_signatures", "s")["readOnlyHint"], true);
+        // the decompiler and flattening removal only read code
+        assert_eq!(annotations("ui_unflatten", "unflatten")["readOnlyHint"], true);
+        assert_eq!(annotations("ui_decompile", "decompile")["readOnlyHint"], true);
+        assert!(!is_gated("ui_unflatten"));
         let set = annotations("ui_set_name", "n");
         assert_eq!((set["readOnlyHint"].as_bool(), set["destructiveHint"].as_bool(), set["idempotentHint"].as_bool()), (Some(false), Some(false), Some(true)));
         assert_eq!(annotations("ui_set_comment", "c")["readOnlyHint"], false);
         assert_eq!(annotations("ui_revert_patch", "r")["destructiveHint"], true);
+        // the heap explorer only reads memory
+        for v in ["ui_heaps", "ui_heap_chunks", "ui_heap_find"] {
+            assert_eq!(annotations(v, "h")["readOnlyHint"], true);
+            assert!(!is_gated(v));
+        }
+        // time-travel traces: recording changes state, the queries only read
+        assert_eq!(annotations("trace_record", "t")["readOnlyHint"], false);
+        assert_eq!(annotations("trace_query", "t")["readOnlyHint"], true);
+        assert_eq!(annotations("trace_info", "t")["readOnlyHint"], true);
     }
 
     #[test]
@@ -230,6 +250,9 @@ mod tests {
         assert_eq!(decide(&p, "disassemble", "disassemble"), Decision::Allow);
         assert_eq!(decide(&p, "emu_step", "emu_step"), Decision::Allow);
         assert!(matches!(decide(&p, "dump_module", "dump"), Decision::Deny(_)));
+        // recording a ptrace trace runs the real thread; querying a trace is always fine
+        assert!(matches!(decide(&p, "trace_record", "trace_record"), Decision::Deny(_)));
+        assert_eq!(decide(&p, "trace_query", "trace_query"), Decision::Allow);
         // reverting a patch writes target memory; naming only touches EchoDebug's own stores
         assert!(matches!(decide(&p, "revert_patch", "ui_revert_patch"), Decision::Deny(_)));
         assert_eq!(decide(&p, "set_name", "ui_set_name"), Decision::Allow);

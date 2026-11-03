@@ -1,13 +1,16 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { request } from "@/lib/client";
-import { fmtAddr, hexToBytes, labelAddr, parseAddress } from "@/lib/hex";
+import { fmtAddr, hexToBytes, labelAddr, moduleOf, parseAddress } from "@/lib/hex";
+import { archLabel, argRegs, registerNames, type Arch } from "@/lib/analysis/arch";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent } from "../ui";
+import { useModuleArch } from "../ArchBadge";
 
 type MemBlob = { address: string; size: number; ok: boolean; data: string };
-type MemAccess = { rip: string; address: string; size: number; access: "r" | "w" | "rw"; before: string; after?: string };
+/** `rip` on x86-64, `pc` on arm64 */
+type MemAccess = { rip?: string; pc?: string; address: string; size: number; access: "r" | "w" | "rw"; before: string; after?: string };
 type EmuResult = {
   error: number;
   error_name: string;
@@ -23,7 +26,7 @@ type EmuResult = {
   api_calls?: { api: string; address: string; return_to: string; result: string; args: string; note?: string }[];
   api_call_count?: number;
   layers?: { entry: string; page: string }[];
-  faults?: { address: string; rip: string }[];
+  faults?: { address: string; rip?: string; pc?: string }[];
   fault_count?: number;
   xmm?: Record<string, string>;
   /** Windows agent: ymm0..ymm15 where the emulated CPU exposes them */
@@ -31,9 +34,11 @@ type EmuResult = {
   /** Windows agent: everything mapped in the emulator after the run */
   regions?: { address: string; end: string; perms: string }[];
   regions_truncated?: boolean;
+  /** "arm64" for the AArch64 emulator */
+  arch?: string;
+  /** arm64: v0..v31 */
+  v?: Record<string, string>;
 };
-
-const kRegs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"];
 
 /** Register values known at each reg_trace step: everything changed so far, and what changed right here. */
 function stepState(t: NonNullable<EmuResult["reg_trace"]>, i: number): { known: Record<string, string>; changed: Set<string> } {
@@ -52,6 +57,20 @@ export default function EmulatorView() {
   const [end, setEnd] = useState("");
   const [code, setCode] = useState("");
   const [regs, setRegs] = useState<Record<string, string>>({ rcx: "", rdx: "", r8: "", r9: "" });
+  // the emulated CPU: the start address's module decides unless the user picks one
+  const [archSel, setArchSel] = useState<"auto" | Arch>("auto");
+  const startMod = useMemo(() => {
+    const a = parseAddress(start, modules);
+    return a === null ? undefined : moduleOf(a, modules);
+  }, [start, modules]);
+  const detected = useModuleArch(startMod);
+  const arch: Arch = archSel === "auto" ? (detected === "arm64" ? "arm64" : "x86_64") : archSel;
+  const a64 = arch === "arm64";
+  const kRegs = registerNames(arch);
+  // swap untouched argument registers when the architecture changes
+  useEffect(() => {
+    setRegs((cur) => (Object.values(cur).some((v) => v.trim()) ? cur : Object.fromEntries(argRegs(arch).map((r) => [r, ""]))));
+  }, [arch]);
   const [maxInsns, setMaxInsns] = useState(100000);
   const [trace, setTrace] = useState(true);
   const [memLog, setMemLog] = useState(true);
@@ -88,7 +107,8 @@ export default function EmulatorView() {
       write.push({ address: fmtAddr(a), data: bytesToHexLocal(bytes).slice(0, bufSize * 2) });
       read.push({ address: fmtAddr(a), size: bufSize });
       // Point the first argument register at the buffer unless the user set one.
-      if (!r.rcx) r.rcx = fmtAddr(a);
+      const first = argRegs(arch)[0];
+      if (!r[first]) r[first] = fmtAddr(a);
     }
     setBusy(true);
     const out = await attempt("emu", request<EmuResult>("emulate", {
@@ -98,9 +118,7 @@ export default function EmulatorView() {
       max_insns: maxInsns,
       trace,
       mem_log: memLog,
-      stubs,
-      layers,
-      trace_regs: regTrace,
+      ...(a64 ? { arch, simd: true } : { stubs, layers, trace_regs: regTrace }),
       on_unmapped: zero ? "zero" : "stop",
       ...(cleanCode ? { code: cleanCode.toLowerCase() } : {}),
       ...(write.length ? { write } : {}),
@@ -122,7 +140,14 @@ export default function EmulatorView() {
       <div className="split-h" style={{ ["--fn-w" as string]: "380px" }}>
         <div className="list-col vlist">
           <div className="panel-section">
-            <div className="label">Unicorn x86-64 · reads fault in from the target, which is never modified</div>
+            <div className="row">
+              <span className="label grow" style={{ padding: 0 }}>Unicorn {archLabel(arch)} · reads fault in from the target, which is never modified</span>
+              <select className="select" value={archSel} onChange={(e) => setArchSel(e.target.value as "auto" | Arch)} data-tip="CPU to emulate; auto follows the start address's module">
+                <option value="auto">auto{archSel === "auto" ? ` (${archLabel(arch)})` : ""}</option>
+                <option value="x86_64">x64</option>
+                <option value="arm64">ARM64</option>
+              </select>
+            </div>
             <div className="row"><span style={{ width: 50 }}>start</span><input className="input mono grow" value={start} onChange={(e) => setStart(e.target.value)} placeholder="function address" /></div>
             <div className="row"><span style={{ width: 50 }}>end</span><input className="input mono grow" value={end} onChange={(e) => setEnd(e.target.value)} placeholder="stop address (e.g. after the call)" /></div>
             <div className="label">Registers (optional)</div>
@@ -139,17 +164,17 @@ export default function EmulatorView() {
               </select>
             </div>
             <div className="label">Code bytes (optional, hex — otherwise the target's code runs)</div>
-            <textarea className="textarea" rows={4} value={code} onChange={(e) => setCode(e.target.value)} placeholder="48 31 c0 c3" />
+            <textarea className="textarea" rows={4} value={code} onChange={(e) => setCode(e.target.value)} placeholder={a64 ? "00 04 00 91 c0 03 5f d6" : "48 31 c0 c3"} />
             <div className="row">
               <span>max insns</span><input className="input mono" style={{ width: 100 }} type="number" value={maxInsns} onChange={(e) => setMaxInsns(Number(e.target.value))} />
               <label className="row"><input type="checkbox" checked={trace} onChange={(e) => setTrace(e.target.checked)} />trace</label>
               <label className="row" title="Log every explicit memory read/write with its value"><input type="checkbox" checked={memLog} onChange={(e) => setMemLog(e.target.checked)} />memory</label>
             </div>
             <div className="row wrap">
-              <label className="row" title="Simulate common API calls (VirtualAlloc, GetProcAddress, memcpy, strlen, …) and return to the caller, so unpackers and decryptors run to the end"><input type="checkbox" checked={stubs} onChange={(e) => setStubs(e.target.checked)} />API stand-ins</label>
-              <label className="row" title="Report pages that were written and then executed: unpacking layers and their entry points"><input type="checkbox" checked={layers} onChange={(e) => setLayers(e.target.checked)} />unpack layers</label>
+              {!a64 && <label className="row" title="Simulate common API calls (VirtualAlloc, GetProcAddress, memcpy, strlen, …) and return to the caller, so unpackers and decryptors run to the end"><input type="checkbox" checked={stubs} onChange={(e) => setStubs(e.target.checked)} />API stand-ins</label>}
+              {!a64 && <label className="row" title="Report pages that were written and then executed: unpacking layers and their entry points"><input type="checkbox" checked={layers} onChange={(e) => setLayers(e.target.checked)} />unpack layers</label>}
               <label className="row" title="Map a zero page on unmapped reads and keep going (every fault is listed)"><input type="checkbox" checked={zero} onChange={(e) => setZero(e.target.checked)} />zero unmapped</label>
-              <label className="row" title="Record which registers change at every instruction"><input type="checkbox" checked={regTrace} onChange={(e) => setRegTrace(e.target.checked)} />register trace</label>
+              {!a64 && <label className="row" title="Record which registers change at every instruction"><input type="checkbox" checked={regTrace} onChange={(e) => setRegTrace(e.target.checked)} />register trace</label>}
               <span className="grow" />
               <button className="btn primary" disabled={busy} onClick={() => void run()}>{busy ? "Running…" : "Emulate"}</button>
             </div>
@@ -189,7 +214,7 @@ export default function EmulatorView() {
               <div className="panel-section">
                 <div className={res.error === 0 ? "ok" : "warn"}>{res.error_name} · {res.instructions} instructions{res.error ? ` · fault ${res.fault_address}` : ""}</div>
               </div>
-              <div className="kv">{kRegs.filter((r) => res.regs[r]).flatMap((r) => [<span key={r + "k"}>{r}</span>, <span key={r} className="link" onClick={() => ui.select(res.regs[r])}>{res.regs[r]}</span>])}</div>
+              <div className="kv">{registerNames(res.arch === "arm64" ? "arm64" : "x86_64").filter((r) => res.regs[r]).flatMap((r) => [<span key={r + "k"}>{r}</span>, <span key={r} className="link" onClick={() => ui.select(res.regs[r])}>{res.regs[r]}</span>])}</div>
               {res.reg_trace && res.reg_trace.length > 0 && (() => {
                 const t = res.reg_trace;
                 const n = t.length;
@@ -243,7 +268,7 @@ export default function EmulatorView() {
                   <thead><tr><th>Memory ({res.mem_log.length}{res.mem_log_truncated ? ", limit hit" : ""})</th><th /><th>Address</th><th>Value</th></tr></thead>
                   <tbody>{res.mem_log.map((m, i) => (
                     <tr key={i}>
-                      <td className="link" onClick={() => ui.goDisasm(m.rip)}>{labelAddr(m.rip, modules)}</td>
+                      <td className="link" onClick={() => ui.goDisasm(m.rip ?? m.pc ?? "")}>{labelAddr(m.rip ?? m.pc ?? "0x0", modules)}</td>
                       <td className={m.access === "r" ? "dim" : "warn"}>{m.access}</td>
                       <td className="link" onClick={() => ui.select(m.address)} title={`${m.size} bytes`}>{labelAddr(m.address, modules)}</td>
                       <td title={m.after !== undefined ? `${m.before || "?"} → ${m.after || "?"}` : m.before}>{m.after !== undefined ? <>{m.before || "?"} → <span className="ok">{m.after || "?"}</span></> : m.before || "?"}</td>
@@ -265,7 +290,7 @@ export default function EmulatorView() {
               )}
               {res.faults && res.faults.length > 0 && (
                 <div className="panel-section"><div className="label">Unmapped accesses ({res.fault_count})</div>
-                  <div className="mono faint" style={{ fontSize: 12 }}>{res.faults.slice(0, 40).map((f) => `${f.address} (rip ${f.rip})`).join(" · ")}</div></div>
+                  <div className="mono faint" style={{ fontSize: 12 }}>{res.faults.slice(0, 40).map((f) => (f.pc ? `${f.address} (pc ${f.pc})` : `${f.address} (rip ${f.rip})`)).join(" · ")}</div></div>
               )}
               {res.reg_trace && res.reg_trace.length > 0 && (
                 <table className="table mono">
@@ -275,6 +300,9 @@ export default function EmulatorView() {
               )}
               {res.xmm && Object.values(res.xmm).some((v) => /[1-9a-f]/.test(v)) && (
                 <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.xmm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k}>{v}</span>])}</div>
+              )}
+              {res.v && Object.values(res.v).some((v) => /[1-9a-f]/.test(v)) && (
+                <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.v).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k} title={v}>{v}</span>])}</div>
               )}
               {res.ymm && Object.values(res.ymm).some((v) => /[1-9a-f]/.test(v)) && (
                 <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.ymm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k} title={v}>{v}</span>])}</div>
