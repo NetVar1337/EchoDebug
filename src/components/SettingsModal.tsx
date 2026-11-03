@@ -1,4 +1,6 @@
-import { X } from "lucide-react";
+import { useProjects } from "@/lib/projects";
+import type { ReactNode } from "react";
+import { Check, X } from "lucide-react";
 import { useConn } from "@/store/conn";
 import { kMotionPrefs, useMotion } from "@/store/motion";
 import { attempt, log } from "@/store/output";
@@ -6,16 +8,23 @@ import { useUi, type Theme } from "@/store/ui";
 import { useUpdate } from "@/store/update";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
 import { isWindowsOs } from "@/lib/tauri";
-import { IconButton } from "./ui";
+import { CopyChip, IconButton, useCopy } from "./ui";
 
 const kAccents = ["", "#2eb8a6", "#88c0d0", "#f26b38", "#a78bfa", "#f472b6", "#facc15"];
+const kThemes: { id: Theme; label: string }[] = [
+  { id: "obsidian", label: "Obsidian" },
+  { id: "nord", label: "Nord" },
+  { id: "blood-orange", label: "Blood Orange" },
+];
 
 export default function SettingsModal() {
+  const projects = useProjects();
   const ui = useUi();
   const conn = useConn();
   const upd = useUpdate();
   const motion = useMotion((s) => s.pref);
   const setMotion = useMotion((s) => s.setPref);
+  const [copied, copy] = useCopy();
   const close = () => ui.set({ settingsOpen: false });
   const reinstall = async () => {
     const r = await attempt("agent", installAgent());
@@ -23,6 +32,8 @@ export default function SettingsModal() {
     else if (!isTauri()) log("warn", "agent", "agent install is only available in the desktop app");
   };
   const windowsOnly = isWindowsOs(conn.os);
+  const endpoint = `http://127.0.0.1:${conn.port}/mcp`;
+  const busy = upd.phase === "checking" || upd.phase === "downloading" || upd.phase === "installing";
   return (
     <div className="modal-scrim" onMouseDown={(e) => e.target === e.currentTarget && close()}>
       <div className="modal" role="dialog" aria-label="Settings">
@@ -32,82 +43,117 @@ export default function SettingsModal() {
           <IconButton tip="Close" onClick={close}><X size={14} /></IconButton>
         </div>
         <div className="modal-body">
-          <div className="settings-group">
-            <div className="label">Appearance</div>
-            <div className="settings-row">
-              <span>Theme</span>
-              <select className="select" value={ui.theme} onChange={(e) => ui.set({ theme: e.target.value as Theme })}>
-                <option value="obsidian">Obsidian</option>
-                <option value="nord">Nord</option>
-                <option value="blood-orange">Blood Orange</option>
-              </select>
-            </div>
-            <div className="settings-row">
-              <span>Accent</span>
+          <Section title="Appearance">
+            <Row label="Theme">
+              <Segmented value={ui.theme} options={kThemes} onChange={(theme) => ui.set({ theme })} />
+            </Row>
+            <Row label="Accent">
               <div className="row">
                 {kAccents.map((c) => (
                   <button key={c || "default"} className="swatch" data-active={ui.accent === c} title={c || "theme default"} aria-label={c || "theme default"}
-                    style={{ background: c || "var(--bg-2)" }} onClick={() => ui.set({ accent: c })} />
+                    style={c ? { background: c } : { background: "var(--bg-2)", color: "var(--text)" }} onClick={() => ui.set({ accent: c })}>
+                    {ui.accent === c && <Check size={11} strokeWidth={3} />}
+                  </button>
                 ))}
               </div>
-            </div>
-            <div className="settings-row">
-              <span>Motion</span>
-              <select className="select" value={motion} onChange={(e) => setMotion(e.target.value as typeof motion)}>
-                {kMotionPrefs.map((m) => <option key={m.id} value={m.id}>{m.label} — {m.hint}</option>)}
-              </select>
-            </div>
-          </div>
+            </Row>
+            <Row label="Motion" hint={kMotionPrefs.find((m) => m.id === motion)?.hint}>
+              <Segmented value={motion} options={kMotionPrefs} onChange={setMotion} />
+            </Row>
+          </Section>
 
-          <div className="settings-group">
-            <div className="label">Echo connection</div>
-            <div className="settings-row"><span>Relay</span><span className="mono">ws://127.0.0.1:{conn.port} {conn.relay ? "· up" : "· down"}</span></div>
-            <div className="settings-row"><span>MCP endpoint</span><span className="mono selectable">http://127.0.0.1:{conn.port}/mcp</span></div>
-            <div className="settings-row">
-              <span>Agent script</span>
-              <div className="row">
-                <button className="btn" onClick={() => void reinstall()} disabled={!windowsOnly} title={windowsOnly ? undefined : "The Echo agent only runs inside Echo on Windows"}>Reinstall agent</button>
-                <button className="btn" onClick={() => void attempt("agent", openScriptsFolder())} disabled={!isTauri() || !windowsOnly}>Open scripts folder</button>
+          <Section title="Connection">
+            <Row label="Relay">
+              <span className="status-pill mono"><span className="dot" data-state={conn.relay ? "ok" : "bad"} />ws://127.0.0.1:{conn.port}<span className="faint">{conn.relay ? "up" : "down"}</span></span>
+            </Row>
+            <Row label="MCP endpoint" hint="Tool catalog and live call log live in the MCP Server panel.">
+              <CopyChip text={endpoint} copied={copied} onCopy={copy} />
+            </Row>
+            <Row label="Add to Claude Code">
+              <CopyChip text={`claude mcp add --transport http echodebug ${endpoint}`} copied={copied} onCopy={copy} />
+            </Row>
+            {windowsOnly ? (
+              <Row label="Agent script" hint={<>Load <span className="mono">echo_debug.as</span> in Echo, installed to <span className="mono">%APPDATA%\scripts</span>.</>}>
+                <div className="row">
+                  <button className="btn" onClick={() => void reinstall()}>Reinstall</button>
+                  <button className="btn" onClick={() => void attempt("agent", openScriptsFolder())} disabled={!isTauri()}>Open folder</button>
+                </div>
+              </Row>
+            ) : (
+              <div className="settings-note">
+                The Echo agent is Windows-only. On <span className="mono">{conn.os}</span> the relay serves a local <span className="mono">/proc</span> backend — attach from the Targets panel.
               </div>
-            </div>
-            <div className="faint" style={{ fontSize: 12 }}>
-              {windowsOnly
-                ? <>Load <span className="mono">echo_debug.as</span> in Echo; the app installs it to <span className="mono">%APPDATA%\scripts</span>. Reopen the Echo menu to refresh the script list.</>
-                : <>Host <span className="mono">{conn.os}</span>: the Echo agent is Windows-only. On Linux the relay serves a local <span className="mono">/proc</span> memory backend — attach from the Targets panel.</>}
-            </div>
-          </div>
+            )}
+          </Section>
 
-          <div className="settings-group">
-            <div className="label">MCP server</div>
-            <div className="settings-row"><span>Endpoint</span><span className="mono selectable">http://127.0.0.1:{conn.port}/mcp</span></div>
-            <div className="faint" style={{ fontSize: 12 }}>
-              Connect any MCP client: <span className="mono selectable">claude mcp add --transport http echodebug http://127.0.0.1:{conn.port}/mcp</span> — see the MCP Server panel for the tool catalog, prompts, resources and a live call log.
-            </div>
-          </div>
+          <Section title="Workspace">
+            <Row label="Reattach on start" hint={ui.lastTarget ? `Attach to ${ui.lastTarget} again when the app starts, if it is running.` : "Attach to the last target again when the app starts."}>
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={ui.reattach} onChange={(e) => ui.set({ reattach: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Module projects" hint="Save names, comments and bookmarks per module build (by RVA) and restore them on the next attach.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={projects.enabled} onChange={(e) => projects.setEnabled(e.target.checked)} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Panel sizes" hint="Splitter positions are remembered between runs.">
+              <button className="btn" onClick={() => { ui.set({ layout: {} }); for (const v of ["--left-w", "--scan-w", "--bottom-h", "--right-w"]) document.querySelector<HTMLElement>(".app")?.style.removeProperty(v); }}>Reset layout</button>
+            </Row>
+          </Section>
 
-          <div className="settings-group">
-            <div className="label">Updates</div>
-            <div className="settings-row">
-              <span>Auto-update</span>
-              <label className="row"><input type="checkbox" checked={ui.autoUpdate} onChange={(e) => ui.set({ autoUpdate: e.target.checked })} /> download updates in the background (checks at startup and every 30 min)</label>
-            </div>
-            <div className="settings-row">
-              <span>Version</span>
-              <div className="row">
-                <span className="mono">v{conn.appVersion}</span>
-                {upd.phase === "ready" ? (
-                  <button className="btn primary" onClick={() => void upd.restart()}>Restart to update to v{upd.version}</button>
-                ) : upd.phase === "available" ? (
-                  <button className="btn primary" onClick={() => void upd.download()}>Download v{upd.version}</button>
-                ) : (
-                  <button className="btn" disabled={upd.phase === "checking" || upd.phase === "downloading" || upd.phase === "installing"} onClick={() => void upd.check({ manual: true })}>Check for updates</button>
-                )}
-              </div>
-            </div>
-            <div className="settings-row"><span>Status</span><span className="faint">{updateSummary(upd)}</span></div>
-          </div>
+          <Section title="Updates">
+            <Row label="Auto-update" hint="Checks at startup and every 30 min.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={ui.autoUpdate} onChange={(e) => ui.set({ autoUpdate: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label={<>Version <span className="pill mono">v{conn.appVersion}</span></>} hint={updateSummary(upd)}>
+              {upd.phase === "ready" ? (
+                <button className="btn primary" onClick={() => void upd.restart()}>Restart to update</button>
+              ) : upd.phase === "available" ? (
+                <button className="btn primary" onClick={() => void upd.download()}>Download v{upd.version}</button>
+              ) : (
+                <button className="btn" disabled={busy} onClick={() => void upd.check({ manual: true })}>Check for updates</button>
+              )}
+            </Row>
+          </Section>
         </div>
       </div>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="settings-group">
+      <div className="label">{title}</div>
+      <div className="settings-card">{children}</div>
+    </section>
+  );
+}
+
+function Row({ label, hint, children }: { label: ReactNode; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <div className="settings-row">
+      <div className="settings-label">
+        <span>{label}</span>
+        {hint && <span className="settings-hint">{hint}</span>}
+      </div>
+      <div className="settings-control">{children}</div>
+    </div>
+  );
+}
+
+function Segmented<T extends string>({ value, options, onChange }: { value: T; options: readonly { id: T; label: string }[]; onChange: (v: T) => void }) {
+  return (
+    <div className="segmented" role="radiogroup">
+      {options.map((o) => (
+        <button key={o.id} role="radio" aria-checked={value === o.id} data-active={value === o.id} onClick={() => onChange(o.id)}>{o.label}</button>
+      ))}
     </div>
   );
 }

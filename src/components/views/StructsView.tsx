@@ -1,5 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Code2, Plus, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Activity, ArrowLeft, Code2, Plus, Trash2, Wand2 } from "lucide-react";
+import { pointerClassifier } from "@/lib/ptrkind";
+import { saveBinary, saveText } from "@/lib/save";
+import { changedFields, guessFields } from "@/lib/analysis/structguess";
+import { toBinja, toC, toGhidra, toIdaPython, toReclassProject } from "@/lib/analysis/typeexport";
 import { request } from "@/lib/client";
 import { fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
 import { readBytes } from "@/lib/memory";
@@ -24,9 +28,19 @@ export default function StructsView() {
   const [history, setHistory] = useState<string[]>([]);
   const [cpp, setCpp] = useState<string | null>(null);
   const [showCatalog, setShowCatalog] = useState(true);
+  const [exportFmt, setExportFmt] = useState<"cpp" | "c" | "ida" | "ghidra" | "binja">("cpp");
+  const [track, setTrack] = useState(false);
+  const [changes, setChanges] = useState<number[]>([]);
+  const prevData = useRef<Uint8Array | null>(null);
   const lay = useMemo(() => layout(cls.fields), [cls.fields]);
   const size = lay.length ? lay[lay.length - 1].offset + lay[lay.length - 1].size : 0;
   const base = ui.structAt;
+
+  // Undo/redo changes the catalog: pick that up in the editor.
+  const stored = catalog.types.find((t) => t.id === activeId);
+  useEffect(() => {
+    if (stored && (stored.name !== cls.name || JSON.stringify(stored.fields) !== JSON.stringify(cls.fields))) setCls(stored);
+  }, [stored]);
 
   // Keep the edited class in the catalog so it survives a reload.
   useEffect(() => {
@@ -34,17 +48,24 @@ export default function StructsView() {
     catalog.update(activeId, { name: cls.name, fields: cls.fields });
   }, [cls.name, cls.fields, activeId]);
 
+  useEffect(() => { setChanges([]); prevData.current = null; }, [base, cls.fields, track]);
   useEffect(() => {
     if (!base || !size) return;
     let live = true;
     const load = async () => {
       const b = await readBytes(toBig(base), size).catch(() => null);
-      if (live) setData(b);
+      if (!live) return;
+      if (track && b && prevData.current) {
+        const ch = changedFields(prevData.current, b, layout(cls.fields));
+        setChanges((c) => ch.map((x, i) => (c[i] ?? 0) + (x ? 1 : 0)));
+      }
+      prevData.current = b;
+      setData(b);
     };
     void load();
     const t = setInterval(() => void load(), 500);
     return () => { live = false; clearInterval(t); };
-  }, [base, size]);
+  }, [base, size, track, cls.fields]);
 
   // RTTI for the class itself and every pointer field, resolved once per distinct pointer value
   const ptrs = useMemo(() => {
@@ -66,6 +87,29 @@ export default function StructsView() {
     if (push && base) setHistory((h) => [...h, base]);
     ui.goStruct(fmtAddr(v));
   };
+
+  /** Retypes the rows from what the live bytes look like. */
+  const guess = async () => {
+    if (!base || !data) return log("warn", "struct", "enter an object address first");
+    const kindOf = await pointerClassifier(modules);
+    const fields = guessFields(data, { kindOf });
+    setCls((c) => ({ ...c, fields }));
+    log("info", "struct", `guessed ${fields.filter((f) => !f.type.startsWith("hex")).length} typed fields over 0x${data.length.toString(16)} bytes`);
+  };
+  const exportText = () => {
+    switch (exportFmt) {
+      case "c": return toC(cls.name, cls.fields);
+      case "ida": return toIdaPython(cls.name, cls.fields);
+      case "ghidra": return toGhidra(cls.name, cls.fields);
+      case "binja": return toBinja(cls.name, cls.fields);
+      default: return toCpp(cls.name, cls.fields);
+    }
+  };
+  const saveReclass = async () => {
+    const all = catalog.types.length ? catalog.types.map((t) => (t.id === activeId ? { ...t, name: cls.name, fields: cls.fields } : t)) : [cls];
+    await saveBinary(`${cls.name || "echodebug"}.rcnet`, toReclassProject(all.map((t) => ({ name: t.name, fields: t.fields }))));
+  };
+  const maxChange = Math.max(1, ...changes);
 
   const setField = (i: number, p: Partial<Field>) => setCls((c) => ({ ...c, fields: c.fields.map((f, j) => (j === i ? { ...f, ...p } : f)) }));
 
@@ -93,8 +137,8 @@ export default function StructsView() {
 
   return (
     <NeedsAgent>
-      <div className="split-h" style={{ ["--fn-w" as string]: showCatalog ? "220px" : "0px" }}>
-        <div className="list-col" style={{ display: showCatalog ? "flex" : "none" }}>
+      <div className="split-h" style={{ gridTemplateColumns: showCatalog ? "220px minmax(0, 1fr)" : "minmax(0, 1fr)" }}>
+        {showCatalog && <div className="list-col">
           <div className="toolbar">
             <span className="panel-title grow">Types</span>
             <IconButton tip="New type" onClick={create}><Plus size={14} /></IconButton>
@@ -108,7 +152,7 @@ export default function StructsView() {
               </div>
             ))}
           </div>
-        </div>
+        </div>}
         <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
           <div className="toolbar">
             <IconButton tip="Back" onClick={() => { const p = history.at(-1); if (p) { setHistory(history.slice(0, -1)); go(p, false); } }} disabled={!history.length}><ArrowLeft size={14} /></IconButton>
@@ -119,12 +163,18 @@ export default function StructsView() {
             <span className="grow mono faint">size 0x{size.toString(16)}</span>
             <button className="btn small" onClick={() => setCls({ ...cls, fields: [...cls.fields, ...hexRows(1)] })}><Plus size={12} />8</button>
             <button className="btn small" onClick={() => setCls({ ...cls, fields: [...cls.fields, ...hexRows(8)] })}><Plus size={12} />64</button>
-            <IconButton tip="Export C++" onClick={() => setCpp(cpp === null ? toCpp(cls.name, cls.fields) : null)}><Code2 size={14} /></IconButton>
+            <IconButton tip="Guess the fields from the live bytes" onClick={() => void guess()} disabled={!data}><Wand2 size={14} /></IconButton>
+            <IconButton tip={track ? "Stop tracking changes" : "Track which fields change"} onClick={() => setTrack(!track)}><Activity size={14} className={track ? "accent" : undefined} /></IconButton>
+            <select className="select" value={exportFmt} onChange={(e) => { setExportFmt(e.target.value as typeof exportFmt); setCpp(null); }} title="export format">
+              <option value="cpp">C++</option><option value="c">C</option><option value="ida">IDAPython</option><option value="ghidra">Ghidra</option><option value="binja">Binary Ninja</option>
+            </select>
+            <IconButton tip="Show export" onClick={() => setCpp(cpp === null ? exportText() : null)}><Code2 size={14} /></IconButton>
+            <button className="btn small" onClick={() => void saveReclass()} title="ReClass.NET project with every type in the catalog (best effort)">.rcnet</button>
             <IconButton tip="Reset layout" onClick={() => setCls({ ...cls, fields: hexRows(16) })}><Trash2 size={14} /></IconButton>
           </div>
           {cpp !== null && (
             <div style={{ borderBottom: "1px solid var(--border-soft)" }}>
-              <div className="toolbar"><span className="panel-title">C++</span><span className="grow" /><button className="btn small" onClick={() => void copy(cpp)}>Copy</button></div>
+              <div className="toolbar"><span className="panel-title">{({ cpp: "C++", c: "C", ida: "IDAPython", ghidra: "Ghidra script", binja: "Binary Ninja" } as const)[exportFmt]}</span><span className="grow" /><button className="btn small" onClick={() => void copy(cpp)}>Copy</button><button className="btn small" onClick={() => void saveText(`${cls.name || "Class"}.${exportFmt === "cpp" || exportFmt === "c" ? "h" : "py"}`, cpp)}>Save</button></div>
               <pre className="code-block" style={{ maxHeight: 220 }}>{cpp}</pre>
             </div>
           )}
@@ -142,7 +192,9 @@ export default function StructsView() {
                     const val = data ? fieldValue(data, offset, f.type) : "??";
                     const ptr = f.type === "ptr" || f.type === "hex64" ? "0x" + (data ? fieldValue(data, offset, "hex64") : "0").replace(/^0+(?=.)/, "").toLowerCase() : null;
                     return (
-                      <tr key={i} data-selected={ui.selected === addr} onClick={() => ui.select(addr)}>
+                      <tr key={i} data-selected={ui.selected === addr} onClick={() => ui.select(addr)}
+                        style={track && changes[i] ? { background: `color-mix(in srgb, var(--warning) ${Math.round(10 + 40 * (changes[i] / maxChange))}%, transparent)` } : undefined}
+                        title={track ? `${changes[i] ?? 0} changes while tracking` : undefined}>
                         <td className="faint">{offset.toString(16).toUpperCase().padStart(4, "0")}</td>
                         <td className="dim">{addr.slice(2).toUpperCase()}</td>
                         <td><select className="select" value={f.type} onChange={(e) => setField(i, { type: e.target.value as FieldType })}>{kTypes.map((t) => <option key={t}>{t}</option>)}</select></td>

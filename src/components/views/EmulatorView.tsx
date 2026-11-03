@@ -7,6 +7,7 @@ import { useUi } from "@/store/ui";
 import { NeedsAgent } from "../ui";
 
 type MemBlob = { address: string; size: number; ok: boolean; data: string };
+type MemAccess = { rip: string; address: string; size: number; access: "r" | "w" | "rw"; before: string; after?: string };
 type EmuResult = {
   error: number;
   error_name: string;
@@ -16,6 +17,15 @@ type EmuResult = {
   instructions: number;
   reached_end?: boolean;
   mem?: MemBlob[];
+  mem_log?: MemAccess[];
+  mem_log_truncated?: boolean;
+  reg_trace?: { rip: string; changes?: Record<string, string> }[];
+  api_calls?: { api: string; address: string; return_to: string; result: string; args: string; note?: string }[];
+  api_call_count?: number;
+  layers?: { entry: string; page: string }[];
+  faults?: { address: string; rip: string }[];
+  fault_count?: number;
+  xmm?: Record<string, string>;
 };
 
 const kRegs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"];
@@ -32,6 +42,11 @@ export default function EmulatorView() {
   const [regs, setRegs] = useState<Record<string, string>>({ rcx: "", rdx: "", r8: "", r9: "" });
   const [maxInsns, setMaxInsns] = useState(100000);
   const [trace, setTrace] = useState(true);
+  const [memLog, setMemLog] = useState(true);
+  const [stubs, setStubs] = useState(true);
+  const [layers, setLayers] = useState(false);
+  const [zero, setZero] = useState(false);
+  const [regTrace, setRegTrace] = useState(false);
   const [res, setRes] = useState<EmuResult | null>(null);
   const [busy, setBusy] = useState(false);
   // Oracle mode: a buffer that is written before the run and read back after it.
@@ -69,6 +84,11 @@ export default function EmulatorView() {
       regs: r,
       max_insns: maxInsns,
       trace,
+      mem_log: memLog,
+      stubs,
+      layers,
+      trace_regs: regTrace,
+      on_unmapped: zero ? "zero" : "stop",
       ...(cleanCode ? { code: cleanCode.toLowerCase() } : {}),
       ...(write.length ? { write } : {}),
       ...(read.length ? { read } : {}),
@@ -109,6 +129,13 @@ export default function EmulatorView() {
             <div className="row">
               <span>max insns</span><input className="input mono" style={{ width: 100 }} type="number" value={maxInsns} onChange={(e) => setMaxInsns(Number(e.target.value))} />
               <label className="row"><input type="checkbox" checked={trace} onChange={(e) => setTrace(e.target.checked)} />trace</label>
+              <label className="row" title="Log every explicit memory read/write with its value"><input type="checkbox" checked={memLog} onChange={(e) => setMemLog(e.target.checked)} />memory</label>
+            </div>
+            <div className="row wrap">
+              <label className="row" title="Simulate common API calls (VirtualAlloc, GetProcAddress, memcpy, strlen, …) and return to the caller, so unpackers and decryptors run to the end"><input type="checkbox" checked={stubs} onChange={(e) => setStubs(e.target.checked)} />API stand-ins</label>
+              <label className="row" title="Report pages that were written and then executed: unpacking layers and their entry points"><input type="checkbox" checked={layers} onChange={(e) => setLayers(e.target.checked)} />unpack layers</label>
+              <label className="row" title="Map a zero page on unmapped reads and keep going (every fault is listed)"><input type="checkbox" checked={zero} onChange={(e) => setZero(e.target.checked)} />zero unmapped</label>
+              <label className="row" title="Record which registers change at every instruction"><input type="checkbox" checked={regTrace} onChange={(e) => setRegTrace(e.target.checked)} />register trace</label>
               <span className="grow" />
               <button className="btn primary" disabled={busy} onClick={() => void run()}>{busy ? "Running…" : "Emulate"}</button>
             </div>
@@ -160,6 +187,45 @@ export default function EmulatorView() {
                     </div>
                   ))}
                 </div>
+              )}
+              {res.mem_log && res.mem_log.length > 0 && (
+                <table className="table mono">
+                  <colgroup><col style={{ width: "34%" }} /><col style={{ width: 36 }} /><col style={{ width: "30%" }} /><col /></colgroup>
+                  <thead><tr><th>Memory ({res.mem_log.length}{res.mem_log_truncated ? ", limit hit" : ""})</th><th /><th>Address</th><th>Value</th></tr></thead>
+                  <tbody>{res.mem_log.map((m, i) => (
+                    <tr key={i}>
+                      <td className="link" onClick={() => ui.goDisasm(m.rip)}>{labelAddr(m.rip, modules)}</td>
+                      <td className={m.access === "r" ? "dim" : "warn"}>{m.access}</td>
+                      <td className="link" onClick={() => ui.select(m.address)} title={`${m.size} bytes`}>{labelAddr(m.address, modules)}</td>
+                      <td title={m.after !== undefined ? `${m.before || "?"} → ${m.after || "?"}` : m.before}>{m.after !== undefined ? <>{m.before || "?"} → <span className="ok">{m.after || "?"}</span></> : m.before || "?"}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              )}
+              {res.layers && res.layers.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>Unpacking layers ({res.layers.length})</th><th>written page</th></tr></thead>
+                  <tbody>{res.layers.map((l, i) => <tr key={i}><td className="link accent" onClick={() => ui.goDisasm(l.entry)}>{labelAddr(l.entry, modules)}</td><td className="faint">{l.page}</td></tr>)}</tbody>
+                </table>
+              )}
+              {res.api_calls && res.api_calls.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>API calls ({res.api_call_count})</th><th>args</th><th>result</th></tr></thead>
+                  <tbody>{res.api_calls.slice(0, 500).map((c, i) => <tr key={i}><td title={`from ${c.return_to}`}>{c.api}{c.note ? <span className="faint"> {c.note}</span> : null}</td><td className="faint ellipsis">{c.args}</td><td>{c.result}</td></tr>)}</tbody>
+                </table>
+              )}
+              {res.faults && res.faults.length > 0 && (
+                <div className="panel-section"><div className="label">Unmapped accesses ({res.fault_count})</div>
+                  <div className="mono faint" style={{ fontSize: 12 }}>{res.faults.slice(0, 40).map((f) => `${f.address} (rip ${f.rip})`).join(" · ")}</div></div>
+              )}
+              {res.reg_trace && res.reg_trace.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>Register trace ({res.reg_trace.length})</th><th>changes</th></tr></thead>
+                  <tbody>{res.reg_trace.slice(0, 1000).map((t, i) => <tr key={i}><td className="link" onClick={() => ui.goDisasm(t.rip)}>{labelAddr(t.rip, modules)}</td><td className="faint ellipsis">{t.changes ? Object.entries(t.changes).map(([k, v]) => `${k}=${v}`).join(" ") : ""}</td></tr>)}</tbody>
+                </table>
+              )}
+              {res.xmm && Object.values(res.xmm).some((v) => /[1-9a-f]/.test(v)) && (
+                <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.xmm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k}>{v}</span>])}</div>
               )}
               {res.trace.length > 0 && (
                 <table className="table mono">

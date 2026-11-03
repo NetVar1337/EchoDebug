@@ -6,12 +6,15 @@ publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std", "io-util"] }
 serde_json = "1"
 futures-util = "0.3"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 iced-x86 = "1"
 object = { version = "0.36", features = ["read", "elf", "std"] }
+getrandom = "0.3"
+pdb = "0.8"
+ureq = "3"
 
 [dev-dependencies]
 tokio-tungstenite = "0.28"
@@ -20,3 +23,8 @@ tower = { version = "0.5", features = ["util"] }
 [[bin]]
 name = "echodebug-relay"
 path = "src/main.rs"
+
+# Linux local backend: Unicorn for `emulate`, ptrace for the debugger.
+[target.'cfg(target_os = "linux")'.dependencies]
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
+nix = { version = "0.29", features = ["ptrace", "process", "signal"] }

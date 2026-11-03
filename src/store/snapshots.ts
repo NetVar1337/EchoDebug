@@ -8,8 +8,10 @@ export type Snapshot = {
   name: string;
   address: string;
   size: number;
-  /** base64 of the captured bytes; kept small so the store stays in localStorage */
+  /** base64 of the captured bytes; empty when the bytes live in IndexedDB (large captures) */
   data: string;
+  /** "idb" when the bytes are stored in IndexedDB under snap:<id> */
+  stored?: "idb";
   created: number;
 };
 
@@ -52,3 +54,22 @@ export function decodeBytes(s: string): Uint8Array {
 }
 
 export const kSnapshotMaxBytes = kMaxBytes;
+
+/** The captured bytes, wherever they are stored. */
+export async function snapshotBytes(s: Snapshot): Promise<Uint8Array> {
+  if (s.stored !== "idb") return decodeBytes(s.data);
+  const { idbGet } = await import("@/lib/idb");
+  const b = await idbGet(`snap:${s.id}`);
+  if (!b) throw new Error(`the bytes of ${s.name} are gone from IndexedDB`);
+  return b;
+}
+
+/** Keeps small captures inline (localStorage), large ones in IndexedDB. */
+export async function storeSnapshot(meta: Omit<Snapshot, "data" | "stored">, bytes: Uint8Array): Promise<Snapshot> {
+  if (bytes.length <= kMaxBytes) return { ...meta, data: encodeBytes(bytes) };
+  const { idbSet } = await import("@/lib/idb");
+  await idbSet(`snap:${meta.id}`, bytes);
+  return { ...meta, data: "", stored: "idb" };
+}
+
+export type SnapshotFile = { format: "echodebug.snapshots"; version: 1; snapshots: (Omit<Snapshot, "stored"> & { data: string })[] };

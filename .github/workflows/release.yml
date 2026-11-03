@@ -1,8 +1,9 @@
 name: Release
 
-# Every push to main that contains a feat/fix/perf/refactor/revert (or breaking) commit
-# bumps the version, tags it, builds the signed Windows installer and publishes a GitHub
-# release with latest.json, which the in-app updater polls.
+# Every push to main (a direct commit or a merged PR) bumps the patch version (only a breaking
+# change bumps minor while we are pre-1.0), tags it, builds the signed Windows and Linux
+# bundles and publishes a GitHub release with latest.json, which the in-app updater polls.
+# The bot's own "chore(release)" commit carries [skip ci] and is skipped below, so it never loops.
 on:
   push:
     branches: [main]
@@ -46,7 +47,7 @@ jobs:
         run: |
           v=$(node scripts/next-version.mjs --notes "$RUNNER_TEMP/notes.md" ${BUMP:+--bump $BUMP})
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "next version: ${v:-<none, nothing releasable>}"
+          echo "next version: ${v:-<none, no commit since the last release>}"
         env:
           BUMP: ${{ inputs.bump }}
       - name: Bump, commit and tag
@@ -95,7 +96,7 @@ jobs:
             echo "body<<__NOTES__"
             cat notes/notes.md
             printf '\n\n**Install (Windows):** run `EchoDebug_%s_x64-setup.exe` (per-user, no admin) or `EchoDebug_%s_x64_en-US.msi` (per-machine). Both update themselves.' "$VERSION" "$VERSION"
-            printf '\n\n**Install (Ubuntu/Linux):** `EchoDebug_%s_amd64.deb` installs with `sudo dpkg -i` / the Software app. For **auto-updates** use the AppImage (`EchoDebug.AppImage`) instead — the Tauri updater updates AppImages, not .deb installs. On Linux the app previews the full UI and talks MCP; process memory comes from a local `/proc` backend (the Echo agent is Windows-only).\n' "$VERSION"
+            printf '\n\n**Install (Ubuntu/Linux):** `EchoDebug_%s_amd64.deb` installs with `sudo dpkg -i` / the Software app; `EchoDebug_%s_amd64.AppImage` runs as is. Both update themselves (the .deb asks for your password to install). On Linux the app previews the full UI and talks MCP; process memory comes from a local `/proc` backend (the Echo agent is Windows-only).\n' "$VERSION" "$VERSION"
             printf '\n\n**Echo agent (Windows):** `echo_debug.as` is attached below and is also installed automatically to `%%APPDATA%%\\scripts` when EchoDebug starts.\n'
             echo "__NOTES__"
           } >> "$GITHUB_OUTPUT"
@@ -119,8 +120,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Ubuntu/.deb + AppImage. The AppImage carries the signed updater artifact (.tar.gz + .sig)
-  # that the in-app updater downloads; latest.json gets a linux-x86_64 platform entry.
+  # Ubuntu/.deb + AppImage, both signed. The updater only installs the format the app was
+  # installed as, so latest.json gets linux-x86_64-deb and linux-x86_64-appimage entries.
   build-linux:
     needs: [version, build]
     if: needs.version.outputs.version != ''
@@ -149,7 +150,10 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --bundles appimage,deb
+        run: |
+          npx tauri build --bundles appimage,deb
+          # createUpdaterArtifacts signs the AppImage; sign the .deb too if the bundler did not
+          for deb in target/release/bundle/deb/*.deb; do [ -f "$deb.sig" ] || npx tauri signer sign "$deb"; done
         working-directory: src-tauri
       - name: Upload Linux artifacts and extend latest.json
         shell: bash
@@ -159,12 +163,12 @@ jobs:
           set -e
           cd src-tauri/target/release/bundle
           ls appimage deb
+          # updater artifacts are the bundles themselves, each with a .sig next to it
           APPIMAGE=$(ls appimage/*.AppImage | head -1)
-          TARBALL=$(ls appimage/*.AppImage.tar.gz | head -1)
-          SIG="$TARBALL.sig"
           DEB=$(ls deb/*.deb | head -1)
-          gh release upload "v$VERSION" "$APPIMAGE" "$TARBALL" "$SIG" "$DEB" --clobber
+          gh release upload "v$VERSION" "$APPIMAGE" "$APPIMAGE.sig" "$DEB" "$DEB.sig" --clobber
           cd "$GITHUB_WORKSPACE"
           gh release download "v$VERSION" --pattern latest.json --dir .
-          node scripts/merge-latest-json.mjs latest.json "src-tauri/target/release/bundle/$SIG" "$VERSION" "$(basename "$TARBALL")"
+          B=src-tauri/target/release/bundle
+          node scripts/merge-latest-json.mjs latest.json "$VERSION" "$B/$APPIMAGE" "$B/$DEB"
           gh release upload "v$VERSION" latest.json --clobber
