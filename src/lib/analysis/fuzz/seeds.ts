@@ -167,7 +167,7 @@ let cache: { files: Seed[]; images: Seed[] } | null = null;
 /** PE seeds: the fixtures as files and mapped, plus the synthetic images (mapped). */
 export function peSeeds(): { files: Seed[]; images: Seed[] } {
   if (cache) return cache;
-  const files = ["fix.exe", "fix-res.exe", "fix-signed.exe"].map((n) => {
+  const files = ["fix.exe", "fix-res.exe", "fix-signed.exe", "fix-seh.exe", "fix-a64.exe"].map((n) => {
     const bytes = fixture(n);
     return { name: n, bytes, regions: peRegions(bytes, false) };
   });

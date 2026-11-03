@@ -2,7 +2,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { clean, fc, inputs, kTimeout, params } from "./harness";
-import { elfFile, elfRegions, type Seed } from "./seeds";
+import { elfFile, elfRegions, fixture, type Seed } from "./seeds";
+import { detectArch } from "../arch";
+import { a64Refs } from "../a64";
 import { elfBias, isElf, parseElf } from "../elf";
 import { buildXrefIndex, elfExecutableRanges, executableRanges } from "../xrefindex";
 
@@ -12,10 +14,13 @@ function analyse(b: Uint8Array): void {
   const ranges = clean(() => elfExecutableRanges(b)) ?? [];
   clean(() => buildXrefIndex(b, ranges));
   clean(() => executableRanges(b));
+  clean(() => detectArch(b, false));
+  clean(() => a64Refs(b, ranges, 10_000));
 }
 
 describe("ELF parser under random and mutated input", () => {
-  const seeds: Seed[] = [{ name: "synthetic", bytes: elfFile(), regions: elfRegions() }];
+  const a64 = fixture("fix-a64.elf");
+  const seeds: Seed[] = [{ name: "synthetic", bytes: elfFile(), regions: elfRegions() }, { name: "fix-a64.elf", bytes: a64, regions: [[0, 64], [64, 64 + 8 * 56]] }];
   // a real ELF from the host, cut to its first 64 KiB (section headers are dropped, the rest stays)
   const host = ["/bin/true", "/usr/bin/true"].find((p) => existsSync(p) && isElf(new Uint8Array(readFileSync(p).subarray(0, 4))));
   if (host) {

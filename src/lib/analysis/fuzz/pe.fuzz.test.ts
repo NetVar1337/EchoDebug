@@ -23,6 +23,9 @@ import { stringAt } from "../annotate";
 import { parseDotnet } from "../dotnet";
 import { dumpNetvars } from "../engines/source";
 import { findNamePools, findObjectArrays } from "../engines/unreal";
+import { listExceptionHandlers, parseUnwindInfo, tlsCallbacks } from "../seh";
+import { detectArch } from "../arch";
+import { a64Refs } from "../a64";
 
 const kBase = 0x140000000n;
 
@@ -38,7 +41,12 @@ function analyseImage(img: Uint8Array): void {
   clean(() => detectPacker(img));
   clean(() => scanAntiDebug(img, kBase));
   clean(() => parseDotnet(img));
+  clean(() => detectArch(img, true));
+  clean(() => detectArch(img, false));
+  clean(() => listExceptionHandlers(img));
   if (!pe) return;
+  clean(() => tlsCallbacks(img, pe.imageBase, pe));
+  for (const f of (clean(() => parseRuntimeFunctions(img, pe)) ?? []).slice(0, 16)) clean(() => parseUnwindInfo(img, f.unwind));
   clean(() => parseRuntimeFunctions(img, pe));
   clean(() => parseTls(img, pe.imageBase, pe));
   clean(() => parseRelocs(img, pe));
@@ -49,6 +57,7 @@ function analyseImage(img: Uint8Array): void {
   const rtti = clean(() => buildRtti(img, kBase, pe));
   for (const c of rtti?.classes.slice(0, 4) ?? []) clean(() => findVftables(img, kBase, c, pe));
   const ranges = clean(() => executableRanges(img, pe)) ?? [];
+  clean(() => a64Refs(img, ranges, 10_000));
   clean(() => buildXrefIndex(img, ranges));
   clean(() => findXrefs(img, ranges, pe.entryRva));
   clean(() => findIat(img, exportIndex(pe)));
@@ -120,6 +129,10 @@ describe("PE parsers under random and mutated input", () => {
         clean(() => stringAt(b, at));
         clean(() => buildXrefIndex(b, [{ rva: 0, size: b.length }]));
         clean(() => findXrefs(b, [{ rva: 0, size: b.length }], at));
+        clean(() => findXrefs(b, [{ rva: 0, size: b.length }], at, 100, "arm64"));
+        clean(() => a64Refs(b, [{ rva: 0, size: b.length }]));
+        clean(() => parseUnwindInfo(b, at));
+        clean(() => detectArch(b));
       }),
       params(),
     );

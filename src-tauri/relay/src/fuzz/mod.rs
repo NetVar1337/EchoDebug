@@ -1,13 +1,14 @@
-//! Property / fuzz tests for everything in the relay that parses target memory or file bytes:
-//! the symbolic lifter's decoder (target code bytes, addresses anywhere in the 64-bit space),
-//! the link_map / auxv walker and the Itanium RTTI readers (hostile target memory), the Itanium
-//! type-name demangler, the instance / xref scanners, PDB files (symbol-server downloads) and
-//! the page hash.
+//! Property / fuzz tests for everything in the relay that parses target memory or file bytes.
+//! Here: the symbolic lifter's decoder (target code bytes, addresses anywhere in the 64-bit
+//! space), the link_map / auxv walker and the Itanium RTTI readers (hostile target memory), the
+//! Itanium type-name demangler, the instance / xref scanners, PDB files, `.pd_` cabinets and the
+//! page hash. `files.rs`: the stack unwinder (PE .pdata / UNWIND_INFO, ELF .eh_frame CFI), the
+//! time-travel trace file decoder and the PDB type database.
 //!
 //! Properties: no panic (an overflow in debug builds is one), and every call inside a time
 //! budget. `FUZZ_CASES` sets the cases per property (default 64, quick enough for every
 //! `cargo test`), `FUZZ_BUDGET_MS` the budget (default 2000 ms: these run unoptimised); a long
-//! run is `FUZZ_CASES=100000 cargo test -p echo-debug-relay fuzz -- --nocapture`.
+//! run is `FUZZ_CASES=100000 cargo test -p echo-debug-relay fuzz`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 
 use crate::lift::{devirt, lift_block, lift_trace, Pages};
+
+mod files;
 use crate::local::{MapLine, MemIo};
 
 fn cases() -> u32 {
@@ -215,7 +218,7 @@ fn pdb_case(bytes: &[u8]) {
     let path = dir.join("case.pdb");
     std::fs::write(&path, bytes).unwrap();
     timed("pdb_identity", || crate::symbols::pdb_identity(&path).is_ok());
-    timed("read_symbols", || crate::symbols::read_symbols(&path, 100_000).map(|v| v.len()).unwrap_or(0));
+    timed("pdbinfo::load", || crate::pdbinfo::load(&path).map(|l| l.syms.len()).ok());
     let _ = std::fs::remove_file(&path);
 }
 
@@ -233,6 +236,16 @@ proptest! {
         f.extend_from_slice(&b);
         pdb_case(&b);
         pdb_case(&f);
+    }
+
+    #[test]
+    fn cabinet_reader_survives_random_files(b in prop::collection::vec(any::<u8>(), 0..2048), head in prop::collection::vec(any::<u8>(), 0..40)) {
+        // a `.pd_` from a symbol server: MSCF header fields then anything
+        let mut f = b"MSCF\0\0\0\0".to_vec();
+        f.extend_from_slice(&head);
+        f.extend_from_slice(&b);
+        timed("uncab", || crate::symbols::uncab(&f).map(|v| v.len()).ok());
+        timed("parse_rsds", || crate::symbols::parse_rsds(&b).is_some());
     }
 }
 
@@ -275,4 +288,20 @@ fn link_map_and_type_info_pointers_at_the_top_of_memory() {
     let auxv: HashMap<u64, u64> = [(3, u64::MAX - 7), (5, 4)].into_iter().collect();
     crate::local_ext::walk_link_map(&mem, &auxv);
     crate::local_ext::itanium_resolve(&mem, &obj(json!({ "address": "0x1000" })));
+}
+
+#[test]
+fn damaged_pdb_is_an_error_not_a_panic() {
+    // single u32 edits of the fixture made the pdb crate index past a buffer (also in release):
+    // 0xffffffff at 0x6008 (a module stream size), 0x1000 at 0xb10c (a name offset)
+    for (at, v) in [(0x6008usize, 0xffff_ffffu32), (0xb10c, 0x1000), (0xb018, 0xffff_ffff)] {
+        let mut b = pdb_fixture();
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("echodebug-damaged-{at:x}-{}.pdb", std::process::id()));
+        std::fs::write(&path, &b).unwrap();
+        let loaded = crate::pdbinfo::load(&path).map(|_| ());
+        let ident = crate::symbols::pdb_identity(&path).map(|_| ());
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_err() || ident.is_err(), "0x{at:x}");
+    }
 }

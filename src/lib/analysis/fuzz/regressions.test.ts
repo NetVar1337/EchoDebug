@@ -20,6 +20,7 @@ import { ElfError, parseElf } from "../elf";
 import { parseMetadata } from "../engines/il2cpp";
 import { findNamePools } from "../engines/unreal";
 import { resolveSwitch } from "../jumptables";
+import { a64Refs } from "../a64";
 
 /** A mapped PE32+ of `size` bytes with no sections, for tests that write their own tables. */
 function blankPe(size: number, dirs: Record<number, { rva: number; size: number }> = {}): { img: Uint8Array; dv: DataView } {
@@ -139,6 +140,21 @@ describe("PE regressions", () => {
     expect(v.length).toBe(0x80000 / 8 - 1);
     expect(v[0].slots).toBe(0x80000 / 8);
     expect(v[v.length - 1].slots).toBe(2);
+  });
+
+  it("buildDumpPe refuses headers that run past the dump (it wrote section headers out of bounds)", () => {
+    // a 0x200-byte dump with SectionAlignment 0x10: the output is ~0x240 bytes, but the data
+    // directories and section headers it rewrites were taken to lie inside SizeOfHeaders (0x400)
+    const { img, dv } = blankPe(0x1000);
+    dv.setUint32(kOh + 32, 0x10, true);
+    dv.setUint32(kOh + 60, 0x400, true);
+    dv.setUint16(0x84 + 2, 0, true);
+    expect(() => clean(() => buildDumpPe(img.slice(0, 0x200), 0x140000000n, 0x1000, []))).not.toThrow();
+    expect(() => buildDumpPe(img.slice(0, 0x200), 0x140000000n, 0x1000, [])).toThrow(/cut short/);
+  });
+
+  it("ARM64 reference scan of a section at RVA >= 2^31 (32-bit alignment went negative)", () => {
+    expect(() => a64Refs(new Uint8Array(64), [{ rva: 0x80000001, size: 0x40 }, { rva: 0, size: 64 }])).not.toThrow();
   });
 
   it("buildDumpPe refuses a SectionAlignment that would size a 2 GiB output", () => {
