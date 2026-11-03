@@ -10,6 +10,7 @@ import { toGhidra, toIdc, useNames } from "@/store/names";
 import { useConn } from "@/store/conn";
 import { useUi } from "@/store/ui";
 import { copy, IconButton, Panel } from "../ui";
+import { addressMenu } from "../AddressMenu";
 
 export default function NamesPanel() {
   const names = useNames();
@@ -82,7 +83,7 @@ export default function NamesPanel() {
             <thead><tr><th>Address</th><th>Name / comment</th><th /></tr></thead>
             <tbody>
               {shown.map((n) => (
-                <tr key={n.address} data-selected={ui.selected === n.address} onClick={() => ui.select(n.address)} onDoubleClick={() => ui.goDisasm("0x" + n.address)}>
+                <tr key={n.address} data-selected={ui.selected === n.address} onClick={() => ui.select(n.address)} onDoubleClick={() => ui.goDisasm("0x" + n.address)} onContextMenu={addressMenu(fmtAddr(BigInt("0x" + n.address)))}>
                   <td className="mono dim">{labelAddr("0x" + n.address, modules)}</td>
                   <td>
                     {n.name && <span className="accent mono">{n.name}</span>}

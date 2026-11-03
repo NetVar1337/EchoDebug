@@ -110,6 +110,8 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Access finder | **Find what writes / accesses this address** (Cheat Engine style) from the Memory view or Watchlist right-click menu: a hardware watchpoint on every thread while the process keeps running; each instruction that hits it is listed with its disassembly, hit count and the registers of its last hit, linked to the disassembly. Attaches the native debugger when needed and detaches when the trace stops; MCP tools `find_accesses_*` |
 | API monitor | **API Monitor** tab: pick imports or exports (`module!function`, from the module's import table or typed), log every call with its arguments decoded for a built-in table of Win32 and libc signatures (CreateFileW, VirtualAlloc, VirtualProtect, ReadFile, WriteFile, LoadLibraryW, GetProcAddress, RegOpenKeyExW, connect, send, recv, open, read, write, mmap, mprotect, …; raw argument registers otherwise), the return value and the caller; filter, CSV export. Debugger breakpoints only (an int3 on each entry and on the return address), nothing injected; MCP tools `api_monitor_*` |
 | Script | Async JavaScript against an `ed` API (verbs, memory, journaled writes, names, disassembly, every app analysis), saved scripts |
+| Disassembler sync | **IDA 9.x, Ghidra 11.1+ and Binary Ninja** plugins (`integrations/`) connect to the relay's token-protected `/sync` WebSocket: the disassembly cursor follows the disassembler and the disassembler follows EchoDebug, names and comments sync both ways (last writer wins, conflicts in the sync log), struct types are pushed as C declarations; locations travel as module + RVA so ASLR and rebased databases line up. **Sync** panel (⇄ in the rail): connected tools, module mapping, a toggle per direction, the log. MCP tool `sync_status` (read-only) |
+| Plugins | Third-party **views, palette commands, address context-menu entries and table analyses** as JavaScript modules in `<config>/EchoDebug/plugins`, built on the Script `ed` API; a `manifest.json` declares id, version, entry and permissions (`write` for journaled writes, `annotate` for names; read-only otherwise), shown before you enable a plugin in Settings → Plugins. Example in `examples/plugins/`. Plugins are never exposed over MCP |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, PDB symbols / types / source lines, …) and tools that read and set your names and comments, list and revert journalled patches and list saved signatures, 16 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Value graphs | **Value Graphs** tab: watched addresses plotted over time (i8..u64, f32, f64), several series at once, fed by a batched poll (20 ms–10 s) and the agent's `watch_event` stream into per-series ring buffers (configurable length); wheel zooms, drag pans, double-click returns to live; hover cursor with value and time; pause; min / max / avg over the visible window; CSV export; **Graph this** from the watchlist (button or right-click) |
 | Search everything | **Ctrl+Shift+F** (also in the command palette): one box over names, comments, bookmarks and labelled watches, saved signatures, struct types and fields, modules, exports of every loaded module (read from the export directory only) and the strings of modules already opened in Strings; **Search strings in all modules** extracts the rest on request. Fuzzy ranking (word starts, camelCase, addresses), grouped results, arrow keys + Enter jump to the right view |
@@ -133,6 +135,42 @@ debugger is the relay's own: ptrace on Linux, and on Windows an optional Win32 u
 for a local process, which unlike Echo is visible to the target). One target is attached at a time; the
 Targets panel switches between recent targets. FLIRT files in IDA 9.5's version 11 format are not
 read yet: that layout is not publicly documented.
+
+### Disassembler sync (IDA, Ghidra, Binary Ninja)
+
+Copy the plugin for your disassembler from [`integrations/`](integrations/README.md) (IDA: the
+plugin file plus `integrations/python/echodebug_sync.py` into the plugins folder; Ghidra: the
+`EchoDebugSync.java` script; Binary Ninja: the plugin folder plus the same Python core), then start
+it in the disassembler (IDA: Ctrl-Alt-E, Ghidra: Tools → EchoDebug Sync, Binary Ninja: Plugins →
+EchoDebug → Start sync). Plugins read the relay token from `<config>/EchoDebug/relay-token` (or
+`ECHODEBUG_TOKEN`) and connect to `ws://127.0.0.1:47110/sync`. The **Sync** panel lists connected
+tools and their modules (map a differently named file to the live module there), switches each
+direction on or off, pushes your names, comments and struct types, and shows the sync log.
+
+### Plugins
+
+A plugin is a folder in `<config>/EchoDebug/plugins/` (`%APPDATA%\EchoDebug\plugins` on Windows,
+`~/.config/EchoDebug/plugins` on Linux; Settings → Plugins → Open) with a `manifest.json`:
+
+```json
+{ "id": "acme.vtables", "name": "VTable tools", "version": "1.0.0", "entry": "index.js", "permissions": ["write"] }
+```
+
+and a self-contained ES module (bundle it; relative imports are not resolved) exporting
+`activate(ctx)` and optionally `deactivate()`. `ctx.ed` is the Script API (`read`, `readU64`,
+`disasm`, `modules`, `label`, `names.get`, `ui("ui_strings", …)`, `request(verb)` for MCP catalog
+verbs, …) with the manifest's permissions enforced: without `write` there are no memory writes or
+stateful verbs (scanner, emulator, attach), with it `ed.write` writes through the patch journal;
+raw `write` / `freeze` verbs are never available to plugins; `annotate` allows `ed.names.set` /
+`comment`. `ctx.registerView({ id, title, render(container) })` adds a tab to the **Plugins** view
+(render into the element; return a cleanup function), `registerCommand({ id, label, run })` adds a
+command palette entry, `registerAddressAction({ id, label, run(address), when? })` adds a
+right-click entry on addresses (disassembly, names), `registerAnalysis({ id, title, params?, run(args) })`
+returns `{ columns, rows }` shown as a table (addresses are clickable). `ctx.navigate(address)`
+opens the disassembly and `ctx.log(...)` prints to Output. Enable plugins in **Settings → Plugins**;
+the permissions are shown before a plugin is enabled. Plugins run as JavaScript inside the app
+window (permissions are enforced by the API, not a sandbox), so install only plugins you trust.
+[`examples/plugins/module-overview`](examples/plugins/module-overview) shows each registration.
 
 ### Connecting an MCP client
 
@@ -176,6 +214,7 @@ npm run dev                  # UI only in a browser (needs a relay: cargo run -p
 npm test                     # frontend unit tests (PE/ELF/.NET parsers, assembler, CFG, YARA, FLIRT, diff, unpacking, struct auto-detect, engine readers, …)
 npm run test:e2e             # end-to-end UI test against a live process (Linux: gcc, cargo, playwright)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml   # relay, local backend, ptrace, Unicorn, PDB
+python3 -m unittest discover -s integrations/python                  # sync client core of the IDA / Binary Ninja plugins
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 # agent tests: compiles echo_debug.as with the real AngelScript engine against mocks of Echo's API
 cmake -S tests/agent -B build/agent-tests && cmake --build build/agent-tests -j && ctest --test-dir build/agent-tests --output-on-failure

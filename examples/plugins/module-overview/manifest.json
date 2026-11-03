@@ -1,0 +1,9 @@
+{
+  "id": "example.module-overview",
+  "name": "Module overview",
+  "version": "1.0.0",
+  "entry": "index.js",
+  "permissions": [],
+  "description": "Example plugin: a modules view, a pointer-table analysis, a palette command and an address action. Read-only.",
+  "author": "EchoDebug examples"
+}
