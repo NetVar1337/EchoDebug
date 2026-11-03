@@ -205,13 +205,14 @@ type Node =
   | { k: "if"; c: Expr; then: Node[]; else: Node[]; addr: string }
   | { k: "while" | "do"; c: Expr; body: Node[]; addr: string }
   | { k: "loop"; body: Node[]; addr: string }
-  | { k: "for"; init: Stmt | null; c: Expr; step: Stmt | null; body: Node[]; addr: string }
+  | { k: "for"; init: Stmt | null; c: Expr; step: Stmt | null; steps?: Stmt[]; body: Node[]; addr: string }
   | { k: "switch"; x: Expr; cases: { vals: bigint[]; body: Node[] }[]; def: Node[] | null; addr: string }
   | { k: "ret"; t: Term }
   | { k: "goto" | "label"; block: number }
   | { k: "break" | "continue" };
 
-type Ctx = { kind: "loop"; header: number; exit: number | null; latch: number | null } | { kind: "switch"; exit: number | null };
+/** `step`: a for-loop's increment block; reaching it is `continue` */
+type Ctx = { kind: "loop"; header: number; exit: number | null; latch: number | null; step?: number } | { kind: "switch"; exit: number | null };
 
 export function structureIr(f: IrFunc): Node[] {
   const n = f.blocks.length;
@@ -237,7 +238,7 @@ export function structureIr(f: IrFunc): Node[] {
   const leave = (x: number, ctx: Ctx[]): Node[] | null => {
     const top = ctx[ctx.length - 1];
     const loop = [...ctx].reverse().find((c) => c.kind === "loop") as Extract<Ctx, { kind: "loop" }> | undefined;
-    if (loop && x === loop.header) return [{ k: "continue" }];
+    if (loop && (x === loop.header || x === loop.step)) return [{ k: "continue" }];
     if (top && x === top.exit) return [{ k: "break" }];
     if (isSmallExit(x) && emitted.has(x)) return [...body(x), ...exitNodes(x)];
     if (emitted.has(x)) {
@@ -339,8 +340,19 @@ export function structureIr(f: IrFunc): Node[] {
     if (t.k === "cond" && blk(h).stmts.length === 0) {
       if ((t.t === exit && loop.body.has(t.f)) || (t.f === exit && loop.body.has(t.t))) {
         emitted.add(h);
-        region(t.t === exit ? t.f : t.t, h, [...ctx, { kind: "loop", header: h, exit, latch: null }], lbody);
-        out.push({ k: "label", block: h }, { k: "while", c: t.t === exit ? negate(t.c) : t.c, body: trimContinue(lbody), addr: t.addr });
+        const first = t.t === exit ? t.f : t.t;
+        const c = t.t === exit ? negate(t.c) : t.c;
+        // a single small latch that only steps and jumps back: for (...; c; step), and edges to it are continue
+        const l = loop.latches.length === 1 ? loop.latches[0] : null;
+        const lb = l !== null ? blk(l) : null;
+        if (l !== null && lb && l !== h && l !== first && lb.term.k === "jump" && lb.stmts.length >= 1 && lb.stmts.length <= 2 && lb.stmts.every((s) => s.k === "set")) {
+          region(first, l, [...ctx, { kind: "loop", header: h, exit, latch: null, step: l }], lbody);
+          emitted.add(l);
+          out.push({ k: "label", block: h }, { k: "for", init: null, c, step: lb.stmts.length === 1 ? lb.stmts[0] : null, steps: lb.stmts, body: trimContinue(lbody), addr: t.addr });
+          return exit;
+        }
+        region(first, h, [...ctx, { kind: "loop", header: h, exit, latch: null }], lbody);
+        out.push({ k: "label", block: h }, { k: "while", c, body: trimContinue(lbody), addr: t.addr });
         return exit;
       }
     }
@@ -391,6 +403,10 @@ function mapChildren(x: Node, f: (l: Node[]) => Node[]): Node {
     default:
       return x;
   }
+}
+
+function termCall(t: Term): Expr {
+  return t.k === "tail" ? t.call : t.k === "ret" && t.v ? t.v : { k: "c", v: 0n, w: 1 };
 }
 
 function trimContinue(body: Node[]): Node[] {
@@ -444,6 +460,8 @@ function tidy(list: Node[], names: Names, top = false): Node[] {
   let out: Node[] = [];
   for (const x0 of list) {
     let x = mapChildren(x0, (l) => tidy(l, names));
+    // a trailing continue does nothing
+    if (x.k === "while" || x.k === "for" || x.k === "loop" || x.k === "do") x = { ...x, body: trimContinue(x.body) };
     if (x.k === "if") {
       if (!x.then.length && x.else.length) x = { ...x, c: negate(x.c), then: x.else, else: [] };
       if (!x.then.length && !x.else.length && !hasCall(x.c)) continue;
@@ -475,7 +493,26 @@ function tidy(list: Node[], names: Names, top = false): Node[] {
         }
       }
     }
+    if (x.k === "for" && !x.init) {
+      // the assignment right before the loop of a variable the loop steps or tests
+      const prev = out[out.length - 1];
+      if (prev?.k === "s" && prev.s.k === "set") {
+        const iv = names.def(prev.s);
+        const stepped = (x.steps ?? (x.step ? [x.step] : [])).some((st) => names.def(st) === iv);
+        if (iv && stepped) {
+          out.pop();
+          x = { ...x, init: prev.s };
+        }
+      }
+    }
     out.push(x);
+  }
+  // `if (c) { A; jump } J` with J a lone break / return / goto: `if (!c) J; A; jump`
+  const n = out.length;
+  const last = out[n - 1];
+  const prev = out[n - 2];
+  if (n >= 2 && prev.k === "if" && !prev.else.length && endsInJump(prev.then) && prev.then.length > 1 && (last.k === "break" || last.k === "goto" || (last.k === "ret" && !hasCall(termCall(last.t))))) {
+    out = [...out.slice(0, -2), { ...prev, c: negate(prev.c), then: [last], else: [] }, ...prev.then];
   }
   if (top) {
     // a void function's final bare return
@@ -952,7 +989,8 @@ class Printer {
         return;
       case "for": {
         const strip = (s: Stmt | null) => (s ? (this.stmt(s) ?? "").replace(/;$/, "") : "");
-        out.push({ indent, text: `for (${strip(x.init)}; ${this.cond(x.c)}; ${strip(x.step)}) {`, addr: x.addr });
+        const step = (x.steps ?? (x.step ? [x.step] : [])).map(strip).filter(Boolean).join(", ");
+        out.push({ indent, text: `for (${strip(x.init)}; ${this.cond(x.c)}; ${step}) {`, addr: x.addr });
         this.nodes(x.body, indent + 1, out);
         out.push({ indent, text: "}" });
         return;

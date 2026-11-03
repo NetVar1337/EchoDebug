@@ -337,6 +337,72 @@ describe("structuring", () => {
     ])).toEqual(["for (v1 = 0; v1 < a1; ++v1) {", "}", "return v1;"]);
   });
 
+  it("for loop with continue and break: edges to the step block are continue", () => {
+    expect(body([
+      [0x00, "xor eax, eax"],
+      [0x02, "xor r8d, r8d"],
+      [0x05, "cmp r8d, edx"],
+      [0x08, "jge 0x30"],
+      [0x0a, "mov r9d, dword ptr [rcx+r8*4]"],
+      [0x0e, "test r9d, r9d"],
+      [0x11, "je 0x20"],
+      [0x13, "js 0x30"],
+      [0x15, "add eax, r9d"],
+      [0x20, "inc r8d"],
+      [0x23, "jmp 0x5"],
+      [0x30, "ret"],
+    ])).toEqual([
+      "v1 = 0;",
+      "for (v2 = 0; v2 < a2; ++v2) {",
+      "  v3 = ((_DWORD *)a1)[v2];",
+      "  if (v3 == 0) {",
+      "    continue;",
+      "  }",
+      "  if (v3 < 0) {",
+      "    break;",
+      "  }",
+      "  v1 += v3;",
+      "}",
+      "return v1;",
+    ]);
+  });
+
+  it("switch inside a loop: case bodies continue the loop, the exit case breaks out", () => {
+    expect(body([
+      [0x00, "xor eax, eax"],
+      [0x02, "movzx edx, byte ptr [rcx]"],
+      [0x05, "inc rcx"],
+      [0x08, "cmp edx, 0x2"],
+      [0x0b, "ja 0x2"],
+      [0x0d, "jmp qword ptr [rdx*8+0x1000]"],
+      [0x20, "ret"],
+      [0x30, "inc eax"],
+      [0x32, "jmp 0x2"],
+      [0x40, "dec eax"],
+      [0x42, "jmp 0x2"],
+    ], { switches: new Map([[0xdn, [0x20n, 0x30n, 0x40n]]]) })).toEqual([
+      "v1 = 0;",
+      "while (1) {",
+      "  v2 = a1->field_0;",
+      "  ++a1;",
+      "  switch (v2) {",
+      "    case 0:",
+      "      break;",
+      "    case 1:",
+      "      ++v1;",
+      "      continue;",
+      "    case 2:",
+      "      --v1;",
+      "      continue;",
+      "    default:",
+      "      continue;",
+      "  }",
+      "  break;",
+      "}",
+      "return v1;",
+    ]);
+  });
+
   it("a loop that tests first and breaks becomes while", () => {
     expect(body([
       [0x10, "mov eax, dword ptr [rcx]"],

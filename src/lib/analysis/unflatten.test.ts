@@ -180,6 +180,53 @@ describe("control-flow flattening removal", () => {
     expect(out.join("\n")).toContain("switch (");
   });
 
+  it("-O0 flattening: state and switch variable on the stack, sub/je tree, branch-selected states", () => {
+    // int f(int n) { int s = 0; if (n > 0) s += n; return s; } flattened
+    const rows: [number, string][] = [
+      [0x00, "push rbp"],
+      [0x01, "mov rbp, rsp"],
+      [0x04, "mov dword ptr [rbp-0x4], ecx"],
+      [0x07, "mov dword ptr [rbp-0x8], 0x0"],
+      [0x0e, "mov dword ptr [rbp-0xc], 0xaaaa"],
+      [0x15, "mov eax, dword ptr [rbp-0xc]"], // dispatcher: switchVar = state
+      [0x18, "mov dword ptr [rbp-0x10], eax"],
+      [0x1b, "sub eax, 0xaaaa"],
+      [0x20, "je 0x40"],
+      [0x22, "jmp 0x24"],
+      [0x24, "mov eax, dword ptr [rbp-0x10]"],
+      [0x27, "sub eax, 0xbbbb"],
+      [0x2c, "je 0x50"],
+      [0x2e, "jmp 0x30"],
+      [0x30, "mov eax, dword ptr [rbp-0x10]"],
+      [0x33, "sub eax, 0xcccc"],
+      [0x38, "je 0x70"],
+      [0x3a, "jmp 0x80"],
+      [0x40, "cmp dword ptr [rbp-0x4], 0x0"], // the real branch, with a state block on each side
+      [0x44, "jle 0x4c"],
+      [0x46, "mov dword ptr [rbp-0xc], 0xbbbb"],
+      [0x4a, "jmp 0x80"],
+      [0x4c, "mov dword ptr [rbp-0xc], 0xcccc"],
+      [0x4e, "jmp 0x80"],
+      [0x50, "mov eax, dword ptr [rbp-0x8]"],
+      [0x53, "add eax, dword ptr [rbp-0x4]"],
+      [0x56, "mov dword ptr [rbp-0x8], eax"],
+      [0x59, "mov dword ptr [rbp-0xc], 0xcccc"],
+      [0x60, "jmp 0x80"],
+      [0x70, "mov eax, dword ptr [rbp-0x8]"],
+      [0x73, "pop rbp"],
+      [0x74, "ret"],
+      [0x80, "jmp 0x15"],
+    ];
+    const { report, ir } = buildIr(buildStructure(listing(rows)), { unflatten: true });
+    expect(report).toMatchObject({ flattened: true, dispatcher: "0x15", state: "var_14", unresolved: [] });
+    expect(report!.recovered.map((r) => [r.block, r.next])).toEqual([["0x0", ["0x40"]], ["0x46", ["0x50"]], ["0x4c", ["0x70"]], ["0x50", ["0x70"]]]);
+    // entry -> branch -> (add) -> return
+    expect(irGraph(ir).blocks.map((b) => b.addr)).toEqual(["0x0", "0x40", "0x50", "0x70"]);
+    const out = text(rows, true).map((l) => l.trim());
+    expect(out).toEqual(["int __fastcall sub_0(int a1)", "{", "int var_10; // stack", "", "var_10 = 0;", "if (a1 > 0) {", "var_10 = a1;", "}", "return var_10;", "}"]);
+    expect(out.join("\n")).not.toMatch(/0xaaaa|0xbbbb|0xcccc|while/);
+  });
+
   it("leaves ordinary functions alone", () => {
     const { report } = buildIr(buildStructure(listing(original)), { unflatten: true });
     expect(report?.flattened).toBe(false);
