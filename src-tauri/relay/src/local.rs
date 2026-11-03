@@ -874,7 +874,7 @@ fn local_detach(relay: &Relay, orig: &Value) -> Value {
 
 pub(crate) fn find_pid_by_name(name: &str) -> Option<u32> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut sys = System::new();
+    let mut sys = System::new().ok()?;
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
     sys.processes()
         .values()
