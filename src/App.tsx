@@ -22,6 +22,7 @@ import { Boundary, Lazy } from "@/components/ui";
 import { startProvider } from "@/lib/provider";
 import { startMcpPolicy } from "@/store/mcp";
 import { startMonitors } from "@/store/monitors";
+import { startGraphs } from "@/store/graphs";
 import ApprovalDialog from "@/components/ApprovalDialog";
 import { redo, undo } from "@/lib/history";
 import { startProjects } from "@/lib/projects";
@@ -59,6 +60,7 @@ export default function App() {
     startProvider();
     startMcpPolicy();
     startMonitors();
+    startGraphs();
     startProjects();
     startWorkspace();
     startAutoPatches();

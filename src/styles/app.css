@@ -408,3 +408,18 @@ html[data-motion="off"] *::after {
 .vtrace { display: flex; flex-wrap: wrap; gap: 3px; max-height: 160px; overflow: auto; }
 .vtrace .pill { padding: 0 5px; font-size: 11px; }
 .toolbar.wrap { flex-wrap: wrap; height: auto; padding-top: 6px; padding-bottom: 6px; }
+
+/* value graphs */
+.btn[data-active="true"] { border-color: var(--accent); color: var(--accent); }
+.vgraph { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: auto; }
+.vgraph-plot { position: relative; flex: 1 1 260px; min-height: 200px; overflow: hidden; border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); background: var(--bg-0); user-select: none; }
+.vgraph-plot canvas { position: absolute; inset: 0; display: block; }
+.vgraph-empty { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; }
+.vgraph-note { position: absolute; right: 12px; top: 8px; font-size: 11.5px; pointer-events: none; }
+.vgraph-tip { position: absolute; width: 180px; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: 0 6px 20px rgb(0 0 0 / 40%); pointer-events: none; }
+.vgraph-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; vertical-align: middle; }
+.vgraph-stats { flex-shrink: 0; }
+.vgraph-help { padding: 4px var(--pad-md); font-size: 11.5px; }
+.ctx-menu { position: fixed; z-index: 120; min-width: 150px; padding: 4px; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 10px 30px rgb(0 0 0 / 45%); }
+.ctx-menu button { padding: 5px 10px; text-align: left; font-size: var(--type-small); border-radius: var(--radius-sm); }
+.ctx-menu button:hover { background: var(--selection); }

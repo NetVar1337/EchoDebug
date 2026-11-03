@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Lock, LockOpen, Plus, X } from "lucide-react";
+import { LineChart, Lock, LockOpen, Plus, X } from "lucide-react";
 import { request } from "@/lib/client";
 import { readMany } from "@/lib/batch";
 import { bytesToHex, fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
@@ -10,6 +10,8 @@ import { usePatches } from "@/store/patches";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry } from "@/store/watch";
+import { useGraphs } from "@/store/graphs";
+import { graphTypeOf } from "@/lib/graphs";
 import { CommitInput, IconButton, Panel } from "../ui";
 
 const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "ptr", "ascii", "utf16"];
@@ -29,6 +31,22 @@ export default function WatchPanel() {
   // conditional alerts live in the Echo agent; fired ones are logged to Output by the conn store
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [al, setAl] = useState({ address: "", type: "i32", cond: "changed", value: "", once: false });
+  const [menu, setMenu] = useState<{ x: number; y: number; e: WatchEntry } | null>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener("mousedown", close);
+    window.addEventListener("blur", close);
+    return () => { window.removeEventListener("mousedown", close); window.removeEventListener("blur", close); };
+  }, [menu]);
+
+  /** Plots the watch in the Value Graphs view. */
+  const graph = (e: WatchEntry) => {
+    const t = graphTypeOf(e.type);
+    if (!t) return log("warn", "graph", `${e.type} values cannot be graphed; pick a number type`);
+    useGraphs.getState().add(e.address, t, e.label);
+    ui.setTab("values");
+  };
 
   const refreshAlerts = useCallback(async () => {
     if (!ext) return setAlerts([]);
@@ -122,11 +140,11 @@ export default function WatchPanel() {
       </div>
       <div className="panel-body">
         <table className="table">
-          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 48 }} /></colgroup>
+          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 70 }} /></colgroup>
           <thead><tr><th>Address</th><th>Type</th><th>Value</th><th /></tr></thead>
           <tbody>
             {w.watches.map((e) => (
-              <tr key={e.id}>
+              <tr key={e.id} onContextMenu={(ev) => { ev.preventDefault(); setMenu({ x: ev.clientX, y: ev.clientY, e }); }}>
                 <td title={labelAddr(e.address, modules)}>
                   <CommitInput className="input mono" value={e.label || labelAddr(e.address, modules)} onCommit={(v) => {
                     const a = parseAddress(v, modules);
@@ -141,6 +159,7 @@ export default function WatchPanel() {
                 </td>
                 <td><CommitInput value={values[e.id] ? decode(values[e.id]!, 0, e.type) : "??"} onCommit={(v) => void write(e, v)} /></td>
                 <td>
+                  <IconButton tip="Graph this" onClick={() => graph(e)}><LineChart size={12} /></IconButton>
                   <IconButton tip={e.frozen ? "Unfreeze" : "Freeze"} onClick={() => void toggleFreeze(e)}>{e.frozen ? <Lock size={12} className="accent" /> : <LockOpen size={12} />}</IconButton>
                   <IconButton tip="Remove" onClick={() => w.removeWatch(e.id)}><X size={12} /></IconButton>
                 </td>
@@ -148,6 +167,15 @@ export default function WatchPanel() {
             ))}
           </tbody>
         </table>
+        {menu && (
+          <div className="ctx-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(ev) => ev.stopPropagation()}>
+            <button onClick={() => { graph(menu.e); setMenu(null); }}>Graph this</button>
+            <button onClick={() => { ui.goMemory(menu.e.address); setMenu(null); }}>Show in memory</button>
+            <button onClick={() => { ui.goDisasm(menu.e.address); setMenu(null); }}>Disassemble</button>
+            <button onClick={() => { void toggleFreeze(menu.e); setMenu(null); }}>{menu.e.frozen ? "Unfreeze" : "Freeze"}</button>
+            <button onClick={() => { w.removeWatch(menu.e.id); setMenu(null); }}>Remove</button>
+          </div>
+        )}
         {w.watches.length === 0 && <div className="panel-section faint">No watches. Add one above or from the scanner / inspector.</div>}
         <div className="panel-head"><div className="panel-title">Alerts</div></div>
         <div className="panel-section">
