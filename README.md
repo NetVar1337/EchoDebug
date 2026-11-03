@@ -59,6 +59,9 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Area | What you get |
 |---|---|
 | Shell | Reverse-Slap layout: frameless title bar with File/View/Window/Theme/Help menus and window buttons, activity rail, targets/modules/watch/names/MCP panels, scanner, tabbed workspace, output, inspector, status bar, splitters, three themes plus accent colours, boot splash, global tooltips, motion preference (on/auto/off) |
+| Navigation | The tab strip holds the views you use (close with × or middle-click, Ctrl+W; wheel scrolls it); **Views** (Ctrl+Shift+V) lists every view grouped as Code / Memory / Binary / Dynamic with a one-line description and search; Ctrl+K command palette also finds views by what they do; F1 lists every shortcut |
+| Layout | Show or hide the side panel (Ctrl+B, or click the active rail icon), scanner (Ctrl+Alt+S), output (Ctrl+J) and inspector (Ctrl+Alt+I) from the status bar, View menu or palette; narrow windows fold the scanner and inspector away automatically; View → Reset tabs and panels |
+| Feedback | Errors (and warnings while the output panel is hidden) appear as toasts; views that need a process offer one-click attach to recent targets; the process list puts targets you attached before first and hides kernel threads |
 | Navigation | Ctrl+G go-to, **Ctrl+Shift+P command palette** over every action, Alt+← back in the disassembly, X for xrefs, N to rename, `;` to comment, A to assemble, F3 next match, **Ctrl+Z / Ctrl+Y undo and redo** for names, comments and struct types |
 | Targets & modules | Local process list, attach by pid/name, module list, open a module in PE/Strings/Disassembly/Memory, dump to `scripts\dmp` |
 | Disassembly | Function list (`enumerate_functions` merged with `.pdata` bounds), virtualized listing, clickable branch targets with history, xrefs (rel32 + RIP-relative), inline strings / reference counts / switch-case counts, regex search over the listing or the whole module, **in-place patching** with a built-in x86-64 assembler (NOP, invert or force a jump), make-signature, bookmarks, names and comments, export as `.asm` or a C array |
@@ -89,10 +92,17 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back |
 | Debugger (Linux) | ptrace: attach every thread, int3 and hardware (DR0-DR3) breakpoints, step, continue, pause, registers with editing, breakpoint bytes hidden from reads |
 | Script | Async JavaScript against an `ed` API (verbs, memory, journaled writes, names, disassembly, every app analysis), saved scripts |
-| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …), 11 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
+| MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …), 13 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script. **Module projects** keep names, comments and bookmarks per module build (by RVA) and restore them on the next attach, wherever ASLR puts the module; panel sizes, the last place in each view and (optionally) the last target are restored on start; a target switcher in the Targets panel |
-| Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI |
+| MCP policy | Settings in the MCP panel: allow everything, **ask** (an Allow/Deny dialog in the window for writes, freezes and dumps) or read-only, plus allow/deny tool lists, an optional audit file (`mcp-audit.jsonl`) and JSONL export. Tools carry MCP annotations and structured output; resource templates (`echodebug://memory/{address}/{size}`, `module/{name}/exports`, …) and argument completion are supported |
+| Lifter | **Lifter** tab (and `lift_block` / `lift_trace` / `devirt` tools): x86-64 lifted to expressions with symbolic execution. **Block** shows each instruction's effect, dead code and the branch condition (constant = opaque predicate); **Deobfuscate trace** emulates a function against the live process, slices away junk, push/pop noise and dead stores, simplifies formulas (MBA included) and folds loops (`[rdi + i] = [rsi + i] ^ 0x5a for i in 0..n`); **Devirtualize** finds a VM's dispatcher, lifts each handler, guesses the VIP register and lists the virtual instruction stream. Scratch buffers for pointer arguments are one checkbox away |
+| Agent extras | Emulation with API stand-ins (unpackers and decryptors run to the end), unpacking-layer detection, register-change traces, zero-filled unmapped reads and xmm registers; Emu Debugger watchpoints, conditional breakpoints and snapshots; typed watches with conditions, hit counts and history; add/clamp freezes in groups; backend snapshot diffs; pointer maps compared across restarts; object instances by vtable; backend xref scans; multi-threaded scans; cancel, stats and a write journal; an **EchoDebug** tab inside Echo with status and safety switches; settings in `echodebug/agent.json` |
+| Emulated debugger | **Emu Debugger** tab: a persistent Unicorn session over the target's memory — step, run to an address, breakpoints, edit registers and memory, watch the stack — without touching the process (`emu_*` verbs, also as MCP tools) |
+| Hook scanner | **Hooks** tab: executable code compared with the file on disk (rebased with its relocations), inline hooks at exports, IAT slots redirected to unbacked memory |
+| Monitors | **Monitors** tab: module load/unload timeline and page-change monitors (4 KiB page hashes), as events and MCP notifications, on every backend |
+| Engine dumpers | **Engines** tab: Unreal Engine 4.23+/5 (GNames/GObjects → object list and an `SDK.hpp`), Unity IL2CPP (global-metadata.dat v24–31 from disk or memory → `dump.cs` and an Il2CppDumper-style `script.json` with method RVAs) and Source engine netvars (`netvars.txt`) |
+| Headless | `echodebug-relay [port]` runs the relay and MCP server without the UI; `echodebug-relay --stdio` serves MCP over stdin/stdout for clients that launch servers as subprocesses |
 | Updates | Signed auto-update from GitHub Releases: checks at startup and every 30 min, downloads in the background, then a **Restart to update** button (status bar, Help menu, Settings); an update left pending installs at the next launch. Help → Check for updates on demand. The Echo agent updates with the app |
 
 **Not available on the Echo backend:** the native debugger (breakpoints, stepping, VEH), Frida,
@@ -113,12 +123,16 @@ only, requires the token on `/client` and `/mcp` (stored in `<config>/EchoDebug/
 `ECHODEBUG_TOKEN` overrides it, `ECHODEBUG_AUTH=0` turns the check off) and rejects browser origins
 other than the app's own, so other programs and web pages cannot reach your target's memory.
 
+For stdio clients: `claude mcp add echodebug -- echodebug-relay --stdio`.
+
 Any MCP client works: the relay speaks Streamable HTTP JSON-RPC 2.0 (`initialize`, `ping`,
-`tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read|subscribe`; batches supported,
+`tools/list`, `tools/call`, `prompts/list|get`, `resources/list|read|subscribe|templates/list`,
+`completion/complete`; batches supported,
 notifications answered with `202`; `GET /mcp` with `Accept: text/event-stream` streams resource updates
 and agent events; a `tools/call` with a `progressToken` streams scan progress). Prompts:
 `explain_function`, `find_pattern`, `find_string`, `pointer_path`, `scan_value`, `triage_module`,
-`find_vtable`, `make_signature`, `diff_snapshots`, `unpack_module`, `decrypt_strings`. Resources:
+`find_vtable`, `make_signature`, `diff_snapshots`, `unpack_module`, `decrypt_strings`,
+`deobfuscate_function`, `devirtualize`. Resources:
 `echodebug://status`, `echodebug://tools`, `echodebug://mcp/log`, `echodebug://target/modules`. Tools
 named `ui_*` run in the app window; with only the headless relay they answer with a clear error.
 

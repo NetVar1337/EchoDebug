@@ -17,6 +17,7 @@ import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { NeedsAgent, Progress, Tabs } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
+import { scanGrouped } from "@/lib/sigbatch";
 
 async function scan(ida: string, module: string): Promise<string[]> {
   const r = await request<{ results: string[]; success: boolean }>("sig_scan_ida", { pattern: ida, module, find_all: true }, true).catch(() => null);
@@ -38,11 +39,10 @@ function HealthTab() {
 
   const check = async () => {
     const out: typeof state = {};
-    for (const [i, s] of catalog.sigs.entries()) {
-      const hits = await scan(s.ida, s.module || mainName());
-      out[s.id] = { health: health(hits.length), hits: hits.length };
-      setBusy((i + 1) / catalog.sigs.length);
-    }
+    setBusy(0.05);
+    // one sig_scan_batch per module instead of a request per signature
+    const hits = await scanGrouped(catalog.sigs.map((s) => ({ ida: s.ida, module: s.module || mainName() })), 1);
+    catalog.sigs.forEach((s, i) => (out[s.id] = { health: health(hits[i].count), hits: hits[i].count }));
     setState(out);
     setBusy(0);
     const bad = Object.values(out).filter((x) => x.health !== "ok").length;

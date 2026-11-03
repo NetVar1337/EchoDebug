@@ -64,12 +64,38 @@ fn read_cstr(mem: &impl MemIo, addr: u64, max: usize) -> Option<String> {
 // Freeze + watch
 // ---------------------------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct Frozen {
+    addr: u64,
+    data: Vec<u8>,
+    before: Vec<u8>,
+    /// "set" (write data), "add" (value += step per second), "clamp" (keep within min..max)
+    mode: String,
+    vtype: String,
+    step: f64,
+    min: f64,
+    max: f64,
+    group: String,
+    paused: bool,
+}
+
+#[derive(Clone)]
+struct Watched {
+    addr: u64,
+    size: usize,
+    label: String,
+    last: Vec<u8>,
+    vtype: String,
+    cond: String,
+    value: f64,
+    hits: u64,
+    history: Vec<String>,
+}
+
 #[derive(Default)]
 struct Live {
-    /// address -> (bytes to keep writing, bytes that were there before the first freeze)
-    frozen: Vec<(u64, Vec<u8>, Vec<u8>)>,
-    /// (address, size, label, last sample)
-    watched: Vec<(u64, usize, String, Vec<u8>)>,
+    frozen: Vec<Frozen>,
+    watched: Vec<Watched>,
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -78,6 +104,45 @@ static TICKER_GEN: AtomicU64 = AtomicU64::new(0);
 fn with_live<R>(f: impl FnOnce(&mut Live) -> R) -> R {
     let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(Live::default))
+}
+
+/// Byte width of a numeric value type (0 = not numeric).
+pub(crate) fn vt_width(vt: &str) -> usize {
+    match vt {
+        "u8" | "i8" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "f32" => 4,
+        "u64" | "i64" | "f64" => 8,
+        _ => 0,
+    }
+}
+
+pub(crate) fn num_decode(vt: &str, b: &[u8]) -> Option<f64> {
+    let w = vt_width(vt);
+    if w == 0 || b.len() < w {
+        return None;
+    }
+    let mut x = [0u8; 8];
+    x[..w].copy_from_slice(&b[..w]);
+    let u = u64::from_le_bytes(x);
+    Some(match vt {
+        "f32" => f32::from_bits(u as u32) as f64,
+        "f64" => f64::from_bits(u),
+        v if v.starts_with('i') => (((u << (64 - w * 8)) as i64) >> (64 - w * 8)) as f64,
+        _ => u as f64,
+    })
+}
+
+pub(crate) fn num_encode(vt: &str, v: f64) -> Vec<u8> {
+    match vt {
+        "f32" => (v as f32).to_le_bytes().to_vec(),
+        "f64" => v.to_le_bytes().to_vec(),
+        "u8" | "i8" => vec![(v as i64) as u8],
+        "u16" | "i16" => ((v as i64) as u16).to_le_bytes().to_vec(),
+        "u32" | "i32" => ((v as i64) as u32).to_le_bytes().to_vec(),
+        "u64" => (v as u64).to_le_bytes().to_vec(),
+        _ => (v as i64).to_le_bytes().to_vec(),
+    }
 }
 
 /// Starts the 20 Hz ticker that rewrites frozen values and samples watches (10 Hz).
@@ -95,7 +160,7 @@ pub fn start_ticker(relay: &Relay, pid: u32) {
             }
             let Some(mem) = io(pid) else { break };
             n += 1;
-            for ev in tick(&mem, n.is_multiple_of(2)) {
+            for ev in tick_n(&mem, n) {
                 relay.emit(ev);
             }
         }
@@ -108,31 +173,69 @@ pub fn stop_ticker() {
 
 /// One ticker step; returns the events to broadcast. Public for tests.
 pub fn tick(mem: &impl MemIo, sample: bool) -> Vec<Value> {
+    tick_n(mem, if sample { 20 } else { 1 })
+}
+
+fn tick_n(mem: &impl MemIo, n: u64) -> Vec<Value> {
     let (frozen, watched) = with_live(|l| (l.frozen.clone(), l.watched.clone()));
     let mut events = Vec::new();
-    for (a, data, _) in &frozen {
-        if mem.write_at(*a, data).is_err() {
-            events.push(json!({ "type": "event", "event": "freeze_error", "address": hex_addr(*a) }));
+    for f in frozen.iter().filter(|f| !f.paused) {
+        let res = match f.mode.as_str() {
+            "set" => mem.write_at(f.addr, &f.data),
+            _ => match read_vec(mem, f.addr, vt_width(&f.vtype)).and_then(|b| num_decode(&f.vtype, &b)) {
+                Some(v) => {
+                    let nv = if f.mode == "add" { if n.is_multiple_of(20) { v + f.step } else { v } } else { v.clamp(f.min.min(f.max), f.max.max(f.min)) };
+                    if nv != v { mem.write_at(f.addr, &num_encode(&f.vtype, nv)) } else { Ok(()) }
+                }
+                None => Err(std::io::Error::other("unreadable")),
+            },
+        };
+        if res.is_err() {
+            events.push(json!({ "type": "event", "event": "freeze_error", "address": hex_addr(f.addr) }));
         }
     }
-    if sample {
+    if n.is_multiple_of(2) {
         let mut updates = Vec::new();
-        for (a, size, label, last) in &watched {
-            if let Some(cur) = read_vec(mem, *a, *size) {
-                if &cur != last {
-                    let mut ev = json!({ "type": "event", "event": "watch_event", "address": hex_addr(*a), "old": hex_bytes(last), "new": hex_bytes(&cur) });
-                    if !label.is_empty() {
-                        ev["label"] = json!(label);
-                    }
-                    events.push(ev);
-                    updates.push((*a, cur));
-                }
+        for w in &watched {
+            let Some(cur) = read_vec(mem, w.addr, w.size) else { continue };
+            if cur == w.last {
+                continue;
             }
+            let (ov, nv) = (num_decode(&w.vtype, &w.last), num_decode(&w.vtype, &cur));
+            let fire = match (w.cond.as_str(), ov, nv) {
+                ("any", ..) => true,
+                ("eq", _, Some(v)) => v == w.value,
+                ("ne", _, Some(v)) => v != w.value,
+                ("gt", _, Some(v)) => v > w.value,
+                ("lt", _, Some(v)) => v < w.value,
+                ("delta", Some(o), Some(v)) => (v - o).abs() >= w.value,
+                _ => true,
+            };
+            if fire {
+                let mut ev = json!({ "type": "event", "event": "watch_event", "address": hex_addr(w.addr), "old": hex_bytes(&w.last), "new": hex_bytes(&cur), "hits": w.hits + 1 });
+                if !w.label.is_empty() {
+                    ev["label"] = json!(w.label);
+                }
+                if let (Some(o), Some(v)) = (ov, nv) {
+                    ev["old_value"] = json!(o);
+                    ev["new_value"] = json!(v);
+                    ev["value_type"] = json!(w.vtype);
+                }
+                events.push(ev);
+            }
+            updates.push((w.addr, cur, fire));
         }
         with_live(|l| {
-            for (a, cur) in updates {
-                if let Some(w) = l.watched.iter_mut().find(|w| w.0 == a) {
-                    w.3 = cur;
+            for (a, cur, fire) in updates {
+                if let Some(w) = l.watched.iter_mut().find(|w| w.addr == a) {
+                    w.history.push(hex_bytes(&cur));
+                    if w.history.len() > 16 {
+                        w.history.remove(0);
+                    }
+                    w.last = cur;
+                    if fire {
+                        w.hits += 1;
+                    }
                 }
             }
         });
@@ -145,53 +248,115 @@ pub fn freeze(relay: &Relay, mem: &impl MemIo, req: &Map<String, Value>) -> Valu
     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
     if !enabled {
         let restored = with_live(|l| {
-            let pos = l.frozen.iter().position(|f| f.0 == addr)?;
+            let pos = l.frozen.iter().position(|f| f.addr == addr)?;
             Some(l.frozen.remove(pos))
         });
-        if let Some((a, _, before)) = restored {
-            let _ = mem.write_at(a, &before);
+        if let Some(f) = restored {
+            let _ = mem.write_at(f.addr, &f.before);
         }
         return json!({ "type": "freeze_result", "success": true, "frozen": with_live(|l| l.frozen.len()) });
     }
-    let Some(data) = req.get("data").and_then(Value::as_str).and_then(parse_hex).filter(|d| !d.is_empty() && d.len() <= 4096) else {
-        return bad("freeze requires hex 'data' (1..4096 bytes)");
+    let s = |k: &str, d: &str| req.get(k).and_then(Value::as_str).unwrap_or(d).to_owned();
+    let f = |k: &str, d: f64| req.get(k).and_then(Value::as_f64).unwrap_or(d);
+    let (mode, vtype, group) = (s("mode", "set"), s("value_type", ""), s("group", ""));
+    if !matches!(mode.as_str(), "set" | "add" | "clamp") {
+        return bad("mode must be set, add or clamp");
+    }
+    if mode != "set" && vt_width(&vtype) == 0 {
+        return bad("add/clamp need a numeric value_type");
+    }
+    let data = if mode == "set" {
+        match req.get("data").and_then(Value::as_str).and_then(parse_hex).filter(|d| !d.is_empty() && d.len() <= 4096) {
+            Some(d) => d,
+            None => return bad("freeze requires hex 'data' (1..4096 bytes)"),
+        }
+    } else {
+        match read_vec(mem, addr, vt_width(&vtype)) {
+            Some(d) => d,
+            None => return failed(format!("{addr:#x} is not readable")),
+        }
     };
     let Some(before) = read_vec(mem, addr, data.len()) else { return failed(format!("{addr:#x} is not readable")) };
-    if let Err(e) = mem.write_at(addr, &data) {
-        return failed(format!("{addr:#x}: {e}"));
+    if mode == "set" {
+        if let Err(e) = mem.write_at(addr, &data) {
+            return failed(format!("{addr:#x}: {e}"));
+        }
     }
+    let entry = Frozen { addr, data: data.clone(), before: before.clone(), mode, vtype, step: f("step", 1.0), min: f("min", 0.0), max: f("max", 0.0), group, paused: false };
     let count = with_live(|l| {
-        match l.frozen.iter_mut().find(|f| f.0 == addr) {
-            Some(f) => f.1 = data.clone(),
-            None => l.frozen.push((addr, data.clone(), before.clone())),
+        match l.frozen.iter_mut().find(|x| x.addr == addr) {
+            Some(x) => {
+                let keep = x.before.clone();
+                *x = Frozen { before: keep, ..entry };
+            }
+            None => l.frozen.push(entry),
         }
         l.frozen.len()
     });
     relay.emit(json!({ "type": "event", "event": "patched", "address": hex_addr(addr), "old": hex_bytes(&before), "new": hex_bytes(&data) }));
+    crate::local_more::journal("freeze", addr, &before, &data);
     json!({ "type": "freeze_result", "success": true, "frozen": count })
 }
 
+pub fn freeze_group(req: &Map<String, Value>) -> Value {
+    let Some(group) = req.get("group").and_then(Value::as_str).filter(|g| !g.is_empty()) else { return bad("freeze_group needs 'group'") };
+    let on = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let n = with_live(|l| {
+        let mut n = 0;
+        for f in l.frozen.iter_mut().filter(|f| f.group == group) {
+            f.paused = !on;
+            n += 1;
+        }
+        n
+    });
+    json!({ "type": "freeze_group_result", "success": true, "group": group, "enabled": on, "entries": n })
+}
+
 pub fn freeze_list() -> Value {
-    let entries: Vec<Value> = with_live(|l| l.frozen.iter().map(|(a, d, _)| json!({ "address": hex_addr(*a), "data": hex_bytes(d) })).collect());
+    let entries: Vec<Value> = with_live(|l| {
+        l.frozen
+            .iter()
+            .map(|f| {
+                let mut e = json!({ "address": hex_addr(f.addr), "data": hex_bytes(&f.data), "mode": f.mode, "paused": f.paused });
+                if !f.vtype.is_empty() { e["value_type"] = json!(f.vtype); }
+                if f.mode == "add" { e["step"] = json!(f.step); }
+                if f.mode == "clamp" { e["min"] = json!(f.min); e["max"] = json!(f.max); }
+                if !f.group.is_empty() { e["group"] = json!(f.group); }
+                e
+            })
+            .collect()
+    });
     json!({ "type": "freeze_list_result", "success": true, "entries": entries })
 }
 
 /// Writes back the pre-freeze bytes (detach / target change).
 pub fn restore_frozen(mem: &impl MemIo) {
     let frozen = with_live(|l| std::mem::take(&mut l.frozen));
-    for (a, _, before) in frozen {
-        let _ = mem.write_at(a, &before);
+    for f in frozen {
+        let _ = mem.write_at(f.addr, &f.before);
     }
 }
 
 pub fn watch(_relay: &Relay, mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let Some(addr) = arg_addr(req, "address") else { return bad("watch requires 'address'") };
-    let size = req.get("size").and_then(Value::as_u64).unwrap_or(4).clamp(1, 16) as usize;
+    let vtype = req.get("value_type").and_then(Value::as_str).unwrap_or("").to_owned();
+    let cond = req.get("condition").and_then(Value::as_str).unwrap_or("any").to_owned();
+    if !vtype.is_empty() && vt_width(&vtype) == 0 {
+        return bad("value_type must be u8..u64, i8..i64, f32 or f64");
+    }
+    if !matches!(cond.as_str(), "any" | "eq" | "ne" | "gt" | "lt" | "delta") {
+        return bad("condition must be any, eq, ne, gt, lt or delta");
+    }
+    if cond != "any" && vtype.is_empty() {
+        return bad("conditions need a numeric value_type");
+    }
+    let size = (req.get("size").and_then(Value::as_u64).unwrap_or(4) as usize).max(vt_width(&vtype)).clamp(1, 256);
     let label = req.get("label").and_then(Value::as_str).unwrap_or("").to_owned();
     let last = read_vec(mem, addr, size).unwrap_or_default();
+    let value = req.get("value").and_then(Value::as_f64).unwrap_or(0.0);
     let n = with_live(|l| {
-        l.watched.retain(|w| w.0 != addr);
-        l.watched.push((addr, size, label, last));
+        l.watched.retain(|w| w.addr != addr);
+        l.watched.push(Watched { addr, size, label, last, vtype, cond, value, hits: 0, history: Vec::new() });
         l.watched.len()
     });
     json!({ "type": "watch_result", "success": true, "watched": n })
@@ -200,7 +365,7 @@ pub fn watch(_relay: &Relay, mem: &impl MemIo, req: &Map<String, Value>) -> Valu
 pub fn unwatch(req: &Map<String, Value>) -> Value {
     let Some(addr) = arg_addr(req, "address") else { return bad("unwatch requires 'address'") };
     let n = with_live(|l| {
-        l.watched.retain(|w| w.0 != addr);
+        l.watched.retain(|w| w.addr != addr);
         l.watched.len()
     });
     json!({ "type": "unwatch_result", "success": true, "watched": n })
@@ -208,7 +373,15 @@ pub fn unwatch(req: &Map<String, Value>) -> Value {
 
 pub fn watch_list() -> Value {
     let entries: Vec<Value> = with_live(|l| {
-        l.watched.iter().map(|(a, s, label, last)| json!({ "address": hex_addr(*a), "size": s, "label": label, "last": hex_bytes(last) })).collect()
+        l.watched
+            .iter()
+            .map(|w| {
+                let mut e = json!({ "address": hex_addr(w.addr), "size": w.size, "label": w.label, "last": hex_bytes(&w.last), "hits": w.hits, "history": w.history });
+                if !w.vtype.is_empty() { e["value_type"] = json!(w.vtype); }
+                if w.cond != "any" { e["condition"] = json!(w.cond); e["value"] = json!(w.value); }
+                e
+            })
+            .collect()
     });
     json!({ "type": "watch_list_result", "success": true, "entries": entries })
 }
@@ -640,6 +813,12 @@ fn resolve_object(mem: &impl MemIo, obj: u64) -> Option<Value> {
         .map(|(a, n)| json!({ "typeinfo": hex_addr(a), "name": demangle_type(&n), "mangled": n }))
         .collect();
     Some(json!({ "success": true, "name": demangle_type(&raw), "mangled": raw, "vtable": hex_addr(vptr), "typeinfo": hex_addr(ti), "bases": bases, "abi": "itanium" }))
+}
+
+/// Class name of the vtable's first virtual slot (Itanium: the type_info sits at vtable[-1]).
+pub(crate) fn itanium_vtable_name(mem: &impl MemIo, vt: u64) -> Option<String> {
+    let ti = read_u64(mem, vt.checked_sub(8)?)?;
+    typeinfo_name(mem, ti).map(|n| demangle_type(&n))
 }
 
 pub fn itanium_resolve(mem: &impl MemIo, req: &Map<String, Value>) -> Value {

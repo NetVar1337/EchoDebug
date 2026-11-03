@@ -77,9 +77,17 @@ const browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: p
 const page = await browser.newPage({ viewport: { width: 1600, height: 950 } });
 const errors = [];
 page.on("pageerror", (e) => errors.push(String(e)));
-const tab = (name) => page.locator(".tab", { hasText: new RegExp(`^${name}$`) }).click();
+// views that are not in the tab strip open through the "All views" menu
+const tab = async (name) => {
+  const t = page.locator(".tab", { hasText: new RegExp(`^${name}$`) });
+  if (await t.count()) return t.first().click();
+  await page.locator("[aria-label='All views']").click();
+  await page.locator('input[placeholder="Find a view…"]').fill(name);
+  await page.locator(".views-item", { hasText: new RegExp(`^${name}`) }).first().click();
+};
 const attach = async (pid) => {
-  await page.locator(".rail-button[aria-label=Targets]").click();
+  // the active rail button folds the panel away: only click when the process list is not shown
+  if (!(await page.locator('input[placeholder="Filter processes…"]').count())) await page.locator(".rail-button[aria-label=Targets]").click();
   await page.locator('input[placeholder="Filter processes…"]').fill("e2e-target");
   await page.locator(".panel-header, .panel-head").first().locator("[aria-label=Refresh]").click().catch(() => undefined);
   await until(async () => (await page.locator("tr", { hasText: String(pid) }).count()) > 0);
@@ -162,6 +170,64 @@ await step("debugger stops at a breakpoint and detaches", async () => {
   await until(async () => (await page.locator("button", { hasText: "Attach debugger" }).count()) > 0);
 });
 
+await step("emulated debugger steps classify and runs it to its return", async () => {
+  await tab("Emu Debugger");
+  await page.locator('input[placeholder="function address · game.exe+0x1234"]').fill(`e2e-target+${sym("classify")}`);
+  await page.locator("button", { hasText: "Start session" }).click();
+  await until(async () => (await page.locator("text=session started").count()) > 0);
+  await page.locator("[aria-label='Step one instruction']").click();
+  await until(async () => (await page.locator("text=stepped 1 instruction").count()) > 0);
+  await page.locator("[aria-label='Run to a breakpoint, a return or a fault']").click();
+  await until(async () => (await page.locator("text=the function returned").count()) > 0);
+});
+
+await step("page monitor sees the counter's page change", async () => {
+  await tab("Monitors");
+  await page.locator('input[placeholder="address · module+0x…"]').last().fill(`e2e-target+${sym("counter")}`);
+  await page.locator("button.primary", { hasText: /^Watch$/ }).click();
+  await until(async () => (await page.locator("text=/[1-9][0-9]* changes/").count()) > 0, 15000);
+});
+
+await step("lifter deobfuscates classify's emulated run and lifts a block", async () => {
+  await tab("Lifter");
+  await page.locator('input[placeholder="start · module+0x…"]').fill(`e2e-target+${sym("classify")}`);
+  await page.locator("button", { hasText: "Emulate & deobfuscate" }).click();
+  await until(async () => (await page.locator("text=/\\d+ kept/").count()) > 0, 20000);
+  expect((await page.locator(".lift-effects").first().innerText()).includes("rax"), "rax is among the effects");
+  await page.locator(".tabs .tab", { hasText: /^Block$/ }).click();
+  await page.locator("button", { hasText: "Lift block" }).click();
+  await until(async () => (await page.locator("th", { hasText: /dead\)/ }).count()) > 0);
+});
+
+await step("lifter devirtualizes the toy VM: dispatcher, handlers, virtual stream", async () => {
+  await page.locator(".tabs .tab", { hasText: /^Devirtualize$/ }).click();
+  await page.locator('input[placeholder="start · module+0x…"]').fill(`e2e-target+${sym("vm_run")}`);
+  await page.locator('input[placeholder="regs: rcx=0x10, rdx=…"]').fill(`rdi=e2e-target+${sym("vm_code")}`);
+  await page.locator("button", { hasText: "Emulate & devirtualize" }).click();
+  const kv = await until(async () => { const t = await page.locator(".kv").first().innerText(); return /dispatcher/.test(t) && t; }, 20000);
+  const n = Number(/(\d+) distinct/.exec(kv)?.[1] ?? 0);
+  expect(n >= 5, `expected at least 5 distinct handlers, got: ${kv}`);
+  expect((await page.locator(".vtrace .pill").count()) >= 8, "virtual instruction stream (the bytecode has 9 ops before halt)");
+});
+
+await step("snapshot diff in the backend sees the counter change", async () => {
+  await tab("Monitors");
+  await page.locator('input[placeholder="module name or address"]').fill(`e2e-target+${sym("counter")}`);
+  await page.locator('input[title="size (ignored for a module)"]').fill("0x100");
+  await page.locator("button", { hasText: /^Snapshot$/ }).click();
+  await until(async () => (await page.locator("text=/baseline/").count()) > 0);
+  await wait(300);
+  await page.locator("button", { hasText: "What changed?" }).click();
+  await until(async () => (await page.locator("text=/[1-9][0-9]* bytes changed/").count()) > 0);
+});
+
+await step("xref scan in the backend finds dec's call sites", async () => {
+  await tab("Xrefs");
+  await page.locator('input[placeholder="Address or module+offset…"]').fill(`e2e-target+${sym("dec")}`);
+  await page.locator("button", { hasText: /^Everywhere$/ }).click();
+  await until(async () => (await page.locator(".tag", { hasText: /^call$/ }).count()) >= 2, 20000);
+});
+
 await step("YARA matches the greeting", async () => {
   await tab("YARA");
   await page.locator("textarea").fill('rule greeting { strings: $g = "hello from the EchoDebug" condition: $g }');
@@ -184,6 +250,21 @@ await step("module projects bring the name back after the target restarts at a n
   await attach(target.p.pid);
   await tab("Disassembly");
   await until(async () => (await page.locator(".fn-row", { hasText: "classify_e2e" }).count()) > 0, 20000);
+});
+
+await step("views menu, tab close and panel toggles", async () => {
+  await page.locator("[aria-label='All views']").click();
+  await page.locator('input[placeholder="Find a view…"]').fill("hooks");
+  await page.keyboard.press("Enter");
+  await until(async () => (await page.locator(".tabs-wrap .tab[data-active=true]").innerText()).startsWith("Hooks"));
+  await page.locator("[aria-label='Close Hooks']").click();
+  await until(async () => (await page.locator(".tabs-wrap .tab", { hasText: /^Hooks$/ }).count()) === 0);
+  await page.keyboard.press("Control+j");
+  await until(async () => (await page.locator("[aria-label='Toggle output'][data-active=false]").count()) > 0);
+  await page.keyboard.press("Control+j");
+  await page.keyboard.press("F1");
+  await until(async () => (await page.locator("[aria-label='Keyboard shortcuts'][role=dialog]").count()) > 0);
+  await page.keyboard.press("Escape");
 });
 
 await step("no uncaught errors in the page", async () => expect(errors.length === 0, errors.join("\n")));
