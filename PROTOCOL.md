@@ -22,6 +22,7 @@ are lowercase hex strings without a prefix (`"4883ec28"`). Sizes and counts are 
 | `/agent` | Echo's native memory server (`process::open_socket(url)`) | Relay is the *requester*: it sends Echo native requests and receives `*_result` / `error` frames. One connection at a time; a new one replaces the old. |
 | `/ext` | `echo_debug.as` via `ws::connect` | Relay sends ext requests and receives replies + id-less events. One at a time; a new one replaces the old. |
 | `/client` | UI, scripts, anything | Sends requests `{ "type", "id", ... }`, receives replies with the same `id`, plus broadcast events. Many clients. |
+| `/sync` | IDA / Ghidra / Binary Ninja plugins (`integrations/`) | Disassembler sync, token-protected like `/client`. See [Disassembler sync](#disassembler-sync-sync). Many peers. |
 | `POST /mcp` | MCP clients | Streamable HTTP, JSON responses only (no SSE). Tools are defined in `src/lib/tools.json`. |
 | `GET /health` | anyone | `200 {"ok":true,"version":"x.y.z"}` |
 
@@ -357,6 +358,35 @@ WebSockets). Missing or wrong tokens get `401`. The token lives in `<config>/Ech
 stay open (Echo cannot send headers; those endpoints only receive requests). The desktop app can
 regenerate the stored token (Settings or the MCP Server panel); the running relay switches to it at once
 (`Relay::set_token`), already-open sockets stay connected, and MCP clients must be re-added.
+
+## Disassembler sync (`/sync`)
+
+Disassembler plugins connect to `/sync` with the relay token (`Authorization: Bearer` or `?token=`;
+browser origins are refused) and send `hello` first: `{ "type":"hello", "tool":"ida"|"ghidra"|"binja",
+"version", "file", "protocol":1, "modules":[{ "name", "base", "size" }] }` → `{ "type":"hello_result",
+"peer", "protocol":1, "directions" }`. Then, both ways, `cursor` / `name` / `comment` frames with `module`
+(file name), `rva` (`"0x…"`) and `name` / `comment` (empty removes); the relay also sends `types`
+(`decls`, `names`) and `config` (`directions`); plugins may send `modules` and `ping` (→ `pong`). Frames
+from the relay carry `from`. Details and the plugins: [integrations/README.md](integrations/README.md).
+
+The relay keeps the hub state (sync.rs): direction toggles, a module map (disassembler file name → live
+module), the current value of every synced name and comment with its writer (**last writer wins**; a
+write that replaces another side's value is logged as a conflict; a write equal to the current value
+is dropped, as is a cursor equal to the last one, so applied changes do not echo), and a 300-entry log.
+
+App verbs on `/client` (relay-local):
+
+| verb | request | reply |
+|---|---|---|
+| `sync_status` (MCP `sync_status`, read-only) | `log_limit?` (default 100, max 300) | `protocol`, `peers:[{id,tool,version,file,modules:[{name,base,size,live}],connected_at,last_seen}]`, `directions`, `map`, `cursor:{module,rva,from,ts}`, `marks`, `log:[{seq,ts,kind,dir:"in"|"out"|"conflict"|"info",from,module,rva,text}]` |
+| `sync_config` | `directions?:{cursor_in,cursor_out,names_in,names_out,comments_in,comments_out,types_out}`, `map?:{toolModule: liveModule ("" removes)}`, `replace_map?` | the status (log omitted) |
+| `sync_send` | `kind: cursor\|name\|comment\|types`, `module`, `rva`, `name` / `comment` / `decls`+`names` | `peers` (tools reached) |
+| `sync_log` | `text`, `kind?`, `dir?` (`conflict`), `module?`, `rva?` | — (adds an entry, e.g. a name the app overwrote) |
+
+`*_in` is disassembler → EchoDebug, `*_out` EchoDebug → disassemblers (tool-to-tool forwarding counts as
+out). Broadcasts to every `/client`: `{ "type":"sync_event", "kind":"cursor"|"name"|"comment", "module",
+"rva", "name"|"comment", "from" }`, `{ "type":"sync_event", "kind":"log", "entry" }`, and `kind:"peers"` /
+`"config"` when those change. `sync_event` frames are not MCP notifications.
 
 ## In-app assistant (desktop app, not the relay)
 

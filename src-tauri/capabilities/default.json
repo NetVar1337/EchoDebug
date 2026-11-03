@@ -20,7 +20,7 @@
     "core:window:allow-internal-toggle-maximize",
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "$CONFIG/scripts" }, { "path": "$CONFIG/scripts/**" }]
+      "allow": [{ "path": "$CONFIG/scripts" }, { "path": "$CONFIG/scripts/**" }, { "path": "$CONFIG/EchoDebug/plugins" }, { "path": "$CONFIG/EchoDebug/plugins/**" }]
     }
   ]
 }

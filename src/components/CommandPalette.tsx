@@ -9,6 +9,7 @@ import { exportProjects, importProjects, useProjects } from "@/lib/projects";
 import { saveText } from "@/lib/save";
 import { redo, undo } from "@/lib/history";
 import { log } from "@/store/output";
+import { usePluginRegistry } from "@/lib/plugins/registry";
 
 async function pickJson(): Promise<unknown> {
   const input = Object.assign(document.createElement("input"), { type: "file", accept: ".json,.edproj" });
@@ -52,6 +53,7 @@ export default function CommandPalette() {
   const ui = useUi();
   const conn = useConn();
   const upd = useUpdate();
+  const plugins = usePluginRegistry();
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
@@ -97,6 +99,7 @@ export default function CommandPalette() {
       { id: "watch", label: "Open watchlist", group: "Target", run: () => ui.setRail("watch") },
       { id: "names", label: "Open names & comments", group: "Target", run: () => ui.setRail("names") },
       { id: "mcp", label: "Open MCP server panel", group: "Target", run: () => ui.setRail("mcp") },
+      { id: "sync", label: "Open disassembler sync (IDA / Ghidra / Binary Ninja)", group: "Target", run: () => ui.setRail("sync") },
       { id: "assistant", label: "Open assistant (Claude)", group: "Assistant", run: () => ui.setRail("assistant") },
       { id: "as-explain", label: "Assistant: explain function at cursor", group: "Assistant", run: () => assistant((a) => a.explainFunction()) },
       { id: "as-names", label: "Assistant: suggest names for function at cursor", group: "Assistant", run: () => assistant((a) => a.suggestNames()) },
@@ -115,9 +118,13 @@ export default function CommandPalette() {
       { id: "protocol", label: "Open protocol reference", group: "App", run: () => void openUrl("https://github.com/NetVar1337/EchoDebug/blob/main/PROTOCOL.md") },
       { id: "releases", label: "Open GitHub releases", group: "App", run: () => void openUrl("https://github.com/NetVar1337/EchoDebug/releases") },
     );
+    // Plugin commands and analyses (never over MCP).
+    for (const c of plugins.commands) out.push({ id: `plugin:${c.key}`, label: c.label, group: `Plugin · ${c.pluginName}`, run: () => void Promise.resolve().then(c.run).catch((e) => log("error", `plugin:${c.plugin}`, e instanceof Error ? e.message : String(e))) });
+    for (const v of plugins.views) out.push({ id: `pview:${v.key}`, label: `${v.title} (plugin view)`, group: `Plugin · ${v.pluginName}`, run: () => ui.setTab("plugins") });
+    for (const a of plugins.analyses) out.push({ id: `panalysis:${a.key}`, label: `${a.title} (plugin analysis)`, group: `Plugin · ${a.pluginName}`, run: () => ui.setTab("plugins") });
     for (const [id, label] of kThemes) out.push({ id: `theme:${id}`, label: `Theme: ${label}`, group: "App", run: () => ui.set({ theme: id }) });
     return out;
-  }, [ui, conn, upd]);
+  }, [ui, conn, upd, plugins]);
 
   const shown = useMemo(() => {
     const scored = cmds

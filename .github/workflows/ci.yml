@@ -24,6 +24,8 @@ jobs:
       - run: npm test
       - run: node --test scripts/*.test.mjs
       - run: npm run build
+      - name: Disassembler sync client (IDA / Binary Ninja core)
+        run: python3 -m unittest discover -s integrations/python -v
 
   agent:
     name: Echo agent (AngelScript lint)

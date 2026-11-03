@@ -10,6 +10,7 @@ import { kDefaultServer, useSymbols } from "@/store/symbols";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
 import { isWindowsOs } from "@/lib/tauri";
 import { CopyChip, IconButton, useCopy } from "./ui";
+import PluginsSettings from "./PluginsSettings";
 import * as assistantApi from "@/lib/assistant/api";
 import { useAssistant } from "@/store/assistant";
 
@@ -140,6 +141,10 @@ export default function SettingsModal() {
                 <span />
               </label>
             </Row>
+          </Section>
+
+          <Section title="Plugins">
+            <PluginsSettings />
           </Section>
 
           <Section title="Updates">
