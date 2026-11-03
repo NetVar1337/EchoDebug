@@ -89,7 +89,7 @@ export default function AccessFinderView() {
                   <span className="faint" style={{ fontSize: 12 }}>{t.total} hit{t.total === 1 ? "" : "s"} · {t.hits.length} instruction{t.hits.length === 1 ? "" : "s"}</span>
                   {t.active && <button className="btn small" onClick={() => void stop(t.slot)}><Square size={12} /> Stop</button>}
                 </div>
-                <table className="table mono">
+                <table className="table mono access-hits">
                   <colgroup><col style={{ width: 52 }} /><col style={{ width: 150 }} /><col /><col style={{ width: 60 }} /></colgroup>
                   <thead><tr><th>Count</th><th>Address</th><th>Instruction</th><th>Thread</th></tr></thead>
                   <tbody>

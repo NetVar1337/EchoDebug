@@ -177,7 +177,7 @@ await step("access finder lists the instruction that writes the counter", async 
   await page.locator('input[placeholder^="address"]').first().fill(`e2e-target+${sym("counter")}`);
   await page.keyboard.press("Enter");
   await page.locator("button", { hasText: "Find what writes" }).click();
-  const text = await until(async () => { const t = await page.locator("tbody td.ellipsis").allInnerTexts(); return t.length > 0 && t.join("\n"); });
+  const text = await until(async () => { const t = await page.locator(".access-hits tbody td.ellipsis").allInnerTexts(); return t.length > 0 && t.join("\n"); });
   expect(/mov|add/.test(text), `writer: ${text}`);
   await page.locator("button", { hasText: "Stop" }).first().click();
   await until(async () => (await page.locator(".pill", { hasText: "stopped" }).count()) > 0);
