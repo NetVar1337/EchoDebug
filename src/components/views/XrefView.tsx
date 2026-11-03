@@ -12,6 +12,7 @@ import { buildXrefIndex, executableRanges, type Xref, type XrefIndex } from "@/l
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
+import { request } from "@/lib/client";
 import { NeedsAgent, Progress } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
 
@@ -27,6 +28,17 @@ export default function XrefView() {
   const [dir, setDir] = useState<Direction>("to");
   const [filter, setFilter] = useState("");
   const [hubs, setHubs] = useState<{ rva: number; count: number }[]>([]);
+  const [wide, setWide] = useState<{ address: string; kind: string; text?: string }[] | null>(null);
+  const [wideBusy, setWideBusy] = useState(false);
+  /** Every module and data pointer, scanned by the backend (xref_scan). */
+  const scanEverywhere = async () => {
+    const a = parseAddress(addr, modules);
+    if (a === null) return log("warn", "xrefs", "enter an address first");
+    setWideBusy(true);
+    const r = await attempt("xref_scan", request<{ results: { address: string; kind: string; text?: string }[]; truncated: boolean }>("xref_scan", { target: fmtAddr(a), max: 2000 }));
+    setWideBusy(false);
+    if (r) { setWide(r.results); log("info", "xrefs", `${r.results.length}${r.truncated ? "+" : ""} references anywhere in memory`); }
+  };
 
   useEffect(() => {
     if (!m) return;
@@ -91,7 +103,21 @@ export default function XrefView() {
           <div className="toolbar">
             <button className="btn" data-active={dir === "to"} onClick={() => setDir("to")}><ArrowDownToLine size={13} /> References to</button>
             <button className="btn" data-active={dir === "from"} onClick={() => setDir("from")}><ArrowUpFromLine size={13} /> References from</button>
+            <span className="grow" />
+            <button className="btn small" disabled={wideBusy || !addr.trim()} title="Scan all memory in the backend: calls, jumps, RIP-relative operands in every module, and pointers in data" onClick={() => void scanEverywhere()}>{wideBusy ? "Scanning…" : "Everywhere"}</button>
           </div>
+          {wide && (
+            <div className="panel-section" style={{ maxHeight: 220, overflow: "auto" }}>
+              <div className="row"><span className="label grow">Everywhere ({wide.length})</span><button className="btn small" onClick={() => setWide(null)}>hide</button></div>
+              {wide.map((w) => (
+                <div key={w.address} className="fn-row" onClick={() => (w.kind === "pointer" ? ui.goMemory(w.address) : ui.goDisasm(w.address))}>
+                  <span className="tag">{w.kind}</span>
+                  <span className="mono grow ellipsis">{labelAddr(w.address, modules)}</span>
+                  {w.text && <span className="faint mono ellipsis" style={{ maxWidth: 180 }}>{w.text}</span>}
+                </div>
+              ))}
+            </div>
+          )}
           <div className="vlist">
             {target === null ? (
               <div className="empty">

@@ -3,8 +3,7 @@
 // disassembly, so they are exact.
 //
 // The module mode builds the same picture for every function of a module at
-// once, from the mapped image, which is how a whole binary is surveyed. The
-// CFG and Pseudocode modes look inside the function instead (CfgPanel).
+// once, from the mapped image, which is how a whole binary is surveyed.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { request } from "@/lib/client";
 import { labelAddr, toBig } from "@/lib/hex";
@@ -18,7 +17,6 @@ import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent } from "../ui";
 import ModulePicker, { useFocusedModule } from "../ModulePicker";
-import CfgPanel from "./CfgPanel";
 
 type Line = { address: string; length: number; bytes: string; text: string };
 
@@ -30,7 +28,7 @@ export default function GraphView() {
   const names = useNames();
   const focused = useFocusedModule();
   const root = ui.disasmAt ?? ui.selected;
-  const [mode, setMode] = useState<"function" | "module" | "cfg" | "pseudo">("function");
+  const [mode, setMode] = useState<"function" | "module">("function");
   const [graph, setGraph] = useState<CallGraph>({ nodes: [], edges: [], visited: [] });
   const [busy, setBusy] = useState(false);
 
@@ -93,7 +91,7 @@ export default function GraphView() {
 
   useEffect(() => {
     if (mode === "module") void buildModule();
-    else if (mode === "function") void build();
+    else void build();
   }, [mode, build, buildModule]);
 
   const pos = useMemo(() => layout(graph), [graph]);
@@ -109,7 +107,7 @@ export default function GraphView() {
     return max;
   }, [pos]);
 
-  if (!root && mode !== "module") {
+  if (!root && mode === "function") {
     return (
       <NeedsAgent>
         <div className="empty">
@@ -120,30 +118,12 @@ export default function GraphView() {
     );
   }
 
-  const modes = (
-    <>
-      <button className="btn small" data-active={mode === "function"} onClick={() => setMode("function")}>Function</button>
-      <button className="btn small" data-active={mode === "module"} onClick={() => setMode("module")}>Module</button>
-      <button className="btn small" data-active={mode === "cfg"} onClick={() => setMode("cfg")}>CFG</button>
-      <button className="btn small" data-active={mode === "pseudo"} onClick={() => setMode("pseudo")}>Pseudocode</button>
-    </>
-  );
-
-  if (root && (mode === "cfg" || mode === "pseudo")) {
-    return (
-      <NeedsAgent>
-        <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
-          <CfgPanel mode={mode} root={root} modes={modes} />
-        </div>
-      </NeedsAgent>
-    );
-  }
-
   return (
     <NeedsAgent>
       <div className="list-col" style={{ height: "100%", borderRight: "none" }}>
         <div className="toolbar">
-          {modes}
+          <button className="btn small" data-active={mode === "function"} onClick={() => setMode("function")}>Function</button>
+          <button className="btn small" data-active={mode === "module"} onClick={() => setMode("module")}>Module</button>
           {mode === "module" && <ModulePicker />}
           <span className="mono faint ellipsis grow">
             {mode === "function" ? labelAddr(root ?? "", modules) : focused?.name} · {graph.nodes.length} nodes · {graph.edges.length} edges

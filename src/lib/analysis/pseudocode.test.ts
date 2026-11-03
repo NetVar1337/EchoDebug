@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildCfg, type Insn } from "./cfg";
+import { buildStructure, type Insn } from "./structure";
 import { conditionOf, condText, normalize, pseudocode, translate } from "./pseudocode";
 
 const listing = (rows: [number, string][]): Insn[] =>
   rows.map(([a, text], i) => ({ address: "0x" + a.toString(16), length: (rows[i + 1]?.[0] ?? a + 2) - a, text }));
 const tr = (text: string, address = "0x1000", length = 7) => translate({ address, length, text });
-const code = (rows: [number, string][]) => pseudocode(buildCfg(listing(rows))).map((l) => "  ".repeat(l.indent - 1) + l.text);
+const code = (rows: [number, string][]) => pseudocode(buildStructure(listing(rows))).map((l) => "  ".repeat(l.indent - 1) + l.text);
 
 describe("normalize", () => {
   it("keeps intel and converts at&t", () => {

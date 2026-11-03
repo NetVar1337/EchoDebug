@@ -1,9 +1,9 @@
-// Structured pseudocode on top of the CFG: a deliberately small
+// Structured pseudocode on top of structure.ts: a deliberately small
 // "decompiler-lite". Regions become if/else, while, do-while and goto where
 // structuring fails; common x64 instructions become C-like statements and
 // everything else stays as the raw asm line in a comment. Registers are not
 // turned into variables and no types are recovered.
-import { branchOf, mnemonicOf, postDominators, type Cfg, type Insn } from "./cfg";
+import { branchOf, mnemonicOf, postDominators, type Cfg, type Insn } from "./structure";
 
 export type Abi = "win64" | "sysv";
 export type Options = { abi?: Abi; nameOf?: (address: string) => string };

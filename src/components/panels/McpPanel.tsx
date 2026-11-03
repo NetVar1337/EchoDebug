@@ -1,18 +1,20 @@
 // MCP Server panel: endpoint + connect hints, the tool catalog with a live call tester,
 // the prompt/resource catalogs, and a live log of tools/call requests the relay has seen.
 import { useEffect, useMemo, useState } from "react";
-import { Check, Copy, Play, RefreshCw } from "lucide-react";
+import { Check, Copy, Download, Play, RefreshCw } from "lucide-react";
 import tools from "@/lib/tools.json";
 import { request } from "@/lib/client";
 import { useConn } from "@/store/conn";
-import { attempt } from "@/store/output";
+import { attempt, log as outLog } from "@/store/output";
+import { parseList, useMcp, type PolicyMode } from "@/store/mcp";
+import { saveText } from "@/lib/save";
 import { CopyChip, IconButton, Panel, useCopy } from "../ui";
 
 type Tool = { name: string; verb: string; description: string; input_schema: { required?: string[] } };
 type Prompt = { name: string; description: string; arguments?: { name: string; description: string; required?: boolean }[] };
 type Resource = { uri: string; name: string; description: string };
-type Meta = { serverInfo: { name: string; version: string }; prompts: Prompt[]; resources: Resource[]; tools: number };
-type LogEntry = { ts: number; tool: string; verb: string; args: string; ok: boolean; ms: number };
+type Meta = { serverInfo: { name: string; version: string }; prompts: Prompt[]; resources: Resource[]; resourceTemplates?: { uriTemplate: string; name: string }[]; tools: number };
+type LogEntry = { ts: number; tool: string; verb: string; args: string; ok: boolean; ms: number; outcome?: "ok" | "error" | "denied" };
 
 const kTools = tools as unknown as Tool[];
 
@@ -27,8 +29,21 @@ export default function McpPanel() {
   const [result, setResult] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
 
+  const pol = useMcp();
+  const [allowText, setAllowText] = useState(pol.allow.join(", "));
+  const [denyText, setDenyText] = useState(pol.deny.join(", "));
+  useEffect(() => setDenyText(pol.deny.join(", ")), [pol.deny]);
+  const exportAudit = async () => {
+    const r = await attempt("mcp_audit_export", request<{ jsonl: string; audit_file: string; audit_path: string }>("mcp_audit_export"));
+    if (!r) return;
+    const text = r.audit_file || r.jsonl;
+    if (!text.trim()) return outLog("warn", "mcp", "the call log is empty");
+    const path = await saveText("mcp-audit.jsonl", text.endsWith("\n") ? text : text + "\n", { name: "JSON Lines", extensions: ["jsonl"] });
+    if (path) outLog("info", "mcp", `audit log saved to ${path}`);
+  };
   const endpoint = `http://127.0.0.1:${c.port}/mcp`;
-  const addCmd = `claude mcp add --transport http echodebug ${endpoint}`;
+  const authHeader = c.token ? `Authorization: Bearer ${c.token}` : "";
+  const addCmd = `claude mcp add --transport http echodebug ${endpoint}${c.token ? ` --header "${authHeader}"` : ""}`;
 
   const loadMeta = async () => {
     const m = await attempt("mcp_meta", request<Meta>("mcp_meta"));
@@ -87,9 +102,42 @@ export default function McpPanel() {
         <CopyChip text={endpoint} copied={copied} onCopy={copy} />
         <div className="label" style={{ marginTop: 6 }}>Connect a client (Claude Code)</div>
         <CopyChip text={addCmd} copied={copied} onCopy={copy} />
+        {c.token ? (
+          <>
+            <div className="label" style={{ marginTop: 6 }}>Auth header (other clients)</div>
+            <CopyChip text={authHeader} copied={copied} onCopy={copy} />
+            <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>The relay rejects <span className="mono">/client</span> and <span className="mono">/mcp</span> requests without this token, so other programs on this machine cannot reach the target's memory. Keep it private.</div>
+          </>
+        ) : (
+          <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>Relay authentication is off (<span className="mono">ECHODEBUG_AUTH=0</span>): any local program can use the relay.</div>
+        )}
+        <div className="row" style={{ marginTop: 6 }}><span className="dot" data-state={c.provider ? "ok" : "warn"} /> App analyses over MCP ({kTools.filter((t) => t.verb.startsWith("ui_")).length} <span className="mono">ui_*</span> tools) {c.provider ? "served by this window" : "unavailable"}</div>
         <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
           Any MCP client works — the relay speaks Streamable HTTP JSON-RPC 2.0 on <span className="mono">POST /mcp</span> (batch supported).
-          Capabilities: tools ({meta?.tools ?? kTools.length}), prompts, resources.
+          Capabilities: tools ({meta?.tools ?? kTools.length}, with annotations and structured output), prompts, resources (subscribe, templates), completions, logging. Clients that launch servers as subprocesses can use <span className="mono">echodebug-relay --stdio</span>. <span className="mono">GET /mcp</span> with <span className="mono">Accept: text/event-stream</span> streams resource updates and agent events; a <span className="mono">tools/call</span> with a <span className="mono">progressToken</span> streams scan progress.
+        </div>
+      </div>
+
+      <div className="panel-section">
+        <div className="label">Call policy</div>
+        <div className="row">
+          {(["allow", "ask", "readonly"] as PolicyMode[]).map((m) => (
+            <button key={m} className={`btn small${pol.mode === m ? " primary" : ""}`} onClick={() => pol.setPolicy({ mode: m })}>
+              {m === "allow" ? "Allow all" : m === "ask" ? "Ask before changes" : "Read-only"}
+            </button>
+          ))}
+        </div>
+        <div className="faint" style={{ fontSize: 12 }}>
+          {pol.mode === "allow" ? "MCP clients may call every tool." : pol.mode === "ask" ? "Calls that change the target (writes, freezes) and dumps wait for Allow/Deny in this window; with no window open they are refused." : "Calls that change the target are refused; reads and analyses still work."}
+          {" "}Tool annotations (readOnlyHint/destructiveHint) tell clients the same.
+        </div>
+        <div className="label" style={{ marginTop: 6 }}>Allow only (empty: every tool)</div>
+        <input className="input mono" placeholder="read_memory, disassemble, …" value={allowText} onChange={(e) => setAllowText(e.target.value)} onBlur={() => pol.setPolicy({ allow: parseList(allowText) })} />
+        <div className="label" style={{ marginTop: 6 }}>Never allow</div>
+        <input className="input mono" placeholder="write_memory, freeze_value, …" value={denyText} onChange={(e) => setDenyText(e.target.value)} onBlur={() => pol.setPolicy({ deny: parseList(denyText) })} />
+        <div className="row" style={{ marginTop: 6 }}>
+          <label className="row grow" style={{ gap: 6 }}><input type="checkbox" checked={pol.audit} onChange={(e) => pol.setPolicy({ audit: e.target.checked })} /> Keep an audit file (<span className="mono">mcp-audit.jsonl</span> in the config folder)</label>
+          <button className="btn small" onClick={() => void exportAudit()}><Download size={12} /> Export audit (JSONL)</button>
         </div>
       </div>
 
@@ -106,6 +154,12 @@ export default function McpPanel() {
           <div key={r.uri} className="mcp-row">
             <span className="mono">{r.uri}</span>
             <span className="faint ellipsis">{r.name}</span>
+          </div>
+        ))}
+        {(meta?.resourceTemplates ?? []).map((r) => (
+          <div key={r.uriTemplate} className="mcp-row">
+            <span className="mono">{r.uriTemplate}</span>
+            <span className="faint ellipsis">{r.name} (template)</span>
           </div>
         ))}
       </div>
@@ -144,12 +198,12 @@ export default function McpPanel() {
         {log.length === 0 && <div className="faint" style={{ fontSize: 12 }}>No tools/call requests yet — call one above or from an MCP client.</div>}
         <div className="mcp-log">
           {log.slice(0, 30).map((e, i) => (
-            <div key={i} className="mcp-log-row" data-ok={e.ok}>
+            <div key={i} className="mcp-log-row" data-ok={e.ok} title={e.outcome === "denied" ? "refused by the call policy" : undefined}>
               <span className="mono dim">{new Date(e.ts).toLocaleTimeString()}</span>
               <span className="mono">{e.tool}</span>
               <span className="faint ellipsis mono">{e.args}</span>
               <span className="mono dim">{e.ms}ms</span>
-              <span>{e.ok ? <Check size={12} /> : "✕"}</span>
+              <span>{e.ok ? <Check size={12} /> : e.outcome === "denied" ? "⛔" : "✕"}</span>
             </div>
           ))}
         </div>
