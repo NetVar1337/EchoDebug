@@ -65,7 +65,8 @@ on unfreeze and detach), `watch`/`unwatch`/`watch_list` (10 Hz `watch_event`s), 
 `resolve_export` (ELF `.dynsym`/`.symtab`), `peb_walk` (the dynamic loader's `r_debug` → `link_map` list,
 found through `AT_PHDR` → `PT_DYNAMIC` → `DT_DEBUG`; reply adds `source: "link_map" | "maps"` and per
 module `l_addr`/`dynamic`), `emulate` (same request/reply as the agent; pages fault in from the process),
-plus the Linux-only verbs below. Only `reopen_socket` answers with an error. Status frames carry
+plus the Linux-only verbs below. Only `reopen_socket` and the conditional alerts (`alert_add` /
+`alert_remove` / `alert_list`, use watch conditions instead) answer with an error. Status frames carry
 `"backend": "echo" | "local" | "none"` and `"local": bool`.
 
 | Linux-only verb | request | reply |
@@ -121,6 +122,9 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `watch` | `address`, `size?` (1–256, default 4), `label?`, `value_type?` (u8..f64), `condition?` (`any` default, `eq`, `ne`, `gt`, `lt`, `delta`), `value?`, `alert?` (Echo alert per hit) | `watched` (count). The agent samples at 10 tps and emits `watch_event` (`old`, `new`, `hits`; with `value_type` also `old_value`/`new_value`) when the value changes and the condition holds; `watch_list` adds `hits` and `history` (last 16 values) |
 | `unwatch` | `address` | `watched` (count) |
 | `watch_list` | – | `entries:[{address,size,label,last}]` (last = hex of the most recent sample) |
+| `alert_add` | `address`, `value_type` (`u8..u64`,`i8..i64`,`f32`,`f64`,`bytes`,`string`,`wstring`), `condition` (`equals`\|`not_equals`\|`changed`\|`greater`\|`less`; patterns only `equals`/`not_equals`/`changed`), `value?` (as in `scan_new`; not for `changed`), `size?` (patterns + `changed`: bytes compared, 1–256, default 16), `once?` (default false), `snapshot?` (bytes captured around the address, 0–1024, default 64), `label?`, `float_epsilon?` | `alert_id`, `alerts` (count). At most 64 alerts; checked at 50 tps |
+| `alert_remove` | `alert_id` | `removed` (bool), `alerts` |
+| `alert_list` | – | `entries:[{alert_id,address,value_type,condition,value,size,label,once,snapshot,fired,last}]` |
 | `read_typed` | `address`, `type` (`u8..u64`,`i8..i64`,`f32`,`f64`,`string`,`wstring`,`bytes`), `length?` (bytes/string/wstring cap, ≤ 4096) | `ok`, `value` (decoded string / hex), `raw` (hex bits) |
 | `region_stats` | `start?`, `end?` | region counts and byte totals split by present/writable/executable, `truncated` |
 | `query` | `address` | `region: {base,size,present,writable,executable}` |
@@ -131,7 +135,7 @@ one-shot `reopen_socket` request; the agent re-opens the native socket and emits
 | `scan_results` | `offset`, `limit` (≤ 2000) | `count`, `results:[{address, value, previous}]` (hex bytes) |
 | `scan_clear` | – | – |
 | `pointer_scan` | `target` (address), `max_depth?` (1–5, default 3), `max_offset?` (default 0x400), `max_results?` (default 500), `module_only_roots?` (default true) | `results:[{module, module_offset, offsets:[n...]}]`, `truncated` |
-| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `write?` (array of `{address, data}` — bytes injected into the emulator before the run; the page is mapped on demand), `read?` (array of `{address, size}` — bytes read back after the run), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000), `mem_log?` (bool; every explicit memory operand is decoded with Zydis before the instruction runs), `mem_log_limit?` (default 2000, max 20000), `trace_regs?` (per-instruction register changes), `stubs?` (API stand-ins), `layers?` (unpacking layers), `on_unmapped?` (`stop` default, `zero`), `xmm?` (`{"xmm0":"<32 hex>"}`) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `mem:[{address,size,ok,data}]`, `mem_log?:[{rip,address,size,access:"r"\|"w"\|"rw",before,after?}]` (hex values; `after` only for writes; `size` comes from the operand's `ptr` width; implicit stack accesses such as push/pop/call are not logged), `mem_log_truncated?`, `instructions`, `reached_end` (bool) |
+| `emulate` | `start` (address), `end` (address where emulation stops; reaching it is success), `code?` (hex; if present it is mapped at `start` in a blank emulator, otherwise `uc::create_process()` is used so code/data fault in from the attached process), `regs?` (`{"rcx":"0x1", ...}` 64-bit GPRs), `write?` (array of `{address, data}` — bytes injected into the emulator before the run; the page is mapped on demand), `read?` (array of `{address, size}` — bytes read back after the run), `max_insns?` (default 100000, max 5000000), `timeout_us?` (default 1000000, max 5000000), `trace?` (bool), `trace_limit?` (default 2000), `mem_log?` (bool; every explicit memory operand is decoded with Zydis before the instruction runs), `mem_log_limit?` (default 2000, max 20000), `trace_regs?` (per-instruction register changes), `stubs?` (API stand-ins), `layers?` (unpacking layers), `on_unmapped?` (`stop` default, `zero`), `xmm?` (`{"xmm0":"<32 hex>"}`) | `error` (uc::error int), `error_name`, `fault_address`, `regs:{rax..r15,rip,rsp,rbp,eflags}`, `trace:[address...]`, `mem:[{address,size,ok,data}]`, `mem_log?:[{rip,address,size,access:"r"\|"w"\|"rw",before,after?}]` (hex values; `after` only for writes; `size` comes from the operand's `ptr` width; implicit stack accesses such as push/pop/call are not logged), `mem_log_truncated?`, `instructions`, `reached_end` (bool); the agent also returns `ymm:{ymm0..ymm15}` (little-endian hex, only where the emulated CPU exposes it) and `regions:[{address,end,perms:"rwx"}]` (`uc::mem_regions` after the run: code, stack and every page faulted in; ≤ 4096), `regions_truncated` |
 | `dump` | `module?`, `filename` | `path` (relative to the Echo scripts `dmp` folder) |
 | `freeze` | `address`, `data` (hex, mode `set`), `enabled` (bool), `mode?` (`set` default, `add`: value += `step` per second, `clamp`: keep within `min`..`max`), `value_type?` (needed by add/clamp), `group?` | `frozen` (count) — applied at 20 Hz while enabled; `freeze_group {group, enabled}` pauses/resumes a group; `freeze_list` shows mode, group and paused |
 | `freeze_list` | – | `entries:[{address,data}]` |
@@ -146,7 +150,16 @@ Other events: `log` (`level`, `message`), `attached` (`pid`,`base`,`name` — al
 `detached`, `freeze_error` (`address`), `patched` (`address`,`old`,`new` — emitted once per `freeze`
 enable so clients can journal the pre-freeze bytes; frozen values are restored on detach/unload),
 `native_socket` (`ok` — health of Echo's native memory socket after a `reopen_socket` poke),
-`watch_event` (`address`,`label?`,`old`,`new` — hex bytes before/after a watched address changed).
+`watch_event` (`address`,`label?`,`old`,`new` — hex bytes before/after a watched address changed),
+`alert_event` (`alert_id`,`address`,`label?`,`value_type`,`condition`,`old`,`new` (hex),`value` (decoded),
+`once`,`snapshot?:{address,data}` — a conditional alert fired; the agent also writes it to Echo's
+console and, with alerts enabled in its settings, raises an Echo notification naming the alert (no
+memory values)). A condition fires on its false→true edge (immediately if it already holds when
+added), `changed` on every change; each alert fires at most every 200 ms, and a `once` alert is
+removed after its first event. Watches and alerts are cleared on attach/detach.
+
+**Echo menu.** The agent's *EchoDebug* tab in Echo's menu (`ui::`) also shows read-only
+*App connected* / *Target attached* checkboxes (re-synced every second) and a *Clear alerts* button.
 
 The agent restores the pre-freeze bytes of every frozen address on `detach`, on target exit and in
 `on_unload`, and calls `process::detach()` in `on_unload` (Echo docs teardown rule).
@@ -348,6 +361,8 @@ The tool set covers the whole backend: process control (`status`, `list_processe
 `signature_scan_masked`, `string_scan`, `resolve_relative`, `rtti_resolve`, `rtti_resolve_batch`,
 `resolve_export`, `peb_walk`), scanning (`value_scan_first`, `value_scan_next`, `value_scan_results`,
 `value_scan_clear`, `pointer_scan`), emulation (`emulate`), freezing (`freeze_value`, `list_frozen`),
+watching (`watch_add`, `watch_remove`, `list_watched`), alerts (`alert_add`,
+`alert_remove`, `alert_list`),
 dumping (`dump_module`) and socket housekeeping (`reopen_native_socket`).
 
 Because the relay routes by verb, an MCP client gets exactly the same behaviour as the desktop UI.

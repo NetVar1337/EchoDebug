@@ -281,6 +281,16 @@ async fn handle_ext_inner(relay: &Relay, req: Map<String, Value>, orig: &Value, 
         "reopen_socket" => {
             return Some(err(orig, 3003, "operation failed", "no Echo memory socket on the local Linux backend"));
         }
+        // conditional alerts are evaluated by the Windows agent's 50 tps thread; the local backend
+        // offers watch conditions (watch value_type/condition) instead
+        "alert_add" | "alert_remove" | "alert_list" => {
+            return Some(err(
+                orig,
+                3003,
+                "requires the Echo agent",
+                "conditional alerts only exist in the Windows AngelScript agent (echo_debug.as); use watch conditions on the local backend",
+            ));
+        }
         "stats" | "cancel" | "journal" | "agent_config" | "ptr_compare" | "mem_snapshot_list" => {
             let mut v = match verb.as_str() {
                 "stats" => crate::local_more::stats(),

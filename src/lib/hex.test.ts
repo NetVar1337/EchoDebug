@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bytesToHex, hexToBytes, labelAddr, parseAddress } from "./hex";
+import { bytesToHex, hexDump, hexToBytes, labelAddr, parseAddress } from "./hex";
 
 const mods = [{ name: "game.exe", base: "0x140000000", size: 0x10000 }];
 
@@ -18,6 +18,15 @@ describe("hex", () => {
   it("labels", () => {
     expect(labelAddr("0x140000123", mods)).toBe("game.exe+0x123");
     expect(labelAddr(5n, mods)).toBe("0x5");
+  });
+});
+
+describe("hexDump", () => {
+  it("formats 16-byte rows with ascii", () => {
+    const d = hexDump("0x1000", "41".repeat(17)).split("\n");
+    expect(d).toHaveLength(2);
+    expect(d[0]).toBe(`0x1000  ${Array(16).fill("41").join(" ")}  ${"A".repeat(16)}`);
+    expect(d[1]).toBe(`0x1010  ${"41".padEnd(47)}  A`);
   });
 });
 
