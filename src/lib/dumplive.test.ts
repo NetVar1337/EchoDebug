@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mapPeFile, parsePe } from "./analysis/pe";
 import { readHeaders } from "./analysis/dumper";
 
-// a fake target: fix-seh.exe mapped at 0x140000000, one unreadable guard page, a stack region
+// a fake target: fix-seh.exe mapped at 0x140000000, one page that is not resident, a stack region
 const file = new Uint8Array(readFileSync(new URL("./analysis/fixtures/fix-seh.exe", import.meta.url)));
 const image = mapPeFile(file);
 const kBase = 0x140000000n;
@@ -44,7 +44,7 @@ const { dumpImage, dumpName, dumpTarget, findHiddenImages, readSalvaged } = awai
 const mod = { name: "fix-seh.exe", base: "0x140000000", size: image.length };
 
 describe("live dumps", () => {
-  it("salvages every readable page around a guard page", async () => {
+  it("salvages every readable page around one that is not resident", async () => {
     const r = await readSalvaged(0x7ff0_0000n, 0x3000);
     expect(r.badPages).toEqual([0x1000]);
     expect(r.bytes[0]).toBe(0xab);

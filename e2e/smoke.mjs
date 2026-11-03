@@ -319,7 +319,12 @@ await step("full target dump from memory: an ELF core gdb reads, a MINIDUMP the 
   const maps = readFileSync(`/proc/${target.p.pid}/maps`, "utf8").split("\n").find((l) => l.endsWith("e2e-target"));
   const base = BigInt("0x" + maps.split("-")[0]);
   const counterAt = "0x" + (base + BigInt(sym("counter"))).toString(16);
-  const out = execFileSync("gdb", ["-batch", "-nx", "-c", corePath, "-ex", `x/wd ${counterAt}`], { stdio: ["ignore", "pipe", "pipe"] }).toString();
+  let out;
+  try {
+    out = execFileSync("gdb", ["-batch", "-nx", "-c", corePath, "-ex", `x/wd ${counterAt}`], { stdio: ["ignore", "pipe", "pipe"] }).toString();
+  } catch (e) {
+    throw new Error(e?.code === "ENOENT" ? "gdb is not installed: this step checks the ELF core with it (apt-get install gdb)" : String(e?.message ?? e));
+  }
   const v = Number(/:\s+(-?\d+)/.exec(out)?.[1]);
   expect(v >= 100, `gdb read counter = ${v} from the core: ${out.slice(-300)}`);
   // the MINIDUMP: the relay's dump reader lists the target's modules from it

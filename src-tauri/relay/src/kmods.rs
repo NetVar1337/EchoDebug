@@ -8,8 +8,9 @@
 //! * Linux: `/proc/modules` (addresses read as 0 unless root with `kptr_restrict` allowing it).
 //!
 //! The dump itself reads the image through the attached backend like any other memory, so it
-//! works only where the backend can read kernel addresses (Echo reads through the target's page
-//! tables; the local /proc backend cannot).
+//! works only where the backend can read kernel addresses: Echo's documented API does not promise
+//! that (its reads go through the attached process's address space), the local /proc backend
+//! cannot.
 
 use serde_json::{json, Value};
 

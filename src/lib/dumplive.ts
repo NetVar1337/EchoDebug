@@ -24,8 +24,10 @@ export type Cancel = { aborted: boolean };
 
 /**
  * [base, base+size) with every readable page: 64 KiB entries first, and a failed entry is read
- * again page by page so one guard page does not cost the whole 64 KiB. Unreadable pages stay zero
- * and are listed (as offsets from `base`).
+ * again page by page so one missing page does not cost the whole 64 KiB. Echo reads physical
+ * memory and the local backend /proc/<pid>/mem, so page protections (guard, no-access) do not stop
+ * either: what fails are pages that are not resident (paged out, never touched, decommitted).
+ * Those stay zero and are listed (as offsets from `base`).
  */
 export async function readSalvaged(base: bigint, size: number, onProgress?: Progress, cancel?: Cancel): Promise<{ bytes: Uint8Array; badPages: number[] }> {
   const out = new Uint8Array(size);
@@ -80,7 +82,7 @@ export async function dumpImage(t: ImageTarget, modules: readonly Module[], o: M
   if (size <= 0 || size > 0x4000_0000) throw new Error(`implausible image size 0x${size.toString(16)}`);
   const { bytes, badPages } = await readSalvaged(t.base, size, o.onProgress, o.cancel);
   const pages = Math.ceil(size / kPage);
-  if (badPages.length === pages) throw new Error(`no page of ${t.name} at ${fmtAddr(t.base)} could be read${t.base >= 0xffff_8000_0000_0000n ? " (kernel memory: the backend cannot read it here; Echo reads through the target's page tables, the local backend not at all)" : ""}`);
+  if (badPages.length === pages) throw new Error(`no page of ${t.name} at ${fmtAddr(t.base)} could be read${t.base >= 0xffff_8000_0000_0000n ? " (kernel memory: this backend cannot read it here — Echo documents no kernel-memory access, and the local /proc backend has none)" : ""}`);
   let disk: Uint8Array | null = null;
   if (o.headers === "disk" || (o.headers === "auto" && headerProblem(bytes))) {
     if (t.module) disk = await readModuleFileBytes(t.module).then((f) => f.bytes).catch(() => null);
@@ -102,6 +104,7 @@ export async function dumpImage(t: ImageTarget, modules: readonly Module[], o: M
     } else report.warnings.push("no IAT found to rebuild: the import table is the one in memory");
   }
   if (rec.note) report.warnings.unshift(rec.note);
+  if (badPages.length) report.warnings.push("unreadable pages are usually not resident (paged out or never touched): touching that code or data in the target before dumping brings them in");
   return { name: t.name, bytes: out, report: { ...report, headerSource: rec.source, imports } };
 }
 

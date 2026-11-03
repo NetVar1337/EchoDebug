@@ -89,6 +89,8 @@ jobs:
       - run: cargo build -p echo-debug-relay --bin echodebug-relay
         working-directory: src-tauri
       - run: npm i --no-save playwright@1.63.0 && npx playwright install --with-deps chromium
+      # the full-target dump step checks the ELF core it writes with gdb
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gdb
       - run: npm run test:e2e
 
   app:

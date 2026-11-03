@@ -201,8 +201,9 @@ over Echo and the local backend and never open the process:
 
 * **Module / image dumps** (`ui_dump_module`, MCP `dump_module_rebuilt`: `path`, `module` or
   `address` (+ `size`), `layout` `file`\|`virtual`, `headers` `auto`\|`memory`\|`disk`,
-  `rebuild_imports`, `oep_rva`): 64 KiB reads, a failed one read again page by page (unreadable
-  pages are zero-filled and counted); ImageBase becomes the address the image was read at (its
+  `rebuild_imports`, `oep_rva`): 64 KiB reads, a failed one read again page by page (pages that
+  are not resident — Echo reads physical memory, so protections do not stop it — are zero-filled
+  and counted); ImageBase becomes the address the image was read at (its
   absolute addresses are already relocated for it); the section table is rewritten for the layout
   (`file`: packed at FileAlignment with trailing zeros trimmed; `virtual`: raw = virtual, FileAlignment
   = SectionAlignment); debug-directory entries get their file offsets; the certificate table (not in
@@ -218,8 +219,9 @@ over Echo and the local backend and never open the process:
   `note?`. Windows: `NtQuerySystemInformation(SystemModuleInformation)` after enabling
   SeDebugPrivilege (Windows 11 24H2+ reports zero bases to non-elevated callers; `note` says so);
   Linux: `/proc/modules` (listing only: the local backend cannot read kernel memory). A driver is
-  dumped like an image at its base, which needs a backend that can read kernel addresses (Echo reads
-  through the target's page tables); when no page reads, the error says so.
+  dumped like an image at its base, which needs a backend that can read kernel addresses: Echo's
+  documented API does not promise that (its reads go through the attached process's address space),
+  the local backend cannot; when no page reads, the error says so.
 * **Full target** (`ui_dump_target`, MCP `dump_target_memory`: `path`, `format`
   `minidump`\|`elf`, `include` `all`\|`writable+images`, `max_region_mib`): every present region,
   streamed to the file region by region (the app's `append_file_raw` command takes raw chunks), as

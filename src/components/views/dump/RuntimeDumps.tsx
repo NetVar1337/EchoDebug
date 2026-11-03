@@ -121,8 +121,7 @@ export function ModuleDumpPanel() {
   return (
     <div className="dump-panel">
       <p className="dump-blurb">
-        Dump a loaded module from memory into a PE that loads and disassembles (x64dbg / Scylla style): every readable page (a guard page costs
-        4 KiB, not the whole read), ImageBase set to where it was dumped, the section table rewritten for the layout, debug-directory offsets fixed,
+        Dump a loaded module from memory into a PE that loads and disassembles (x64dbg / Scylla style): every readable page (a page that is not resident costs 4 KiB, not the whole read), ImageBase set to where it was dumped, the section table rewritten for the layout, debug-directory offsets fixed,
         the signature table dropped, the checksum recomputed; headers wiped by anti-dump code come from the file on disk. Reads go through the
         attached backend, so nothing touches the target.
       </p>
@@ -224,8 +223,9 @@ export function DriversPanel() {
       <p className="dump-blurb">
         The machine's kernel drivers (Windows: <code>NtQuerySystemInformation</code>, which reports image bases only to an elevated EchoDebug;
         Linux: <code>/proc/modules</code>), dumped through the attached backend's reads like a module: INIT and other discarded sections come back
-        as unreadable pages, the checksum is recomputed so the image is valid again. This needs a backend that can read kernel memory — Echo reads
-        through the target's page tables, where kernel space is normally mapped; the local /proc backend cannot. If no page reads, it says so.
+        as unreadable pages, the checksum is recomputed so the image is valid again. Reading kernel addresses is not part of Echo's documented
+        API (its reads go through the attached process's address space), so whether this works depends on your Echo build and system; the
+        local /proc backend cannot. If no page reads, it says so.
       </p>
       <div className="dump-form">
         <button className="dump-btn" onClick={() => void load()}><RefreshCw size={13} /> Reload</button>
