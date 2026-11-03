@@ -4,7 +4,12 @@
  * `img` is a mapped PE image indexed by RVA (`img[rva]` is the byte at RVA
  * `rva`).  `fns` carries the module functions as *absolute* addresses; they are
  * converted to RVAs by subtracting the module base.
+ *
+ * AArch64 images (detected from the headers) take their edges from the arm64
+ * reference scanner (a64.ts): b/bl/b.cond/cbz/tbz and adrp pairs, adr, literals.
  */
+import { a64Refs } from "./a64";
+import { detectArch } from "./arch";
 
 export type GraphNode = {
   address: string;
@@ -220,6 +225,7 @@ export function buildCallGraph(
 
   const known = new Map<number, FnInfo>();
   for (const fn of functions) if (!known.has(fn.rva)) known.set(fn.rva, fn);
+  const a64 = detectArch(img)?.arch === "arm64";
 
   const nodes = new Map<string, GraphNode>();
   const edges = new Map<string, GraphEdge>();
@@ -263,6 +269,17 @@ export function buildCallGraph(
 
     const start = fn.rva;
     const end = fn.rva + fn.size;
+
+    if (a64) {
+      for (const r of a64Refs(img, [{ rva: start, size: fn.size }])) {
+        if (r.toRva < 0 || r.toRva >= img.length) continue;
+        const knownFn = known.get(r.toRva);
+        addNode(r.toRva, knownFn ? "function" : "unknown", level);
+        addEdge(fn.rva, r.toRva, r.kind);
+        if (r.kind !== "rip" && knownFn && level + 1 <= maxDepth) queue.push({ fn: knownFn, level: level + 1 });
+      }
+      continue;
+    }
 
     // Direct relative branches: E8 (call), E9 (jmp), 0F 8x (jcc).
     for (let i = start; i + 5 <= end; i++) {
