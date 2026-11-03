@@ -57,6 +57,22 @@ pub use mcp_server::serve_stdio;
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Per-verb wall-clock budget for one /client request (fuzz guard): a hostile target's bytes must
+/// not be able to hang the relay's own CPU-bound parsers. Relay-local verbs that chew on untrusted
+/// input (PDB/cabinet files, unwind data, traces, the lifter, scans over hostile memory) get a
+/// short budget; everything else keeps the 120 s upstream timeout as its ceiling.
+pub fn verb_budget(verb: &str) -> Duration {
+    match verb {
+        "pdb" | "pdb_fetch" | "pdb_symbols" | "pdb_type" | "pdb_types" | "pdb_lines" | "pdb_image"
+        | "cab" | "kdump_open" | "kdump_info" | "kdump_extract" | "unwind" | "lift_block"
+        | "lift_trace" | "devirt" | "trace_import" | "trace_query" | "trace_export"
+        | "sig_scan" | "sig_scan_ida" | "string_scan" | "scan_new" | "scan_next" | "ptr_scan" => {
+            Duration::from_secs(10)
+        }
+        _ => DEFAULT_TIMEOUT,
+    }
+}
+
 /// Reply (code 2006) to `threads` / `stack` / `handles` while the Echo agent is the backend.
 pub const THREADS_ECHO_UNSUPPORTED: &str = "the Echo backend can't list threads, call stacks or handles: Echo's script API has no thread enumeration, thread context or handle access (they work on the local Linux backend and natively on Windows without Echo)";
 
@@ -813,7 +829,21 @@ impl Relay {
             }
             let (relay, tx) = (self.clone(), tx.clone());
             tokio::spawn(async move {
-                let _ = tx.send(relay.request(req).await.to_string());
+                // fuzz guard: a request that outruns its per-verb budget is dropped with an
+                // error instead of hanging the relay on a hostile input
+                let id = req["id"].clone();
+                let verb = req["type"].as_str().unwrap_or("").to_owned();
+                let out = match tokio::time::timeout(verb_budget(&verb), relay.request(req)).await {
+                    Ok(v) => v,
+                    Err(_) => json!({
+                        "type": "error",
+                        "id": id,
+                        "code": 2003,
+                        "message": format!("verb '{verb}' exceeded its relay time budget"),
+                        "detail": "the request was dropped; the relay stays up",
+                    }),
+                };
+                let _ = tx.send(out.to_string());
             });
         }
         writer.abort();
@@ -1209,6 +1239,18 @@ pub async fn serve(port: u16, app_version: String) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verb_budgets() {
+        // relay-local parsers of untrusted input get the short budget
+        for v in ["pdb_types", "cab", "kdump_extract", "unwind", "lift_trace", "sig_scan", "scan_next", "trace_import"] {
+            assert_eq!(verb_budget(v), Duration::from_secs(10), "{v}");
+        }
+        // everything else keeps the upstream-timeout ceiling
+        for v in ["read", "disassemble", "emulate", "attach", "watch_add", "ui_set_name"] {
+            assert_eq!(verb_budget(v), DEFAULT_TIMEOUT, "{v}");
+        }
+    }
 
     #[test]
     fn prompts_reference_only_known_tools() {
