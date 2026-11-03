@@ -15,7 +15,7 @@ export const kStateful = [
   "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
   "ui_load_symbols", "ui_import_pdb_type", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
   "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
-  "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment",
+  "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment", "trace_record",
 ];
 /** relay/src/assistant.rs ASSISTANT_DENY: read-only by annotation, but they run code, change the agent's state or use the network. */
 export const kAssistantDeny = [

@@ -17,6 +17,7 @@ const kViews: Record<TabId, ComponentType> = {
   heap: lazy(() => import("./views/HeapView")),
   emulator: lazy(() => import("./views/EmulatorView")),
   emudbg: lazy(() => import("./views/EmuDebugView")),
+  trace: lazy(() => import("./views/TraceView")),
   hooks: lazy(() => import("./views/HooksView")),
   monitors: lazy(() => import("./views/MonitorsView")),
   engines: lazy(() => import("./views/EnginesView")),
