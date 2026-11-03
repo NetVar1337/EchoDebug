@@ -203,6 +203,15 @@ button:disabled { opacity: 0.45; cursor: default; }
 .insn-comment { color: var(--text-faint); font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .iat-symbol { color: var(--success); margin-left: 8px; font-size: 11.5px; }
 
+/* --- pseudocode (CFG view) ----------------------------------------------- */
+.pseudo { white-space: pre; padding-bottom: var(--pad-md); }
+.pseudo-note { padding: var(--pad-sm) 10px; margin-bottom: var(--pad-sm); font-family: var(--font-ui); font-size: var(--type-small); color: var(--warning); white-space: normal; border-bottom: 1px solid var(--border-soft); }
+.pseudo-line { line-height: var(--row-h); }
+.pseudo-line[data-link="true"] { cursor: pointer; }
+.pseudo-line[data-link="true"]:hover { background: var(--bg-2); }
+.pseudo-line[data-kind="comment"] { color: var(--text-faint); }
+.pseudo-line[data-kind="label"] { color: var(--accent); }
+
 /* --- binary map ----------------------------------------------------------- */
 .map-bar { display: flex; height: 22px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .map-seg { display: grid; place-items: center; min-width: 0; overflow: hidden; font-size: 10px; color: var(--text-faint); background: var(--bg-2); border-right: 1px solid var(--bg-1); }
@@ -328,6 +337,9 @@ html[data-motion="off"] *::after {
 .cfg-wrap { flex: 1; overflow: auto; background: var(--bg-0, var(--bg)); }
 .cfg-block rect { fill: var(--bg-2); stroke: var(--border); }
 .cfg-block[data-entry="true"] rect { stroke: var(--accent); stroke-width: 1.5; }
+.cfg-block[data-loop] rect { fill: color-mix(in srgb, var(--warning) 9%, var(--bg-2)); stroke: var(--warning); }
+.cfg-block[data-loop="header"] rect { stroke-width: 2; }
+.cfg-block[data-entry="true"][data-loop] rect { stroke: var(--accent); }
 .cfg-block[data-sel="true"] rect { fill: var(--selection); }
 .cfg-block text { font-family: var(--font-mono); font-size: 11px; fill: var(--text); }
 .cfg-block .cfg-addr { fill: var(--text-faint); }
