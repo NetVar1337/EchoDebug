@@ -349,7 +349,7 @@ export function structure(cfg: Cfg, opts: Options = {}): Structured {
     blk.insns.forEach((insn, i) => {
       if (i === consumed) return;
       const br = branchOf(insn.text);
-      if (i === blk.insns.length - 1 && br && ((br.kind === "jcc" && isCond(b)) || (br.kind === "jmp" && blk.succ.length > 0))) return;
+      if (i === blk.insns.length - 1 && br && ((br.kind === "jcc" && isCond(b)) || (br.kind === "jmp" && blk.succ.some((e) => e.kind === "jump")))) return;
       // a jcc whose target is outside the listing has no edge: keep it visible
       const text = br?.kind === "jcc" ? `// ${insn.text.trim()}  (conditional branch out of the function)` : translate(insn, abi, written, opts.nameOf);
       if (text !== null) out.push({ k: "s", text, addr: insn.address });
