@@ -40,13 +40,16 @@ import { disassembleIl, formatIl, userStringRefs } from "./analysis/cil";
 import { findIat } from "./analysis/unpack";
 import { diffFunctions } from "./analysis/bindiff";
 import { mapPeFile, parseRuntimeFunctions } from "./analysis/pe";
-import { loadPdbSymbols, readModuleFileBytes } from "./modfile";
+import { readModuleFileBytes } from "./modfile";
+import { ensurePdb, importPdbType, loadPdb, pdbType, pdbTypes, protoText, sourceLines, symAddr } from "./pdb";
+import { pdbFunctionAt } from "@/store/symbols";
 import { batchDecrypt, exportIndex, oepCandidates } from "./unpacklive";
 import { functionsFromImage } from "./diffinput";
 import { parseSignature, authenticodeHash } from "./analysis/authenticode";
 import { invoke } from "@tauri-apps/api/core";
 import { guessFields } from "./analysis/structguess";
 import { toCpp } from "./analysis/struct";
+import { pdbDecl } from "./analysis/pdbtypes";
 import { toBinja, toC, toGhidra, toIdaPython, toReclassXml } from "./analysis/typeexport";
 import { pointerClassifier } from "./ptrkind";
 import { useTypes } from "@/store/types";
@@ -501,7 +504,60 @@ provide("ui_source_netvars", async (args) => {
 
 provide("ui_load_symbols", async (args) => {
   const m = pickModule(args);
-  return { module: m.name, ...(await loadPdbSymbols(m, { overwrite: Boolean(args.overwrite) })) };
+  // this tool is the network one (openWorld): it may ask the symbol servers unless download:false
+  const e = await loadPdb(m, { applyNames: Boolean(args.apply_names), overwrite: Boolean(args.overwrite), download: args.download !== false, allowMismatch: Boolean(args.allow_mismatch) });
+  if (e.status !== "loaded") throw new Error(`${m.name}: ${e.error ?? e.status}${e.tried?.length ? ` (looked in: ${e.tried.slice(0, 12).join("; ")})` : ""}`);
+  return { module: m.name, pdb: e.pdb, path: e.path, source: e.source, expected_key: e.expected, key: e.key, guid: e.loadedGuid, age: e.loadedAge, matched: e.matched, ...e.counts };
+});
+
+provide("ui_pdb_symbols", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  const f = typeof args.filter === "string" ? args.filter.toLowerCase() : "";
+  const kind = typeof args.kind === "string" ? args.kind : "";
+  const b = toBig(m.base);
+  const list = e.symbols
+    .filter((s) => (!kind || s.kind === kind) && (!f || s.name.toLowerCase().includes(f) || (s.mangled ?? "").toLowerCase().includes(f)))
+    .map((s) => ({ address: fmtAddr(b + BigInt(s.rva)), rva: s.rva, name: s.name, kind: s.kind, size: s.size, prototype: s.params ? protoText(s) : undefined, type: s.params ? undefined : s.type, mangled: s.mangled }));
+  return { module: m.name, pdb: e.path, matched: e.matched, ...limitList(list, args, 500) };
+});
+
+provide("ui_pdb_types", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  const r = await pdbTypes(e, typeof args.filter === "string" ? args.filter : "", num(args, "limit", 500, 20000));
+  return { module: m.name, total: r.total, types: r.types };
+});
+
+provide("ui_pdb_type", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  if (typeof args.name !== "string" && typeof args.index !== "number") throw new Error("missing 'name' (or 'index') of the type");
+  const which = typeof args.name === "string" ? { name: args.name } : { index: Number(args.index) };
+  const l = await pdbType(e, which);
+  const decl = [pdbDecl(l), ...(l.nested ?? []).map(pdbDecl)].join("\n\n");
+  return { module: m.name, name: l.name, kind: l.kind, size: l.size, fields: l.fields, values: l.values, nested: (l.nested ?? []).map((n) => n.name), c: decl };
+});
+
+provide("ui_import_pdb_type", async (args) => {
+  const m = pickModule(args);
+  const e = await ensurePdb(m);
+  if (typeof args.name !== "string") throw new Error("missing 'name' of the type");
+  const r = await importPdbType(e, { name: args.name }, { nested: args.nested !== false });
+  const t = useTypes.getState().find(r.name);
+  return { module: m.name, imported: r.imported, name: r.name, fields: t?.fields.length ?? 0, cpp: t ? toCpp(t.name, t.fields) : undefined };
+});
+
+provide("ui_pdb_lookup", async (args) => {
+  const a = addrArg(args);
+  const f = pdbFunctionAt(a);
+  const m = moduleOf(a, modules());
+  const lines = m && f ? await sourceLines(m, a, a + 1n).catch(() => []) : [];
+  return {
+    address: fmtAddr(a), label: symAddr(a, modules()),
+    function: f ? { name: f.sym.name, start: fmtAddr(a - BigInt(f.offset)), offset: f.offset, size: f.sym.size, prototype: f.sym.params ? protoText(f.sym) : undefined } : null,
+    source: lines[0] ? { file: lines[0].file, line: lines[0].line } : null,
+  };
 });
 
 provide("ui_il", async (args) => {

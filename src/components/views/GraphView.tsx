@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { request } from "@/lib/client";
 import { labelAddr, toBig } from "@/lib/hex";
+import { symAddr } from "@/lib/pdb";
 import { xrefsTo } from "@/lib/live";
 import { loadImage } from "@/lib/memory";
 import { addEdge, addNode, calleesOf, layout, type CallGraph } from "@/lib/analysis/callgraph";
@@ -173,7 +174,7 @@ export default function GraphView() {
                 <tbody>
                   {graph.nodes.filter((n) => n.depth === (mode === "module" ? 0 : 1)).map((n) => (
                     <tr key={n.address} onClick={() => ui.goDisasm(n.address)}>
-                      <td className="link">{labelAddr(n.address, modules)}</td>
+                      <td className="link">{symAddr(n.address, modules)}</td>
                       <td className="faint">{n.label}</td>
                     </tr>
                   ))}

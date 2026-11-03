@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import { Bug, Pause, Play, StepForward, Unplug } from "lucide-react";
 import { request, type Frame } from "@/lib/client";
-import { fmtAddr, labelAddr, parseAddress, showAddr } from "@/lib/hex";
+import { fmtAddr, parseAddress, showAddr } from "@/lib/hex";
+import { symAddr } from "@/lib/pdb";
 import { onAgentEvent, useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
@@ -55,7 +56,7 @@ export default function DebuggerView() {
     void refresh();
     return onAgentEvent((f: Frame) => {
       if (f.event === "dbg_stop") {
-        const what = `${f.reason}${f.signal ? ` ${f.signal}` : ""}${f.watch ? ` (DR${f.slot} ${f.watch})` : ""} in thread ${f.tid} at ${labelAddr(String(f.address), useConn.getState().modules)}`;
+        const what = `${f.reason}${f.signal ? ` ${f.signal}` : ""}${f.watch ? ` (DR${f.slot} ${f.watch})` : ""} in thread ${f.tid} at ${symAddr(String(f.address), useConn.getState().modules)}`;
         setEvents((e) => [what, ...e].slice(0, 200));
         log("info", "debugger", what);
         void showRegs(f.regs as Regs);
@@ -140,7 +141,7 @@ export default function DebuggerView() {
             <CommitInput value="" placeholder="add: address · module+0x…" onCommit={(v) => v && void addBp(v)} />
             {(status.breakpoints ?? []).map((b) => (
               <div key={b} className="row">
-                <span className="mono link grow" onClick={() => ui.goDisasm(b)}>{labelAddr(b, modules)}</span>
+                <span className="mono link grow" onClick={() => ui.goDisasm(b)}>{symAddr(b, modules)}</span>
                 <button className="row-action" onClick={() => void call("dbg_break", { address: b, enabled: false })}>remove</button>
               </div>
             ))}
@@ -156,14 +157,14 @@ export default function DebuggerView() {
             {(status.hardware ?? []).filter((h) => h.address).map((h) => (
               <div key={h.slot} className="row">
                 <span className="faint">DR{h.slot}</span>
-                <span className="mono grow">{labelAddr(h.address!, modules)} {h.kind} {h.kind !== "exec" ? `${h.len}B` : ""}</span>
+                <span className="mono grow">{symAddr(h.address!, modules)} {h.kind} {h.kind !== "exec" ? `${h.len}B` : ""}</span>
                 <button className="row-action" onClick={() => void call("dbg_hwbreak", { slot: h.slot, enabled: false })}>clear</button>
               </div>
             ))}
           </div>
         </div>
         <div className="list-col" style={{ borderRight: "none" }}>
-          <div className="toolbar"><span className="panel-title">At {regs.rip ? labelAddr(regs.rip, modules) : "—"}</span></div>
+          <div className="toolbar"><span className="panel-title">At {regs.rip ? symAddr(regs.rip, modules) : "—"}</span></div>
           <div className="vlist listing" style={{ flex: "1 1 60%" }}>
             {lines.map((l, i) => {
               const bp = status.breakpoints?.includes(l.address);
