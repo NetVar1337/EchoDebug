@@ -55,7 +55,7 @@ fn read_cstr(mem: &impl MemIo, addr: u64, max: usize) -> Option<String> {
             return Some(String::from_utf8_lossy(&out).into_owned());
         }
         out.extend_from_slice(&chunk);
-        a += k as u64;
+        a = a.wrapping_add(k as u64);
     }
     Some(String::from_utf8_lossy(&out).into_owned())
 }
@@ -545,9 +545,10 @@ pub fn walk_link_map(mem: &impl MemIo, auxv: &HashMap<u64, u64>) -> Option<Vec<(
     let mut bias = None;
     let mut dynamic = None;
     for i in 0..phnum.min(64) {
-        let ph = phdr + i * 56;
+        // every address below is read from target memory: wrapping, never an overflow panic
+        let ph = phdr.wrapping_add(i * 56);
         let ty = read_u32(mem, ph)?;
-        let vaddr = read_u64(mem, ph + 16)?;
+        let vaddr = read_u64(mem, ph.wrapping_add(16))?;
         match ty {
             PT_PHDR => bias = Some(phdr.wrapping_sub(vaddr)),
             PT_DYNAMIC => dynamic = Some(vaddr),
@@ -557,28 +558,28 @@ pub fn walk_link_map(mem: &impl MemIo, auxv: &HashMap<u64, u64>) -> Option<Vec<(
     let dynamic = dynamic?.wrapping_add(bias.unwrap_or(0));
     let mut r_debug = 0;
     for i in 0..512u64 {
-        let tag = read_u64(mem, dynamic + i * 16)?;
+        let tag = read_u64(mem, dynamic.wrapping_add(i * 16))?;
         if tag == 0 {
             break;
         }
         if tag == DT_DEBUG {
-            r_debug = read_u64(mem, dynamic + i * 16 + 8)?;
+            r_debug = read_u64(mem, dynamic.wrapping_add(i * 16 + 8))?;
             break;
         }
     }
     if r_debug == 0 {
         return None;
     }
-    let mut lm = read_u64(mem, r_debug + 8)?;
+    let mut lm = read_u64(mem, r_debug.wrapping_add(8))?;
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     while lm != 0 && seen.insert(lm) && out.len() < 4096 {
         let l_addr = read_u64(mem, lm)?;
-        let l_name = read_u64(mem, lm + 8)?;
-        let l_ld = read_u64(mem, lm + 16)?;
+        let l_name = read_u64(mem, lm.wrapping_add(8))?;
+        let l_ld = read_u64(mem, lm.wrapping_add(16))?;
         let name = if l_name != 0 { read_cstr(mem, l_name, 4096).unwrap_or_default() } else { String::new() };
         out.push((l_addr, name, l_ld));
-        lm = read_u64(mem, lm + 24)?;
+        lm = read_u64(mem, lm.wrapping_add(24))?;
     }
     Some(out)
 }
@@ -592,7 +593,7 @@ pub fn link_map_walk(mem: &impl MemIo, pid: u32) -> Value {
             Some(h) if &h[..4] == b"\x7fELF" => {
                 let e = u64::from_le_bytes(h[24..32].try_into().unwrap());
                 let et = u16::from_le_bytes([h[16], h[17]]);
-                if et == 3 { base + e } else { e } // ET_DYN entries are relative
+                if et == 3 { base.wrapping_add(e) } else { e } // ET_DYN entries are relative
             }
             _ => 0,
         }
@@ -640,7 +641,7 @@ pub fn link_map_walk(mem: &impl MemIo, pid: u32) -> Value {
 pub fn demangle_type(s: &str) -> String {
     let b = s.as_bytes();
     let mut i = 0;
-    match parse_type(b, &mut i) {
+    match parse_type(b, &mut i, 0) {
         Some(t) if i == b.len() => t,
         _ => s.to_owned(),
     }
@@ -652,12 +653,19 @@ fn parse_source_name(b: &[u8], i: &mut usize) -> Option<String> {
         *i += 1;
     }
     let n: usize = std::str::from_utf8(&b[start..*i]).ok()?.parse().ok()?;
-    let name = std::str::from_utf8(b.get(*i..*i + n)?).ok()?.to_owned();
+    // the length is part of the (target-supplied) name: `18446744073709551615x` overflowed
+    let name = std::str::from_utf8(b.get(*i..i.checked_add(n)?)?).ok()?.to_owned();
     *i += n;
     Some(name)
 }
 
-fn parse_template_args(b: &[u8], i: &mut usize) -> Option<String> {
+/// Steps over the `E` that closes a nested name, template list or literal; None when the name
+/// ends first (stepping past the end made the next slice panic: `1aILN1b`).
+fn eat_end(b: &[u8], i: &mut usize) -> Option<()> {
+    (b.get(*i) == Some(&b'E')).then(|| *i += 1)
+}
+
+fn parse_template_args(b: &[u8], i: &mut usize, depth: usize) -> Option<String> {
     // at 'I'
     *i += 1;
     let mut args = Vec::new();
@@ -665,32 +673,40 @@ fn parse_template_args(b: &[u8], i: &mut usize) -> Option<String> {
         if b[*i] == b'L' {
             // literal: L <type> <value> E
             *i += 1;
-            let ty = parse_type(b, i)?;
+            let ty = parse_type(b, i, depth)?;
             let start = *i;
             while *i < b.len() && b[*i] != b'E' {
                 *i += 1;
             }
             let v = std::str::from_utf8(&b[start..*i]).ok()?.replace('n', "-");
-            *i += 1;
+            eat_end(b, i)?;
             args.push(if ty == "bool" { if v == "1" { "true".into() } else { "false".into() } } else { v });
         } else if b[*i] == b'J' {
             *i += 1;
             let mut pack = Vec::new();
             while *i < b.len() && b[*i] != b'E' {
-                pack.push(parse_type(b, i)?);
+                pack.push(parse_type(b, i, depth)?);
             }
-            *i += 1;
+            eat_end(b, i)?;
             args.push(pack.join(", "));
         } else {
-            args.push(parse_type(b, i)?);
+            args.push(parse_type(b, i, depth)?);
         }
     }
-    *i += 1; // 'E'
+    eat_end(b, i)?;
     let joined = args.into_iter().filter(|a| !a.is_empty()).collect::<Vec<_>>().join(", ");
     Some(format!("<{joined}>"))
 }
 
-fn parse_type(b: &[u8], i: &mut usize) -> Option<String> {
+/// Deepest nesting demangled (pointers, templates, nested names). Mangled names come from target
+/// memory and from symbol tables of any length: `PPPP…` a megabyte long overflowed the stack.
+const MAX_TYPE_DEPTH: usize = 64;
+
+fn parse_type(b: &[u8], i: &mut usize, depth: usize) -> Option<String> {
+    if depth > MAX_TYPE_DEPTH {
+        return None;
+    }
+    let depth = depth + 1;
     let c = *b.get(*i)?;
     let builtin = match c {
         b'v' => Some("void"), b'b' => Some("bool"), b'c' => Some("char"), b'a' => Some("signed char"),
@@ -706,15 +722,15 @@ fn parse_type(b: &[u8], i: &mut usize) -> Option<String> {
     match c {
         b'P' => {
             *i += 1;
-            Some(format!("{}*", parse_type(b, i)?))
+            Some(format!("{}*", parse_type(b, i, depth)?))
         }
         b'R' => {
             *i += 1;
-            Some(format!("{}&", parse_type(b, i)?))
+            Some(format!("{}&", parse_type(b, i, depth)?))
         }
         b'K' => {
             *i += 1;
-            Some(format!("{} const", parse_type(b, i)?))
+            Some(format!("{} const", parse_type(b, i, depth)?))
         }
         b'S' => {
             let abbr = match b.get(*i + 1) {
@@ -728,7 +744,7 @@ fn parse_type(b: &[u8], i: &mut usize) -> Option<String> {
             *i += 2;
             let mut name = if abbr == "std" { format!("std::{}", parse_source_name(b, i)?) } else { abbr.to_owned() };
             if b.get(*i) == Some(&b'I') {
-                name += &parse_template_args(b, i)?;
+                name += &parse_template_args(b, i, depth)?;
             }
             Some(name)
         }
@@ -739,7 +755,7 @@ fn parse_type(b: &[u8], i: &mut usize) -> Option<String> {
                 match b[*i] {
                     b'0'..=b'9' => parts.push(parse_source_name(b, i)?),
                     b'I' => {
-                        let t = parse_template_args(b, i)?;
+                        let t = parse_template_args(b, i, depth)?;
                         parts.last_mut()?.push_str(&t);
                     }
                     b'S' if b.get(*i + 1) == Some(&b't') => {
@@ -750,13 +766,13 @@ fn parse_type(b: &[u8], i: &mut usize) -> Option<String> {
                     _ => return None,
                 }
             }
-            *i += 1;
+            eat_end(b, i)?;
             Some(parts.join("::"))
         }
         b'0'..=b'9' => {
             let mut name = parse_source_name(b, i)?;
             if b.get(*i) == Some(&b'I') {
-                name += &parse_template_args(b, i)?;
+                name += &parse_template_args(b, i, depth)?;
             }
             Some(name)
         }
@@ -766,7 +782,7 @@ fn parse_type(b: &[u8], i: &mut usize) -> Option<String> {
 
 /// Name of the type_info at `ti` (its `__type_name` pointer at +8).
 fn typeinfo_name(mem: &impl MemIo, ti: u64) -> Option<String> {
-    let np = read_u64(mem, ti + 8)?;
+    let np = read_u64(mem, ti.wrapping_add(8))?;
     let raw = read_cstr(mem, np, 1024)?;
     let ok = !raw.is_empty() && raw.len() < 1024 && raw.bytes().all(|b| b.is_ascii_graphic());
     ok.then_some(raw)
@@ -777,11 +793,11 @@ fn typeinfo_name(mem: &impl MemIo, ti: u64) -> Option<String> {
 fn typeinfo_bases(mem: &impl MemIo, ti: u64) -> Vec<(u64, String)> {
     let mut out = Vec::new();
     // vmi first: small count and every entry a plausible type_info
-    if let (Some(flags), Some(count)) = (read_u32(mem, ti + 16), read_u32(mem, ti + 20)) {
+    if let (Some(flags), Some(count)) = (read_u32(mem, ti.wrapping_add(16)), read_u32(mem, ti.wrapping_add(20))) {
         if flags < 8 && (1..=32).contains(&count) {
             let mut all = Vec::new();
             for k in 0..count as u64 {
-                match read_u64(mem, ti + 24 + k * 16).and_then(|b| typeinfo_name(mem, b).map(|n| (b, n))) {
+                match read_u64(mem, ti.wrapping_add(24 + k * 16)).and_then(|b| typeinfo_name(mem, b).map(|n| (b, n))) {
                     Some(x) => all.push(x),
                     None => {
                         all.clear();
@@ -794,7 +810,7 @@ fn typeinfo_bases(mem: &impl MemIo, ti: u64) -> Vec<(u64, String)> {
             }
         }
     }
-    if let Some(b) = read_u64(mem, ti + 16) {
+    if let Some(b) = read_u64(mem, ti.wrapping_add(16)) {
         if let Some(n) = typeinfo_name(mem, b) {
             if b != ti {
                 out.push((b, n));
@@ -875,8 +891,8 @@ pub fn itanium_classes(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
             let slots = vt.map(|v| {
                 let mut n = 0;
                 while n < 512 {
-                    match read_u64(mem, v + 16 + n * 8) {
-                        Some(f) if f >= base && f < base + size => n += 1,
+                    match read_u64(mem, v.wrapping_add(16 + n * 8)) {
+                        Some(f) if f >= base && f < base.saturating_add(size) => n += 1,
                         _ => break,
                     }
                 }
@@ -884,7 +900,7 @@ pub fn itanium_classes(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
             });
             json!({
                 "name": demangle_type(&mangled), "mangled": mangled,
-                "typeinfo": ti.map(hex_addr), "vtable": vt.map(|v| hex_addr(v + 16)),
+                "typeinfo": ti.map(hex_addr), "vtable": vt.map(|v| hex_addr(v.wrapping_add(16))),
                 "slots": slots.unwrap_or(0), "bases": bases,
             })
         })

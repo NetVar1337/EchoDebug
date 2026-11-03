@@ -861,7 +861,8 @@ impl Code for Pages {
     fn at(&self, addr: u64) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(16);
         for i in 0..16u64 {
-            let a = addr + i;
+            // nothing follows the last byte of the address space (an overflow panic before)
+            let Some(a) = addr.checked_add(i) else { break };
             match self.0.get(&(a & !0xfff)).and_then(|p| p.get((a & 0xfff) as usize)) {
                 Some(b) => out.push(*b),
                 None => break,
