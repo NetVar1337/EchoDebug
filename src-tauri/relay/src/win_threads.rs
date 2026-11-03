@@ -165,13 +165,24 @@ impl Drop for Suspended<'_> {
     }
 }
 
-struct ProcMem(Handle);
+/// The target's memory; `shadowed` while the native debugger has int3s planted in it, whose
+/// original bytes are shown instead (the unwinder decodes prologs, epilogs and call sites).
+struct ProcMem(Handle, bool);
+
+impl ProcMem {
+    fn new(h: Handle, pid: u32) -> ProcMem {
+        ProcMem(h, crate::windbg::shadows(Some(pid)))
+    }
+}
 
 impl Memory for ProcMem {
     fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
         let mut n = 0usize;
         // SAFETY: buf is valid for buf.len() bytes; ReadProcessMemory fails cleanly on unmapped pages
         let ok = unsafe { ReadProcessMemory(self.0, addr as *const c_void, buf.as_mut_ptr().cast(), buf.len(), &mut n) };
+        if ok != 0 && self.1 {
+            crate::local_dbg::unshadow(addr, &mut buf[..n]);
+        }
         ok != 0 && n == buf.len()
     }
 }
@@ -431,7 +442,7 @@ fn threads(req: &Map<String, Value>, pid: u32) -> Value {
     let regs_wanted = req.get("registers").and_then(Value::as_bool).unwrap_or(true);
     let max = max_frames(req);
     let states = system_thread_states(pid);
-    let mem = ProcMem(t.process.0);
+    let mem = ProcMem::new(t.process.0, pid);
     let mut un = Unwinder::new(&mem, t.modules.clone());
     let mut cache = HashMap::new();
     let mut list = Vec::new();
@@ -500,7 +511,7 @@ fn stack(req: &Map<String, Value>, pid: u32) -> Value {
     let Some(h) = Owned::open(unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid) }) else {
         return failed(format!("OpenThread({tid}): {}", last_error()));
     };
-    let mem = ProcMem(t.process.0);
+    let mem = ProcMem::new(t.process.0, pid);
     let mut un = Unwinder::new(&mem, t.modules.clone());
     let max = max_frames(req);
     with_context(&h, |r| match r {

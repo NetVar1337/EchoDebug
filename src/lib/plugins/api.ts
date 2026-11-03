@@ -23,6 +23,9 @@ export const kStateful = new Set([
   "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
   "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
   "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove", "trace_record",
+  // the native debuggers: attaching, int3s and debug registers, the access finder, the API monitor
+  "dbg_attach", "dbg_detach", "dbg_break", "dbg_hwbreak", "dbg_continue", "dbg_step", "dbg_pause", "dbg_set_regs",
+  "dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear",
 ]);
 /** Verbs that change names, comments and the struct catalog. Need `annotate`. */
 export const kAnnotate = new Set(["ui_set_name", "ui_set_comment", "ui_import_pdb_type"]);

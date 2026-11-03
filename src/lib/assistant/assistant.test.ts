@@ -31,6 +31,9 @@ describe("assistant tool filtering", () => {
       "value_scan_first", "value_scan_next", "emulate", "emu_start", "emu_step", "emu_run", "emu_set", "lift_trace", "devirt", "watch_add",
       "alert_add", "agent_config", "cancel_job", "ui_find_oep", "ui_batch_decrypt", "ui_rebuild_imports", "ui_load_symbols", "ui_guess_struct",
       "reopen_native_socket", "module_monitor", "page_monitor", "mem_snapshot", "ptr_save",
+      // the native debugger's access finder and API monitor, their read-only tools included
+      "find_accesses_start", "find_accesses_results", "find_accesses_stop",
+      "api_monitor_start", "api_monitor_log", "api_monitor_stop", "api_monitor_signatures",
     ]) {
       expect(offered.has(name), name).toBe(false);
       expect(allowedTool(name), name).toBeUndefined();

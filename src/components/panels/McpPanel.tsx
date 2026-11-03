@@ -135,7 +135,7 @@ export default function McpPanel() {
           ))}
         </div>
         <div className="faint" style={{ fontSize: 12 }}>
-          {pol.mode === "allow" ? "MCP clients may call every tool." : pol.mode === "ask" ? "Calls that change the target (writes, freezes) and dumps wait for Allow/Deny in this window; with no window open they are refused." : "Calls that change the target are refused; reads and analyses still work."}
+          {pol.mode === "allow" ? "MCP clients may call every tool." : pol.mode === "ask" ? "Calls that change the target (writes, freezes, debugger breakpoints and monitors) and dumps wait for Allow/Deny in this window; with no window open they are refused." : "Calls that change the target are refused; reads and analyses still work."}
           {" "}Tool annotations (readOnlyHint/destructiveHint) tell clients the same.
         </div>
         <div className="label" style={{ marginTop: 6 }}>Allow only (empty: every tool)</div>

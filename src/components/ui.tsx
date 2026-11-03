@@ -113,6 +113,44 @@ export function Lazy({ children }: { children: ReactNode }) {
   return <Suspense fallback={<Empty title="Loading…" />}>{children}</Suspense>;
 }
 
+export type MenuItem = { label: string; onClick: () => void; disabled?: boolean; hint?: string } | "sep";
+
+/** A right-click menu: `open(e, items)` from an onContextMenu handler, render `menu` anywhere. */
+export function useContextMenu(): [(e: React.MouseEvent, items: MenuItem[]) => void, ReactNode] {
+  const [m, setM] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  useEffect(() => {
+    if (!m) return;
+    const close = () => setM(null);
+    const key = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", key);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", key);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+    };
+  }, [m]);
+  const open = (e: React.MouseEvent, items: MenuItem[]) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setM({ x: e.clientX, y: e.clientY, items });
+  };
+  const menu = m ? (
+    <div className="menu-pop context-menu" role="menu" onMouseDown={(e) => e.stopPropagation()}
+      style={{ left: Math.max(4, Math.min(m.x, window.innerWidth - 260)), top: Math.max(4, Math.min(m.y, window.innerHeight - m.items.length * 28 - 12)) }}>
+      {m.items.map((it, i) => it === "sep" ? <div key={i} className="menu-sep" /> : (
+        <button key={i} className="menu-item" role="menuitem" disabled={it.disabled} onClick={() => { setM(null); it.onClick(); }}>
+          {it.label}{it.hint && <span className="menu-hint faint">{it.hint}</span>}
+        </button>
+      ))}
+    </div>
+  ) : null;
+  return [open, menu];
+}
+
 /** Keeps one broken view from blanking the whole window. */
 export class Boundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
