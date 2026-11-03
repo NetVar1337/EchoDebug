@@ -1,4 +1,5 @@
-//! `emulate` for the local backend: Unicorn (x86-64) backed by the attached process.
+//! `emulate` for the local backend: Unicorn (x86-64; AArch64 in `local_emu_a64.rs`) backed by the
+//! attached process.
 //!
 //! Same request/reply shape as the agent's verb (PROTOCOL.md). Without `code`, every page the
 //! emulated code touches is faulted in from the live process on first access, so the process
@@ -21,7 +22,7 @@ pub fn emulate(_mem: &impl MemIo, _req: &Map<String, Value>) -> Value {
 pub use imp::emulate;
 
 #[cfg(target_os = "linux")]
-mod imp {
+pub(crate) mod imp {
     use super::*;
     use crate::local::{arg_addr, hex_addr, hex_bytes};
     use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
@@ -53,7 +54,7 @@ mod imp {
         x: crate::emux::Extras,
     }
 
-    fn error_name(e: uc_error) -> &'static str {
+    pub(crate) fn error_name(e: uc_error) -> &'static str {
         match e {
             uc_error::OK => "OK",
             uc_error::READ_UNMAPPED => "READ_UNMAPPED",
@@ -71,7 +72,7 @@ mod imp {
         }
     }
 
-    fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    pub(crate) fn parse_hex(s: &str) -> Option<Vec<u8>> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
         if !s.len().is_multiple_of(2) {
             return None;
@@ -79,7 +80,7 @@ mod imp {
         (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()).collect()
     }
 
-    fn parse_u64(v: &Value) -> Option<u64> {
+    pub(crate) fn parse_u64(v: &Value) -> Option<u64> {
         match v {
             Value::String(s) => {
                 let t = s.trim();
@@ -111,6 +112,11 @@ mod imp {
         let Some(start) = arg_addr(req, "start") else {
             return json!({ "type": "error", "code": 3002, "message": "bad arguments", "detail": "emulate requires 'start'" });
         };
+        // AArch64: an explicit `arch`, else the architecture of the module that holds `start`
+        let arch = crate::arch::from_req(req).unwrap_or_else(|| if req.contains_key("code") { crate::arch::Arch::X86_64 } else { crate::local::arch_at(mem, start) });
+        if arch == crate::arch::Arch::Arm64 {
+            return crate::local_emu_a64::emulate(mem, req);
+        }
         let end = arg_addr(req, "end").unwrap_or(0);
         let max_insns = req.get("max_insns").and_then(Value::as_u64).unwrap_or(100_000).clamp(1, 5_000_000);
         let timeout_us = req.get("timeout_us").and_then(Value::as_u64).unwrap_or(1_000_000).clamp(1, 5_000_000);
