@@ -357,6 +357,15 @@ describe("mmapped chunks", () => {
     expect(got.map((c) => c.address)).toEqual([base, base + 0x2000n]);
   });
 
+  it("accepts the glibc 2.43 form whose size excludes the header", async () => {
+    const base = 0x7f0000300000n;
+    const m = new FakeMem().map(base, 0x44000);
+    m.q(base + 8n, 0x40ff0n | 2n); // a 0x41000 mapping, as on the CI runner
+    m.q(base + 0x41000n + 8n, 0x2ff0n | 2n); // the next one, right after
+    const got = await mmappedChunks(new HeapMem(m.read), m.list(), () => false, 10);
+    expect(got.map((c) => [c.address, c.size])).toEqual([[base, 0x40ff0], [base + 0x41000n, 0x2ff0]]);
+  });
+
   it("skips pages the caller excludes and headers that run past the region", async () => {
     const base = 0x7f0000200000n;
     const m = new FakeMem().map(base, 0x4000);

@@ -477,9 +477,12 @@ export async function mmappedChunks(mem: HeapMem, regions: Region[], skip: (a: b
       const hdr = await mem.bytes(p, 0x20);
       if (!hdr) { p += 0x1000n; continue; }
       const prev = u64At(hdr, 0), field = u64At(hdr, 8), size = field & ~7n;
-      if ((field & 7n) !== 2n || prev >= 0x1000n || size < 0x1000n || (size & 0xfffn) !== 0n || p + size > end) { p += 0x1000n; continue; }
+      // up to 2.42 the size is the whole mapping; 2.43 stores the mapping size minus the 16-byte header
+      // (seen on the CI runner: 0x40ff0 for a 0x41000 mapping), so accept both and step to the next page
+      const tail = size & 0xfffn;
+      if ((field & 7n) !== 2n || prev >= 0x1000n || size < 0xff0n || (tail !== 0n && tail !== 0xff0n) || p + size > end) { p += 0x1000n; continue; }
       out.push({ address: p, user: p + 16n, size: Number(size), userSize: Number(size) - 16, state: "mmapped", flags: flagText(field & 7n), heap: "glibc:mmap", preview: hdr.slice(16, 32) });
-      p += size;
+      p += (size + 0xfffn) & ~0xfffn;
     }
   }
   return out;
