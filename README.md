@@ -105,6 +105,8 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back; register-change traces with a step slider, xmm/ymm registers and the regions mapped during the run |
 | Debugger (Linux) | ptrace: attach every thread, int3 and hardware (DR0-DR3) breakpoints, step, continue, pause, registers with editing, breakpoint bytes hidden from reads |
 | Script | Async JavaScript against an `ed` API (verbs, memory, journaled writes, names, disassembly, every app analysis), saved scripts |
+| Disassembler sync | **IDA 9.x, Ghidra 11.1+ and Binary Ninja** plugins (`integrations/`) connect to the relay's token-protected `/sync` WebSocket: the disassembly cursor follows the disassembler and the disassembler follows EchoDebug, names and comments sync both ways (last writer wins, conflicts in the sync log), struct types are pushed as C declarations; locations travel as module + RVA so ASLR and rebased databases line up. **Sync** panel (⇄ in the rail): connected tools, module mapping, a toggle per direction, the log. MCP tool `sync_status` (read-only) |
+| Plugins | Third-party **views, palette commands, address context-menu entries and table analyses** as JavaScript modules in `<config>/EchoDebug/plugins`, built on the Script `ed` API; a `manifest.json` declares id, version, entry and permissions (`write` for journaled writes, `annotate` for names; read-only otherwise), shown before you enable a plugin in Settings → Plugins. Example in `examples/plugins/`. Plugins are never exposed over MCP |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …) and tools that read and set your names and comments, list and revert journalled patches and list saved signatures, 16 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
 | Sessions | Export/import the whole workspace (theme, watchlist, bookmarks, names, struct layout) as one JSON file; names export as an IDA `.idc` or Ghidra script. **Module projects** keep names, comments and bookmarks per module build (by RVA) and restore them on the next attach, wherever ASLR puts the module; when a module's build changes, its saved items are **re-located** by a signature made per name and bookmark (Names panel → Sign), with matched / moved / lost counts, and project exports also carry the signature catalog; panel sizes, the last place in each view and (optionally) the last target are restored on start; a target switcher in the Targets panel |
@@ -124,6 +126,42 @@ Echo exposes no API for these, and EchoDebug deliberately ships no driver to rep
 debugger exists on the Linux local backend, through ptrace). One target is attached at a time; the
 Targets panel switches between recent targets. FLIRT files in IDA 9.5's version 11 format are not
 read yet: that layout is not publicly documented.
+
+### Disassembler sync (IDA, Ghidra, Binary Ninja)
+
+Copy the plugin for your disassembler from [`integrations/`](integrations/README.md) (IDA: the
+plugin file plus `integrations/python/echodebug_sync.py` into the plugins folder; Ghidra: the
+`EchoDebugSync.java` script; Binary Ninja: the plugin folder plus the same Python core), then start
+it in the disassembler (IDA: Ctrl-Alt-E, Ghidra: Tools → EchoDebug Sync, Binary Ninja: Plugins →
+EchoDebug → Start sync). Plugins read the relay token from `<config>/EchoDebug/relay-token` (or
+`ECHODEBUG_TOKEN`) and connect to `ws://127.0.0.1:47110/sync`. The **Sync** panel lists connected
+tools and their modules (map a differently named file to the live module there), switches each
+direction on or off, pushes your names, comments and struct types, and shows the sync log.
+
+### Plugins
+
+A plugin is a folder in `<config>/EchoDebug/plugins/` (`%APPDATA%\EchoDebug\plugins` on Windows,
+`~/.config/EchoDebug/plugins` on Linux; Settings → Plugins → Open) with a `manifest.json`:
+
+```json
+{ "id": "acme.vtables", "name": "VTable tools", "version": "1.0.0", "entry": "index.js", "permissions": ["write"] }
+```
+
+and a self-contained ES module (bundle it; relative imports are not resolved) exporting
+`activate(ctx)` and optionally `deactivate()`. `ctx.ed` is the Script API (`read`, `readU64`,
+`disasm`, `modules`, `label`, `names.get`, `ui("ui_strings", …)`, `request(verb)` for MCP catalog
+verbs, …) with the manifest's permissions enforced: without `write` there are no memory writes or
+stateful verbs (scanner, emulator, attach), with it `ed.write` writes through the patch journal;
+raw `write` / `freeze` verbs are never available to plugins; `annotate` allows `ed.names.set` /
+`comment`. `ctx.registerView({ id, title, render(container) })` adds a tab to the **Plugins** view
+(render into the element; return a cleanup function), `registerCommand({ id, label, run })` adds a
+command palette entry, `registerAddressAction({ id, label, run(address), when? })` adds a
+right-click entry on addresses (disassembly, names), `registerAnalysis({ id, title, params?, run(args) })`
+returns `{ columns, rows }` shown as a table (addresses are clickable). `ctx.navigate(address)`
+opens the disassembly and `ctx.log(...)` prints to Output. Enable plugins in **Settings → Plugins**;
+the permissions are shown before a plugin is enabled. Plugins run as JavaScript inside the app
+window (permissions are enforced by the API, not a sandbox), so install only plugins you trust.
+[`examples/plugins/module-overview`](examples/plugins/module-overview) shows each registration.
 
 ### Connecting an MCP client
 
@@ -167,6 +205,7 @@ npm run dev                  # UI only in a browser (needs a relay: cargo run -p
 npm test                     # frontend unit tests (PE/ELF/.NET parsers, assembler, CFG, YARA, FLIRT, diff, unpacking, struct auto-detect, engine readers, …)
 npm run test:e2e             # end-to-end UI test against a live process (Linux: gcc, cargo, playwright)
 cargo test -p echo-debug-relay --manifest-path src-tauri/Cargo.toml   # relay, local backend, ptrace, Unicorn, PDB
+python3 -m unittest discover -s integrations/python                  # sync client core of the IDA / Binary Ninja plugins
 node scripts/lint-agent.mjs <echo-angelscript-lsp checkout> agent/echo_debug.as
 # agent tests: compiles echo_debug.as with the real AngelScript engine against mocks of Echo's API
 cmake -S tests/agent -B build/agent-tests && cmake --build build/agent-tests -j && ctest --test-dir build/agent-tests --output-on-failure
