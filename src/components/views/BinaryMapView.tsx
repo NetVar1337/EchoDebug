@@ -16,7 +16,7 @@ type Region = { base: string; size: number; present: boolean; writable: boolean;
 export default function BinaryMapView() {
   const m = useFocusedModule();
   const modules = useConn((s) => s.modules);
-  const ext = useConn((s) => s.ext);
+  const ext = useConn((s) => s.extOk);
   const ui = useUi();
   const [sections, setSections] = useState<{ name: string; rva: number; vsize: number; r: boolean; w: boolean; x: boolean }[]>([]);
   const [sizeOfImage, setSizeOfImage] = useState(0);

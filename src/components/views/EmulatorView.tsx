@@ -19,24 +19,27 @@ type EmuResult = {
   mem?: MemBlob[];
   mem_log?: MemAccess[];
   mem_log_truncated?: boolean;
-  /** GPRs before each instruction (step_regs) */
-  steps?: Record<string, string>[];
-  steps_truncated?: boolean;
+  reg_trace?: { rip: string; changes?: Record<string, string> }[];
+  api_calls?: { api: string; address: string; return_to: string; result: string; args: string; note?: string }[];
+  api_call_count?: number;
+  layers?: { entry: string; page: string }[];
+  faults?: { address: string; rip: string }[];
+  fault_count?: number;
   xmm?: Record<string, string>;
+  /** Windows agent: ymm0..ymm15 where the emulated CPU exposes them */
   ymm?: Record<string, string>;
+  /** Windows agent: everything mapped in the emulator after the run */
   regions?: { address: string; end: string; perms: string }[];
   regions_truncated?: boolean;
 };
 
 const kRegs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"];
-const kVec = Array.from({ length: 16 }, (_, i) => i);
 
-/** Little-endian 16-byte hex as four f32 lanes, low lane first. */
-function f32Lanes(hex: string): string {
-  if (hex.length < 32) return "";
-  const b = hexToBytes(hex.slice(0, 32));
-  const dv = new DataView(b.buffer);
-  return [0, 4, 8, 12].map((o) => Number(dv.getFloat32(o, true).toPrecision(6))).join(", ");
+/** Register values known at each reg_trace step: everything changed so far, and what changed right here. */
+function stepState(t: NonNullable<EmuResult["reg_trace"]>, i: number): { known: Record<string, string>; changed: Set<string> } {
+  const known: Record<string, string> = {};
+  for (let k = 0; k <= i; k++) Object.assign(known, t[k].changes ?? {});
+  return { known, changed: new Set(Object.keys(t[i].changes ?? {})) };
 }
 
 /** A scratch buffer the emulator writes into, so a routine can be fed input. */
@@ -52,7 +55,10 @@ export default function EmulatorView() {
   const [maxInsns, setMaxInsns] = useState(100000);
   const [trace, setTrace] = useState(true);
   const [memLog, setMemLog] = useState(true);
-  const [stepRegs, setStepRegs] = useState(false);
+  const [stubs, setStubs] = useState(true);
+  const [layers, setLayers] = useState(false);
+  const [zero, setZero] = useState(false);
+  const [regTrace, setRegTrace] = useState(false);
   const [step, setStep] = useState(0);
   const [res, setRes] = useState<EmuResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -92,7 +98,10 @@ export default function EmulatorView() {
       max_insns: maxInsns,
       trace,
       mem_log: memLog,
-      ...(stepRegs ? { step_regs: true, step_regs_limit: 1000 } : {}),
+      stubs,
+      layers,
+      trace_regs: regTrace,
+      on_unmapped: zero ? "zero" : "stop",
       ...(cleanCode ? { code: cleanCode.toLowerCase() } : {}),
       ...(write.length ? { write } : {}),
       ...(read.length ? { read } : {}),
@@ -135,7 +144,12 @@ export default function EmulatorView() {
               <span>max insns</span><input className="input mono" style={{ width: 100 }} type="number" value={maxInsns} onChange={(e) => setMaxInsns(Number(e.target.value))} />
               <label className="row"><input type="checkbox" checked={trace} onChange={(e) => setTrace(e.target.checked)} />trace</label>
               <label className="row" title="Log every explicit memory read/write with its value"><input type="checkbox" checked={memLog} onChange={(e) => setMemLog(e.target.checked)} />memory</label>
-              <label className="row" title="Record all registers before each instruction (first 1000 steps)"><input type="checkbox" checked={stepRegs} onChange={(e) => setStepRegs(e.target.checked)} />steps</label>
+            </div>
+            <div className="row wrap">
+              <label className="row" title="Simulate common API calls (VirtualAlloc, GetProcAddress, memcpy, strlen, …) and return to the caller, so unpackers and decryptors run to the end"><input type="checkbox" checked={stubs} onChange={(e) => setStubs(e.target.checked)} />API stand-ins</label>
+              <label className="row" title="Report pages that were written and then executed: unpacking layers and their entry points"><input type="checkbox" checked={layers} onChange={(e) => setLayers(e.target.checked)} />unpack layers</label>
+              <label className="row" title="Map a zero page on unmapped reads and keep going (every fault is listed)"><input type="checkbox" checked={zero} onChange={(e) => setZero(e.target.checked)} />zero unmapped</label>
+              <label className="row" title="Record which registers change at every instruction"><input type="checkbox" checked={regTrace} onChange={(e) => setRegTrace(e.target.checked)} />register trace</label>
               <span className="grow" />
               <button className="btn primary" disabled={busy} onClick={() => void run()}>{busy ? "Running…" : "Emulate"}</button>
             </div>
@@ -176,44 +190,28 @@ export default function EmulatorView() {
                 <div className={res.error === 0 ? "ok" : "warn"}>{res.error_name} · {res.instructions} instructions{res.error ? ` · fault ${res.fault_address}` : ""}</div>
               </div>
               <div className="kv">{kRegs.filter((r) => res.regs[r]).flatMap((r) => [<span key={r + "k"}>{r}</span>, <span key={r} className="link" onClick={() => ui.select(res.regs[r])}>{res.regs[r]}</span>])}</div>
-              {res.steps && res.steps.length > 0 && (() => {
-                const n = res.steps.length;
+              {res.reg_trace && res.reg_trace.length > 0 && (() => {
+                const t = res.reg_trace;
+                const n = t.length;
                 const i = Math.min(step, n - 1);
-                const cur = res.steps[i];
-                const prev = i > 0 ? res.steps[i - 1] : undefined;
+                const { known, changed } = stepState(t, i);
                 return (
                   <div className="panel-section">
-                    <div className="label">Steps ({n}{res.steps_truncated ? ", limit hit" : ""}) · registers before the instruction runs, changed ones highlighted</div>
+                    <div className="label">Steps ({n}) · registers changed so far when this instruction is reached; the ones the previous instruction changed are highlighted</div>
                     <div className="row">
                       <button className="btn" disabled={i === 0} onClick={() => setStep(i - 1)}>‹</button>
                       <input type="range" className="grow" min={0} max={n - 1} value={i} onChange={(e) => setStep(Number(e.target.value))} />
                       <button className="btn" disabled={i === n - 1} onClick={() => setStep(i + 1)}>›</button>
                       <span className="mono" style={{ minWidth: 70, textAlign: "right" }}>{i + 1}/{n}</span>
                     </div>
-                    <div className="row mono">rip <span className="link" onClick={() => ui.goDisasm(cur.rip)}>{labelAddr(cur.rip, modules)}</span></div>
-                    <div className="kv">{kRegs.filter((r) => cur[r] && r !== "rip").flatMap((r) => [
+                    <div className="row mono">rip <span className="link" onClick={() => ui.goDisasm(t[i].rip)}>{labelAddr(t[i].rip, modules)}</span></div>
+                    <div className="kv">{kRegs.filter((r) => known[r]).flatMap((r) => [
                       <span key={r + "k"}>{r}</span>,
-                      <span key={r} className={prev && prev[r] !== cur[r] ? "warn" : undefined} title={prev && prev[r] !== cur[r] ? `was ${prev[r]}` : undefined}>{cur[r]}</span>,
+                      <span key={r} className={changed.has(r) ? "warn" : undefined}>{known[r]}</span>,
                     ])}</div>
                   </div>
                 );
               })()}
-              {res.xmm && Object.keys(res.xmm).length > 0 && (
-                <table className="table mono">
-                  <colgroup><col style={{ width: 56 }} /><col /><col style={{ width: "38%" }} /></colgroup>
-                  <thead><tr><th>Vector</th><th>Hex (little-endian)</th><th>f32 lanes</th></tr></thead>
-                  <tbody>{kVec.filter((k) => res.xmm![`xmm${k}`]).map((k) => {
-                    const y = res.ymm?.[`ymm${k}`];
-                    return (
-                      <tr key={k}>
-                        <td>{y ? `ymm${k}` : `xmm${k}`}</td>
-                        <td title={y ?? res.xmm![`xmm${k}`]}>{y ?? res.xmm![`xmm${k}`]}</td>
-                        <td className="dim">{f32Lanes(res.xmm![`xmm${k}`])}</td>
-                      </tr>
-                    );
-                  })}</tbody>
-                </table>
-              )}
               {res.regions && res.regions.length > 0 && (
                 <table className="table mono">
                   <colgroup><col /><col /><col style={{ width: 48 }} /></colgroup>
@@ -252,6 +250,34 @@ export default function EmulatorView() {
                     </tr>
                   ))}</tbody>
                 </table>
+              )}
+              {res.layers && res.layers.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>Unpacking layers ({res.layers.length})</th><th>written page</th></tr></thead>
+                  <tbody>{res.layers.map((l, i) => <tr key={i}><td className="link accent" onClick={() => ui.goDisasm(l.entry)}>{labelAddr(l.entry, modules)}</td><td className="faint">{l.page}</td></tr>)}</tbody>
+                </table>
+              )}
+              {res.api_calls && res.api_calls.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>API calls ({res.api_call_count})</th><th>args</th><th>result</th></tr></thead>
+                  <tbody>{res.api_calls.slice(0, 500).map((c, i) => <tr key={i}><td title={`from ${c.return_to}`}>{c.api}{c.note ? <span className="faint"> {c.note}</span> : null}</td><td className="faint ellipsis">{c.args}</td><td>{c.result}</td></tr>)}</tbody>
+                </table>
+              )}
+              {res.faults && res.faults.length > 0 && (
+                <div className="panel-section"><div className="label">Unmapped accesses ({res.fault_count})</div>
+                  <div className="mono faint" style={{ fontSize: 12 }}>{res.faults.slice(0, 40).map((f) => `${f.address} (rip ${f.rip})`).join(" · ")}</div></div>
+              )}
+              {res.reg_trace && res.reg_trace.length > 0 && (
+                <table className="table mono">
+                  <thead><tr><th>Register trace ({res.reg_trace.length})</th><th>changes</th></tr></thead>
+                  <tbody>{res.reg_trace.slice(0, 1000).map((t, i) => <tr key={i}><td className="link" onClick={() => ui.goDisasm(t.rip)}>{labelAddr(t.rip, modules)}</td><td className="faint ellipsis">{t.changes ? Object.entries(t.changes).map(([k, v]) => `${k}=${v}`).join(" ") : ""}</td></tr>)}</tbody>
+                </table>
+              )}
+              {res.xmm && Object.values(res.xmm).some((v) => /[1-9a-f]/.test(v)) && (
+                <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.xmm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k}>{v}</span>])}</div>
+              )}
+              {res.ymm && Object.values(res.ymm).some((v) => /[1-9a-f]/.test(v)) && (
+                <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.ymm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k} title={v}>{v}</span>])}</div>
               )}
               {res.trace.length > 0 && (
                 <table className="table mono">

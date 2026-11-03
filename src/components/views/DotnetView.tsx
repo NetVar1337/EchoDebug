@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, Search } from "lucide-react";
 import { loadImage } from "@/lib/memory";
-import { parseDotnet, type DotnetInfo, type DotnetType } from "@/lib/analysis/dotnet";
+import { openMetadata, parseDotnet, type DotnetInfo, type DotnetMetadata, type DotnetType } from "@/lib/analysis/dotnet";
+import { disassembleIl, formatIl, userStringRefs, type IlBody } from "@/lib/analysis/cil";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { NeedsAgent, Progress } from "../ui";
@@ -19,6 +20,11 @@ export default function DotnetView() {
   const [filter, setFilter] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [sel, setSel] = useState<string | null>(null);
+  const [img, setImg] = useState<Uint8Array | null>(null);
+  const [md, setMd] = useState<DotnetMetadata | null>(null);
+  const [il, setIl] = useState<{ name: string; rva: number; body: IlBody | null; error: string } | null>(null);
+  const [pane, setPane] = useState<"type" | "strings">("type");
+  const [usFilter, setUsFilter] = useState("");
 
   useEffect(() => {
     if (!m) return;
@@ -30,6 +36,9 @@ export default function DotnetView() {
       setProgress(1);
       const info = parseDotnet(img);
       setInfo(info);
+      setImg(img);
+      setMd(info ? openMetadata(img) : null);
+      setIl(null);
       log("info", "dotnet", info ? `${info.types.length} types in ${m.name}` : `${m.name} is not a managed assembly`);
     });
     return () => { live = false; };
@@ -63,6 +72,19 @@ export default function DotnetView() {
     });
 
   const typeOf = (key: string) => info?.types.find((t) => `t:${t.fullName}` === key);
+  const showIl = (t: DotnetType, name: string, rva: number) => {
+    if (!img || !md) return;
+    try {
+      setIl({ name: `${t.fullName}::${name}`, rva, body: disassembleIl(img, rva, md.tokenName), error: "" });
+    } catch (e) {
+      setIl({ name: `${t.fullName}::${name}`, rva, body: null, error: String(e instanceof Error ? e.message : e) });
+    }
+  };
+  const refs = useMemo(() => (pane === "strings" && img && md ? userStringRefs(img, md.methods) : new Map()), [pane, img, md]);
+  const strings = useMemo(() => {
+    const f = usFilter.toLowerCase();
+    return (md?.userStrings ?? []).filter((u) => !f || u.text.toLowerCase().includes(f));
+  }, [md, usFilter]);
 
   return (
     <NeedsAgent>
@@ -98,7 +120,11 @@ export default function DotnetView() {
                     <span className="faint">{t.methods.length}m</span>
                   </div>
                   {open && kids.map((k) => (
-                    <div key={k.key} className="fn-row" data-selected={sel === k.key} onClick={() => setSel(k.key)} style={{ paddingLeft: 36 }}>
+                    <div key={k.key} className="fn-row" data-selected={sel === k.key} onClick={() => {
+                      setSel(k.key);
+                      const mm = k.kind === "method" ? t.methods.find((x) => x.name === k.label) : undefined;
+                      if (mm) { setPane("type"); showIl(t, mm.name, mm.rva); }
+                    }} style={{ paddingLeft: 36 }}>
                       <span className="faint" style={{ width: 14 }}>{k.kind === "method" ? "M" : "F"}</span>
                       <span className="grow ellipsis">{k.label}</span>
                     </div>
@@ -113,6 +139,26 @@ export default function DotnetView() {
             <div className="empty"><div className="empty-title">No CLR metadata.</div><div className="empty-hint">This module is not a managed assembly, or it has no CLR header.</div></div>
           ) : (
             <div className="vlist">
+              <div className="toolbar">
+                <button className="btn small" data-active={pane === "type"} onClick={() => setPane("type")}>Type & IL</button>
+                <button className="btn small" data-active={pane === "strings"} onClick={() => setPane("strings")}>User strings ({md?.userStrings.length ?? 0})</button>
+              </div>
+              {pane === "strings" ? (
+                <div className="panel-section">
+                  <label className="search"><Search size={13} /><input placeholder="Filter strings…" value={usFilter} onChange={(e) => setUsFilter(e.target.value)} /></label>
+                  <table className="table mono"><tbody>
+                    {strings.slice(0, 3000).map((u) => {
+                      const r = refs.get(u.token) ?? [];
+                      return (
+                        <tr key={u.token}>
+                          <td className="ellipsis" title={u.text}>{JSON.stringify(u.text)}</td>
+                          <td className="faint" style={{ width: "40%" }}>{r.length ? r.slice(0, 3).map((x: { method: string; offset: number }) => `${x.method}+IL_${x.offset.toString(16).padStart(4, "0")}`).join(", ") + (r.length > 3 ? ` +${r.length - 3}` : "") : "unreferenced"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody></table>
+                </div>
+              ) : <>
               <div className="panel-section">
                 <div className="label">Assembly</div>
                 <div className="kv">
@@ -133,7 +179,7 @@ export default function DotnetView() {
                         const base = m ? BigInt(m.base) : 0n;
                         const addr = "0x" + (base + BigInt(mm.rva)).toString(16);
                         return (
-                          <tr key={mm.name} onClick={() => ui.goDisasm(addr)}>
+                          <tr key={mm.name} onClick={() => showIl(typeOf(sel)!, mm.name, mm.rva)} onDoubleClick={() => ui.goMemory(addr)} title="click: IL · double-click: bytes in memory">
                             <td className="link">{mm.name}</td>
                             <td className="faint">0x{mm.rva.toString(16)}</td>
                             <td className="dim">{addr}</td>
@@ -144,6 +190,18 @@ export default function DotnetView() {
                   </table>
                 </div>
               )}
+              {il && (
+                <div className="panel-section">
+                  <div className="label">IL · {il.name}</div>
+                  {il.error ? <div className="faint">{il.error}</div> : il.body && (
+                    <>
+                      <div className="faint" style={{ fontSize: 12 }}>{il.body.headerSize === 1 ? "tiny" : "fat"} header · {il.body.codeSize} bytes · maxstack {il.body.maxStack}{il.body.localsToken ? ` · locals ${md?.tokenName(il.body.localsToken)}` : ""}</div>
+                      <pre className="mcp-result" style={{ maxHeight: "none" }}>{formatIl(il.body).join("\n")}</pre>
+                    </>
+                  )}
+                </div>
+              )}
+              </>}
             </div>
           )}
         </div>
