@@ -25,8 +25,8 @@ async function scan(ida: string, module: string): Promise<string[]> {
 }
 
 async function uniqueAt(addr: string, module: string): Promise<{ pattern: Pattern } | null> {
-  const r = await request<{ results: Insn[] }>("disassemble", { address: addr, size: 0x200 }, true).catch(() => null);
-  return r?.results?.length ? makeSignature(r.results, async (p) => (await scan(p, module)).length) : null;
+  const r = await request<{ results: Insn[]; arch?: string }>("disassemble", { address: addr, size: 0x200 }, true).catch(() => null);
+  return r?.results?.length ? makeSignature(r.results, async (p) => (await scan(p, module)).length, 5, r.arch) : null;
 }
 
 function HealthTab() {

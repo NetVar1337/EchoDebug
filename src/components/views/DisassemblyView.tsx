@@ -22,12 +22,16 @@ import { entryId, pdbFunctions, pdbSymbolAt, useSymbols } from "@/store/symbols"
 import { protoText, sourceLines } from "@/lib/pdb";
 import { CommitInput, IconButton, NeedsAgent, Progress } from "../ui";
 import VList from "../VList";
+import { ArchBadge, useModuleArch } from "../ArchBadge";
+import { addressMenu } from "../AddressMenu";
 
 type Fn = { address: string; size: number; source?: "echo" | "pdata" | "both" | "pdb" };
 export type Line = { address: string; length: number; bytes: string; text: string };
 
 const fnCache = new Map<string, Fn[]>();
-const kBranch = /^(j[a-z]+|call|loop[a-z]*)$/;
+const kBranch = /^(j[a-z]+|call|loop[a-z]*|b|bl|br|blr|bc?\.[a-z]{2}|cbn?z|tbn?z)$/;
+/** AArch64 nop, little-endian */
+const kA64Nop = [0x1f, 0x20, 0x03, 0xd5];
 
 /** IAT symbol for a RIP-relative operand, e.g. `KERNEL32.CreateFileW`. */
 function iatSymbol(line: Line, iat: IatMap | null): string | null {
@@ -42,7 +46,7 @@ function iatSymbol(line: Line, iat: IatMap | null): string | null {
 /** Exported symbol for a direct branch, e.g. `CreateFileW`. */
 function exportSymbol(line: Line, expMap: ExportMap | null): string | null {
   if (!expMap) return null;
-  const m = /\b(call|jmp)\s+(0x[0-9a-f]+)\b/i.exec(line.text);
+  const m = /\b(call|jmp|bl|b)\s+(0x[0-9a-f]+)\b/i.exec(line.text);
   if (!m) return null;
   const entry = expMap.byAddress.get("0x" + BigInt(m[2]).toString(16));
   return entry ? entry.name : null;
@@ -205,6 +209,10 @@ export default function DisassemblyView() {
   };
 
   const selLine = lines.find((l) => l.address === ui.selected) ?? null;
+  // the module under the cursor decides the decoder (the relay is told by archlive's hook)
+  const atMod = useMemo(() => (at ? moduleOf(toBig(at), modules) : undefined), [at, modules]);
+  const arch = useModuleArch(atMod ?? mod);
+  const isA64 = arch === "arm64";
 
   // --- patching -------------------------------------------------------------------------
   const patchWith = async (l: Line, bytes: Uint8Array, note: string) => {
@@ -233,6 +241,7 @@ export default function DisassemblyView() {
   };
   const doAssemble = async () => {
     if (!selLine) return log("warn", "patch", "select an instruction first");
+    if (isA64) return log("warn", "patch", "the assembler is x86-64 only; arm64 code can be NOPed or patched as bytes in the memory view");
     const src = window.prompt(`Assemble at ${labelAddr(selLine.address, modules)} (';' separates instructions; branch targets are absolute)`, selLine.text);
     if (!src) return;
     try {
@@ -241,7 +250,7 @@ export default function DisassemblyView() {
       log("error", "patch", String(e instanceof Error ? e.message : e));
     }
   };
-  const doNop = () => selLine && void patchWith(selLine, nops(selLine.length), "nop");
+  const doNop = () => selLine && void patchWith(selLine, isA64 ? new Uint8Array(Array.from({ length: selLine.length }, (_, i) => kA64Nop[i % 4])) : nops(selLine.length), "nop");
   const doInvert = () => {
     if (!selLine) return;
     const b = invertJcc(hexToBytes(selLine.bytes));
@@ -376,7 +385,7 @@ export default function DisassemblyView() {
     return s?.kind === "function" ? protoText(s) : "";
   }, [curFn?.address, symVersion]);
   const fnIndex = useMemo(() => (at ? shown.findIndex((f) => toBig(f.address) === toBig(at)) : -1), [shown, at]);
-  const isJcc = selLine ? /^j(?!mp)[a-z]+\s/i.test(selLine.text) : false;
+  const isJcc = selLine && !isA64 ? /^j(?!mp)[a-z]+\s/i.test(selLine.text) : false;
 
   return (
     <NeedsAgent>
@@ -395,7 +404,7 @@ export default function DisassemblyView() {
             const pdb = pdbSymbolAt(toBig(f.address))?.sym;
             const user = names.nameOf(f.address) || pdb?.name;
             return (
-              <div className="fn-row" data-selected={i === fnIndex} onClick={() => go(f.address)} title={pdb ? protoText(pdb) : f.source === "pdata" ? "from the exception directory (.pdata)" : undefined}>
+              <div className="fn-row" data-selected={i === fnIndex} onClick={() => go(f.address)} onContextMenu={addressMenu(f.address)} title={pdb ? protoText(pdb) : f.source === "pdata" ? "from the exception directory (.pdata)" : undefined}>
                 <span className={user ? "accent ellipsis" : undefined}>{user || `sub_${showAddr(f.address).replace(/^0+/, "")}`}</span>
                 <span className="faint">{f.source === "pdata" ? "·" : ""}{f.size}</span>
               </div>
@@ -406,7 +415,7 @@ export default function DisassemblyView() {
           <div className="toolbar">
             <IconButton tip="Back (Alt+←)" onClick={back} disabled={history.length === 0}><ArrowLeft size={14} /></IconButton>
             <CommitInput value={at ?? ""} placeholder="address · module+0x…  (Ctrl+G)" onCommit={go} width={220} />
-            <span className="mono faint ellipsis grow" title={curProto || undefined}>{at ? labelAddr(at, modules) : ""} · {lines.length} insns{curProto ? ` · ${curProto}` : ""}</span>
+            <span className="mono faint ellipsis grow" title={curProto || undefined}>{at ? labelAddr(at, modules) : ""} · {lines.length} insns{curProto ? ` · ${curProto}` : ""}<ArchBadge arch={arch} /></span>
             <label className="row" style={{ fontSize: 12 }}><input type="checkbox" checked={linear} onChange={(e) => setLinear(e.target.checked)} />linear</label>
             <label className="row" style={{ fontSize: 12 }} title="show how many references point at each instruction"><input type="checkbox" checked={showRefs} onChange={(e) => setShowRefs(e.target.checked)} />refs</label>
             <IconButton tip="Xrefs to selection (X)" onClick={() => void findRefs()}><Crosshair size={14} /></IconButton>
@@ -416,7 +425,7 @@ export default function DisassemblyView() {
               <IconButton tip="Patch selection (A assembles)" onClick={() => setPatchMenu(!patchMenu)} disabled={!selLine}><Hammer size={14} /></IconButton>
               {patchMenu && selLine && (
                 <div className="menu-pop" onMouseLeave={() => setPatchMenu(false)}>
-                  <button className="menu-item" onClick={() => { setPatchMenu(false); void doAssemble(); }}>Assemble…</button>
+                  <button className="menu-item" disabled={isA64} onClick={() => { setPatchMenu(false); void doAssemble(); }}>Assemble…{isA64 ? " (x86-64 only)" : ""}</button>
                   <button className="menu-item" onClick={() => { setPatchMenu(false); doNop(); }}>NOP instruction ({selLine.length} B)</button>
                   <button className="menu-item" disabled={!isJcc} onClick={() => { setPatchMenu(false); doInvert(); }}>Invert condition</button>
                   <button className="menu-item" disabled={!isJcc} onClick={() => { setPatchMenu(false); doForce(); }}>Make unconditional</button>
@@ -448,7 +457,7 @@ export default function DisassemblyView() {
               const nm = names.nameOf(l.address);
               const sl = src.get(l.address);
               return (
-                <div className="insn-row" data-selected={ui.selected === l.address} data-match={listingMatches.has(l.address)} onClick={() => ui.select(l.address)}>
+                <div className="insn-row" data-selected={ui.selected === l.address} data-match={listingMatches.has(l.address)} onClick={() => ui.select(l.address)} onContextMenu={addressMenu(l.address)}>
                   <span className="insn-va">{showAddr(l.address)}</span>
                   <span className="insn-bytes">{l.bytes.replace(/(..)/g, "$1 ").trim()}</span>
                   <InsnText text={l.text} notes={notesFor(l)} onGo={go} />

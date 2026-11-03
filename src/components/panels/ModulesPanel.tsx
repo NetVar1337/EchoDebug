@@ -5,6 +5,7 @@ import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { IconButton, NeedsAgent, Panel } from "../ui";
+import { ModuleArchBadge } from "../ArchBadge";
 
 export default function ModulesPanel() {
   const { modules, refreshModules } = useConn();
@@ -41,7 +42,7 @@ export default function ModulesPanel() {
             <tbody>
               {shown.map((m) => (
                 <tr key={m.base} data-selected={sel === m.name || ui.module === m.name} onClick={() => { setSel(m.name); ui.select(m.base); }} onDoubleClick={() => ui.goModule(m.name, "pe")}>
-                  <td title={m.name}>{m.name}{ui.module === m.name && <span className="pill accent" style={{ marginLeft: 6 }}>focused</span>}</td>
+                  <td title={m.name}>{m.name}<ModuleArchBadge module={m} />{ui.module === m.name && <span className="pill accent" style={{ marginLeft: 6 }}>focused</span>}</td>
                   <td className="mono dim">{m.base.replace(/^0x/, "").toUpperCase()}</td>
                   <td className="mono faint">{(m.size / 1024).toFixed(0)}K</td>
                 </tr>

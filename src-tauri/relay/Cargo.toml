@@ -11,6 +11,9 @@ serde_json = "1"
 futures-util = "0.3"
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 iced-x86 = "1"
+# AArch64 decoder (pure Rust) for arm64 modules on Linux and Windows-on-ARM
+yaxpeax-arm = { version = "0.5", default-features = false, features = ["std", "alloc", "fmt"] }
+yaxpeax-arch = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 object = { version = "0.40", features = ["read", "elf", "std"] }
 getrandom = "0.4"
 pdb = "0.8"
@@ -25,9 +28,9 @@ tower = { version = "0.5", features = ["util"] }
 name = "echodebug-relay"
 path = "src/main.rs"
 
-# Linux local backend: Unicorn for `emulate`, ptrace for the debugger.
+# Linux local backend: Unicorn (x86-64 + AArch64) for `emulate`, ptrace for the debugger.
 [target.'cfg(target_os = "linux")'.dependencies]
-unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
+unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86", "arch_aarch64"] }
 nix = { version = "0.31", features = ["ptrace", "process", "signal"] }
 
 # Windows: DPAPI keeps the assistant's API key encrypted for the user account.

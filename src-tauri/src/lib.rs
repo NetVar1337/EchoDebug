@@ -10,6 +10,8 @@ use serde_json::Value;
 use tauri::ipc::Channel;
 use tauri::Manager;
 
+mod plugins;
+
 const AGENT_SOURCE: &str = include_str!("../../agent/echo_debug.as");
 const AGENT_PORT_LINE: &str = "const int RELAY_PORT = 47110;";
 
@@ -253,6 +255,9 @@ pub fn run() {
             write_binary_file,
             read_text_file,
             read_binary_file,
+            plugins::plugins_dir,
+            plugins::list_plugins,
+            plugins::read_plugin_file,
             assistant_key_status,
             assistant_set_key,
             assistant_clear_key,

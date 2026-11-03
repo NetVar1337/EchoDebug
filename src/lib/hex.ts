@@ -1,6 +1,12 @@
 // hex / address helpers shared by every view
 
-export type Module = { name: string; base: string; size: number };
+export type Module = {
+  name: string;
+  base: string;
+  size: number;
+  /** "x86_64" | "x86" | "arm64" when the backend reports it (the Linux local backend does) */
+  arch?: string;
+};
 
 export function bytesToHex(b: Uint8Array): string {
   let s = "";

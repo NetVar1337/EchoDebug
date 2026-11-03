@@ -1,4 +1,4 @@
-# PE test fixtures
+# PE / ELF test fixtures
 
 Built from `fix.c` with LLVM (no MSVC, no CRT), so they can be rebuilt anywhere:
 
@@ -32,3 +32,24 @@ clang --target=x86_64-pc-windows-msvc -O1 -c fix-seh.c -o fix-seh.obj -fno-stack
 lld-link /nologo /entry:mainCRTStartup /subsystem:console /nodefaultlib /dynamicbase \
   /out:fix-seh.exe fix-seh.obj k32.lib ntdll.lib
 ```
+
+## AArch64 fixtures
+
+`fix-a64.elf` and `fix-a64.exe` are built from `fix-a64.c` (and, for the PE, `fix-a64-seh.s`, a
+function that names an exception handler so its unwind data cannot be packed):
+
+```sh
+clang --target=aarch64-linux-gnu -O1 -ffreestanding -fno-stack-protector -nostdlib -fuse-ld=lld \
+  -Wl,-e,entry -Wl,--build-id=none -static -o fix-a64.elf fix-a64.c
+clang --target=aarch64-pc-windows-msvc -O1 -ffreestanding -fno-stack-protector -funwind-tables -c fix-a64.c -o fix-a64.obj
+clang --target=aarch64-pc-windows-msvc -c fix-a64-seh.s -o fix-a64-seh.obj
+lld-link /nologo /machine:arm64 /entry:with_handler /subsystem:console /nodefaultlib /dynamicbase \
+  /out:fix-a64.exe fix-a64.obj fix-a64-seh.obj
+```
+
+Ground truth from `llvm-objdump -d` / `llvm-readobj --unwind`: the ELF has `add_scaled` at
+`0x210168` (12 bytes), `walk` at `0x210174` (0x24), `entry` at `0x210198` (0x40), `adr x0, g_msg`
+(`0x200158`) and `adrp x20` + `ldr`/`str [x20, #0x1d8]` for `g_counter` (`0x2201d8`). The PE has
+`.pdata` entries for `entry` (RVA `0x1030`, packed, 60 bytes) and `with_handler` (`0x106c`, `.xdata`,
+20 bytes), `adrp x0` + `add x0, x0, #0` at `0x104c` for `g_msg` (`.rdata`, RVA `0x2000`) and
+`adrp x20` + `ldr w0, [x20]` at `0x1038` for `g_counter` (`.data`, RVA `0x3000`).
