@@ -30,6 +30,7 @@ pub mod emux;
 pub mod lift;
 pub mod mcp;
 pub mod monitor;
+pub mod pdbinfo;
 pub mod symbols;
 
 pub const DEFAULT_PORT: u16 = 47110;
@@ -295,9 +296,10 @@ impl Relay {
                     .unwrap_or_default();
                 return json!({ "type": "processes_result", "id": orig, "success": true, "processes": processes });
             }
-            // PDB symbols from a symbol server (or a local file), any backend.
-            "pdb_symbols" => {
-                let r = tokio::task::spawn_blocking(move || symbols::handle(&req)).await;
+            // PDB symbols, types and lines: local files, symbol stores and servers, any backend.
+            "pdb_symbols" | "pdb_fetch" | "pdb_progress" | "pdb_image" | "pdb_types" | "pdb_type" | "pdb_lines" => {
+                let v2 = verb.clone();
+                let r = tokio::task::spawn_blocking(move || symbols::handle_verb(&v2, &req)).await;
                 let mut v = r.unwrap_or_else(|e| error(Value::Null, 3003, &e.to_string()));
                 v["id"] = orig;
                 return v;
