@@ -143,6 +143,27 @@ export async function kernelModules(): Promise<{ modules: KernelModule[]; source
   return request("kernel_modules", {});
 }
 
+/** A driver image (.sys), as opposed to the other kernel modules (ntoskrnl.exe, hal.dll, .ko …). */
+export function isDriverFile(m: { name: string }): boolean {
+  return /\.sys$/i.test(m.name);
+}
+
+export type KernelProbe = { ok: boolean; driver?: string; address?: string; detail: string };
+
+/**
+ * Can the attached backend read kernel memory? Reads the first page of a loaded .sys driver and
+ * checks for its PE headers (a page of zeros or a failed read means no).
+ */
+export async function probeKernelReads(mods: readonly KernelModule[]): Promise<KernelProbe> {
+  const d = mods.find((m) => isDriverFile(m) && toBig(m.base) !== 0n);
+  if (!d) return { ok: false, detail: mods.length ? "no .sys driver has a known base: run EchoDebug elevated so Windows reports them" : "no kernel modules listed" };
+  const page = (await readMany([{ address: d.base, size: kPage }]).catch(() => [null]))[0];
+  if (!page) return { ok: false, driver: d.name, address: d.base, detail: `the backend could not read ${d.name} at ${d.base}: it cannot read kernel memory here, so driver dumps will not work` };
+  const bad = headerProblem(page);
+  if (bad) return { ok: false, driver: d.name, address: d.base, detail: `${d.name} at ${d.base} read back, but without valid PE headers (${bad}): the backend does not see kernel memory there` };
+  return { ok: true, driver: d.name, address: d.base, detail: `read ${d.name}'s PE headers at ${d.base}: this backend reads kernel memory, driver dumps should work` };
+}
+
 // ---- the whole target ---------------------------------------------------------------------------
 
 /** Where a streamed dump goes: a file through the app, or a download in the browser. */

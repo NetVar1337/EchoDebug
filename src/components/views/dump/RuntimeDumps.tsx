@@ -10,7 +10,8 @@ import { log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { Progress } from "../../ui";
 import {
-  defaultFormat, dumpImage, dumpName, dumpTarget, findHiddenImages, kernelModules, pickSink,
+  defaultFormat, dumpImage, dumpName, dumpTarget, findHiddenImages, isDriverFile, kernelModules, pickSink, probeKernelReads,
+  type KernelProbe,
   type Cancel, type KernelModule, type ModuleDump, type ModuleDumpOptions, type TargetDumpReport,
 } from "@/lib/dumplive";
 import type { FoundImage } from "@/lib/analysis/dumper";
@@ -207,6 +208,9 @@ export function HiddenImagesPanel() {
 export function DriversPanel() {
   const [list, setList] = useState<{ modules: KernelModule[]; source: string; note?: string } | null>(null);
   const [filter, setFilter] = useState("");
+  const [sysOnly, setSysOnly] = useState(true);
+  const [probe, setProbe] = useState<KernelProbe | null>(null);
+  const [probing, setProbing] = useState(false);
   const [o, setO] = useState<Omit<ModuleDumpOptions, "onProgress" | "cancel">>({ layout: "file", headers: "memory" });
   const { busy, prog, last, run } = useImageDump();
   const load = async () => {
@@ -217,7 +221,17 @@ export function DriversPanel() {
     }
   };
   useEffect(() => { void load(); }, []);
-  const shown = useMemo(() => (list?.modules ?? []).filter((m) => !filter || `${m.name} ${m.path}`.toLowerCase().includes(filter.toLowerCase())), [list, filter]);
+  const shown = useMemo(() => (list?.modules ?? []).filter((m) => (!sysOnly || isDriverFile(m)) && (!filter || `${m.name} ${m.path}`.toLowerCase().includes(filter.toLowerCase()))), [list, filter, sysOnly]);
+  const test = async () => {
+    setProbing(true);
+    try {
+      const p = await probeKernelReads(list?.modules ?? []);
+      setProbe(p);
+      log(p.ok ? "info" : "warn", "dump", p.detail);
+    } finally {
+      setProbing(false);
+    }
+  };
   return (
     <div className="dump-panel">
       <p className="dump-blurb">
@@ -230,8 +244,13 @@ export function DriversPanel() {
       <div className="dump-form">
         <button className="dump-btn" onClick={() => void load()}><RefreshCw size={13} /> Reload</button>
         <input className="dump-input dump-input-wide" placeholder="filter drivers…" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        {list && <span className="faint">{list.modules.length} from {list.source}</span>}
+        <label className="row" title="only driver images (.sys); off: every kernel module, ntoskrnl.exe and hal.dll included"><input type="checkbox" checked={sysOnly} onChange={(e) => setSysOnly(e.target.checked)} />.sys only</label>
+        {list && <span className="faint">{shown.length} of {list.modules.length} from {list.source}</span>}
+        <button className="dump-btn" disabled={!list?.modules.length || probing} onClick={() => void test()} title="read the first page of a loaded .sys driver through the attached backend">
+          {probing ? <RefreshCw size={13} className="spin" /> : <Search size={13} />} Test kernel reads
+        </button>
       </div>
+      {probe && <div className={probe.ok ? "dump-result ok" : "warn"} style={{ fontSize: 12 }}>{probe.detail}</div>}
       {list?.note && <div className="warn" style={{ fontSize: 12 }}>{list.note}</div>}
       <DumpOptionsForm o={o} set={setO} allowImports={false} />
       <table className="table mono" style={{ fontSize: 12 }}>

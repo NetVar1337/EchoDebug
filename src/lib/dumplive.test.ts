@@ -40,7 +40,7 @@ vi.mock("./modfile", () => ({ readModuleFileBytes: async () => ({ bytes: file, p
 vi.mock("./unpacklive", () => ({ exportIndex: async () => new Map() }));
 vi.mock("./tauri", () => ({ isTauri: () => false }));
 
-const { dumpImage, dumpName, dumpTarget, findHiddenImages, readSalvaged } = await import("./dumplive");
+const { dumpImage, dumpName, dumpTarget, findHiddenImages, isDriverFile, probeKernelReads, readSalvaged } = await import("./dumplive");
 const mod = { name: "fix-seh.exe", base: "0x140000000", size: image.length };
 
 describe("live dumps", () => {
@@ -118,5 +118,22 @@ describe("live dumps", () => {
     expect(r).toMatchObject({ regions: 2, skipped: 0 });
     const r2 = await dumpTarget([], {}, { format: "elf", include: "all", maxRegionMiB: 0.013, sink });
     expect(r2).toMatchObject({ regions: 1, skipped: 1 });
+  });
+
+  it("tests kernel reads on a .sys driver", async () => {
+    expect(isDriverFile({ name: "ACPI.sys" })).toBe(true);
+    expect(isDriverFile({ name: "ntoskrnl.exe" })).toBe(false);
+    // a "driver" whose image the fake backend can read (headers there) and one it cannot
+    const readable = await probeKernelReads([
+      { name: "ntoskrnl.exe", path: "", base: "0x7ff00000", size: 0x1000 },
+      { name: "fake.sys", path: "", base: "0x140000000", size: image.length },
+    ]);
+    expect(readable).toMatchObject({ ok: true, driver: "fake.sys" });
+    const unreadable = await probeKernelReads([{ name: "ACPI.sys", path: "", base: "0xfffff80000000000", size: 0x1000 }]);
+    expect(unreadable.ok).toBe(false);
+    expect(unreadable.detail).toMatch(/cannot read kernel memory/);
+    const garbage = await probeKernelReads([{ name: "x.sys", path: "", base: "0x7ff00000", size: 0x1000 }]);
+    expect(garbage.detail).toMatch(/without valid PE headers/);
+    expect((await probeKernelReads([{ name: "x.sys", path: "", base: "0x0", size: 1 }])).detail).toMatch(/elevated/);
   });
 });
