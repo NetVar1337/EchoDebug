@@ -19,6 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+pub mod assistant;
 pub mod auth;
 pub mod local;
 pub mod local_dbg;
@@ -54,6 +55,16 @@ static TOOLS: LazyLock<Vec<Value>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../../../src/lib/tools.json"))
         .expect("src/lib/tools.json is a JSON array")
 });
+
+/// Every tool in `src/lib/tools.json` (`name`, `verb`, `description`, `input_schema`).
+pub fn tool_list() -> &'static [Value] {
+    &TOOLS
+}
+
+/// The verb behind an MCP tool name.
+pub fn tool_verb(name: &str) -> Option<String> {
+    TOOLS.iter().find(|t| t["name"] == name).and_then(|t| t["verb"].as_str()).map(str::to_owned)
+}
 
 /// MCP prompts: canned RE workflows an MCP client can hand to its model.
 static PROMPTS: LazyLock<Vec<Value>> = LazyLock::new(|| {
