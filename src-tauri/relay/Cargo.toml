@@ -14,6 +14,7 @@ iced-x86 = "1"
 object = { version = "0.40", features = ["read", "elf", "std"] }
 getrandom = "0.4"
 pdb = "0.8"
+cab = "0.6"
 ureq = "3"
 
 [dev-dependencies]
@@ -29,6 +30,7 @@ path = "src/main.rs"
 unicorn-engine = { version = "2.1", default-features = false, features = ["arch_x86"] }
 nix = { version = "0.31", features = ["ptrace", "process", "signal"] }
 
-# Windows: the native debugger (Win32 debug API) in windbg.rs.
+# Windows: the native debugger (Win32 debug API) in windbg.rs, and DPAPI, which keeps the
+# assistant's API key encrypted for the user account.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Kernel"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Kernel"] }

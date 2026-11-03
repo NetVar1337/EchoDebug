@@ -1016,6 +1016,18 @@ mod imp {
                     }
                     r
                 }
+                // every thread's registers at once (like the ptrace debugger's)
+                "dbg_all_regs" => {
+                    let was_running = self.running();
+                    if !self.need_stopped() {
+                        return failed("cannot stop the process");
+                    }
+                    let threads: Vec<Value> = self.threads.keys().map(|t| json!({ "tid": t, "regs": self.regs_json(*t) })).collect();
+                    if was_running {
+                        self.resume();
+                    }
+                    json!({ "type": "dbg_all_regs_result", "success": true, "threads": threads, "was_running": was_running })
+                }
                 "dbg_set_regs" => {
                     if !self.need_stopped() {
                         return failed("cannot stop the process");

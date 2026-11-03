@@ -12,9 +12,10 @@
 //! Verbs (`dbg_*`, ext routing): `dbg_attach`, `dbg_detach`, `dbg_status`, `dbg_break`
 //! {address, enabled}, `dbg_hwbreak` {slot 0-3, address, kind exec|write|rw, len 1|2|4|8,
 //! enabled}, `dbg_continue`, `dbg_step` {tid?}, `dbg_pause`, `dbg_regs` {tid?}, `dbg_set_regs`
-//! {tid?, regs}, `dbg_disasm`, `dbg_trace_start|stop|results`, `dbg_api_start|stop|log|clear|
-//! signatures`. Stops broadcast `{type:"event", event:"dbg_stop", reason, tid, address, regs}`;
-//! process exit broadcasts `dbg_exit`; a newly found accessor broadcasts `dbg_access`.
+//! {tid?, regs}, `dbg_all_regs` (every thread), `dbg_disasm`, `dbg_trace_start|stop|results`,
+//! `dbg_api_start|stop|log|clear|signatures`. Stops broadcast `{type:"event", event:"dbg_stop",
+//! reason, tid, address, regs}`; process exit broadcasts `dbg_exit`; a newly found accessor
+//! broadcasts `dbg_access`.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -79,12 +80,24 @@ pub fn handle(_relay: &Relay, _req: &Map<String, Value>) -> Value {
 #[cfg(not(target_os = "linux"))]
 pub fn detach_all() {}
 
+/// Is a ptrace debug session attached to `pid`? (Its threads cannot be seized a second time.)
+#[cfg(not(target_os = "linux"))]
+pub fn active_on(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 pub use imp::handle;
 
 #[cfg(target_os = "linux")]
 pub fn detach_all() {
     crate::dbg_core::detach_all();
+}
+
+/// Is a ptrace debug session attached to `pid`? (Its threads cannot be seized a second time.)
+#[cfg(target_os = "linux")]
+pub fn active_on(pid: u32) -> bool {
+    crate::dbg_core::session_pid() == Some(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -852,6 +865,16 @@ mod imp {
                     }
                     let total = with_mon(ABI, |m| m.api.log_json(u64::MAX, 1, "")["total"].clone());
                     self.finish(json!({ "type": "dbg_api_stop_result", "success": true, "calls": total }), was_running)
+                }
+                // every thread's registers at once (the Threads view while a session is active)
+                "dbg_all_regs" => {
+                    let was_running = self.running;
+                    self.need_stopped();
+                    let threads: Vec<Value> = self.threads.keys().map(|t| json!({ "tid": t, "regs": regs_json(*t) })).collect();
+                    if was_running {
+                        let _ = self.resume_all();
+                    }
+                    json!({ "type": "dbg_all_regs_result", "success": true, "threads": threads, "was_running": was_running })
                 }
                 "dbg_detach" => {
                     self.detach();

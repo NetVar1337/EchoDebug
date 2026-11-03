@@ -5,7 +5,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Bug, Pause, Play, RefreshCw, StepForward, Unplug } from "lucide-react";
 import { request, type Frame } from "@/lib/client";
-import { fmtAddr, labelAddr, parseAddress, showAddr } from "@/lib/hex";
+import { fmtAddr, parseAddress, showAddr } from "@/lib/hex";
+import { symAddr } from "@/lib/pdb";
 import { onAgentEvent, useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
@@ -31,13 +32,13 @@ type Proc = { pid: number; name: string; path: string };
 const kRegOrder = ["rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "eflags", "fs_base", "gs_base"];
 
 /** One line for the events list / Output. */
-export function describeStop(f: Frame, modules: Parameters<typeof labelAddr>[1]): string {
+export function describeStop(f: Frame, modules: Parameters<typeof symAddr>[1]): string {
   if (f.event === "dbg_exception") return `${f.description ?? "exception"} ${f.code ?? ""} (first chance, passed on) in thread ${f.tid}`;
   if (f.event === "dbg_output") return `debug output (thread ${f.tid}): ${f.text}`;
   const what = f.reason === "exception"
     ? `${f.first_chance === false ? "second-chance " : ""}exception ${f.code ?? ""} ${f.description ?? ""}`.replace(/\s+/g, " ").trim()
     : `${f.reason}${f.signal ? ` ${f.signal}` : ""}${f.watch ? ` (DR${f.slot} ${f.watch})` : ""}`;
-  return `${what} in thread ${f.tid} at ${labelAddr(String(f.address), modules)}`;
+  return `${what} in thread ${f.tid} at ${symAddr(String(f.address), modules)}`;
 }
 
 function AttachPanel({ onAttached }: { onAttached: () => void }) {
@@ -192,7 +193,7 @@ export default function DebuggerView() {
                   <tr key={t.tid} data-selected={t.tid === status.focus} onClick={() => stopped && void focusThread(t.tid)} title={stopped ? "click: show this thread" : undefined}>
                     <td style={{ width: 70 }}>{t.tid}</td>
                     <td className="faint">{t.state}</td>
-                    <td className="ellipsis">{t.rip ? labelAddr(t.rip, modules) : ""}</td>
+                    <td className="ellipsis">{t.rip ? symAddr(t.rip, modules) : ""}</td>
                   </tr>
                 ))}
               </tbody></table>
@@ -215,7 +216,7 @@ export default function DebuggerView() {
             <CommitInput value="" placeholder="add: address · module+0x…" onCommit={(v) => v && void addBp(v)} />
             {(status.breakpoints ?? []).map((b) => (
               <div key={b} className="row">
-                <span className="mono link grow" onClick={() => ui.goDisasm(b)}>{labelAddr(b, modules)}</span>
+                <span className="mono link grow" onClick={() => ui.goDisasm(b)}>{symAddr(b, modules)}</span>
                 <button className="row-action" onClick={() => void call("dbg_break", { address: b, enabled: false })}>remove</button>
               </div>
             ))}
@@ -231,7 +232,7 @@ export default function DebuggerView() {
             {(status.hardware ?? []).filter((h) => h.address).map((h) => (
               <div key={h.slot} className="row">
                 <span className="faint">DR{h.slot}</span>
-                <span className="mono grow">{labelAddr(h.address!, modules)} {h.kind} {h.kind !== "exec" ? `${h.len}B` : ""}</span>
+                <span className="mono grow">{symAddr(h.address!, modules)} {h.kind} {h.kind !== "exec" ? `${h.len}B` : ""}</span>
                 {h.trace
                   ? <span className="link" onClick={() => ui.setTab("accesses")}>access finder</span>
                   : <button className="row-action" onClick={() => void call("dbg_hwbreak", { slot: h.slot, enabled: false })}>clear</button>}
@@ -245,7 +246,7 @@ export default function DebuggerView() {
           ) : null}
         </div>
         <div className="list-col" style={{ borderRight: "none" }}>
-          <div className="toolbar"><span className="panel-title">At {regs.rip ? labelAddr(regs.rip, modules) : "—"}</span></div>
+          <div className="toolbar"><span className="panel-title">At {regs.rip ? symAddr(regs.rip, modules) : "—"}</span></div>
           <div className="vlist listing" style={{ flex: "1 1 60%" }}>
             {lines.map((l, i) => {
               const bp = status.breakpoints?.includes(l.address);

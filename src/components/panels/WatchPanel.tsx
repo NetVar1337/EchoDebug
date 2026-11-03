@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Lock, LockOpen, Plus, X } from "lucide-react";
+import { LineChart, Lock, LockOpen, Plus, X } from "lucide-react";
 import { request } from "@/lib/client";
 import { readMany } from "@/lib/batch";
 import { bytesToHex, fmtAddr, labelAddr, parseAddress, toBig } from "@/lib/hex";
@@ -10,6 +10,8 @@ import { usePatches } from "@/store/patches";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry } from "@/store/watch";
+import { useGraphs } from "@/store/graphs";
+import { graphTypeOf } from "@/lib/graphs";
 import { CommitInput, IconButton, Panel, useContextMenu } from "../ui";
 import { accessMenuItems } from "../accessMenu";
 
@@ -34,11 +36,20 @@ export default function WatchPanel() {
   const rowMenu = (ev: React.MouseEvent, e: WatchEntry) => openMenu(ev, [
     ...accessMenuItems(e.address, kSizes[e.type]),
     "sep",
+    { label: "Graph this", onClick: () => graph(e) },
     { label: "Browse memory", onClick: () => ui.goMemory(e.address) },
     { label: "Disassemble here", onClick: () => ui.goDisasm(e.address) },
     { label: e.frozen ? "Unfreeze" : "Freeze", onClick: () => void toggleFreeze(e) },
     { label: "Remove", onClick: () => w.removeWatch(e.id) },
   ]);
+
+  /** Plots the watch in the Value Graphs view. */
+  const graph = (e: WatchEntry) => {
+    const t = graphTypeOf(e.type);
+    if (!t) return log("warn", "graph", `${e.type} values cannot be graphed; pick a number type`);
+    useGraphs.getState().add(e.address, t, e.label);
+    ui.setTab("values");
+  };
 
   const refreshAlerts = useCallback(async () => {
     if (!ext) return setAlerts([]);
@@ -132,11 +143,11 @@ export default function WatchPanel() {
       </div>
       <div className="panel-body">
         <table className="table">
-          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 48 }} /></colgroup>
+          <colgroup><col /><col style={{ width: 62 }} /><col style={{ width: 96 }} /><col style={{ width: 80 }} /></colgroup>
           <thead><tr><th>Address</th><th>Type</th><th>Value</th><th /></tr></thead>
           <tbody>
             {w.watches.map((e) => (
-              <tr key={e.id} onContextMenu={(ev) => rowMenu(ev, e)} title="right-click: find what writes / accesses it">
+              <tr key={e.id} onContextMenu={(ev) => rowMenu(ev, e)} title="right-click: graph it, find what writes / accesses it">
                 <td title={labelAddr(e.address, modules)}>
                   <CommitInput className="input mono" value={e.label || labelAddr(e.address, modules)} onCommit={(v) => {
                     const a = parseAddress(v, modules);
@@ -151,6 +162,7 @@ export default function WatchPanel() {
                 </td>
                 <td><CommitInput value={values[e.id] ? decode(values[e.id]!, 0, e.type) : "??"} onCommit={(v) => void write(e, v)} /></td>
                 <td>
+                  <IconButton tip="Graph this" onClick={() => graph(e)}><LineChart size={12} /></IconButton>
                   <IconButton tip={e.frozen ? "Unfreeze" : "Freeze"} onClick={() => void toggleFreeze(e)}>{e.frozen ? <Lock size={12} className="accent" /> : <LockOpen size={12} />}</IconButton>
                   <IconButton tip="Remove" onClick={() => w.removeWatch(e.id)}><X size={12} /></IconButton>
                 </td>

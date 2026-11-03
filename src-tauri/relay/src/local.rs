@@ -316,6 +316,20 @@ async fn handle_ext_inner(relay: &Relay, req: Map<String, Value>, orig: &Value, 
             }
             return Some(r);
         }
+        // threads, call stacks and open fds (local_threads.rs); ptrace runs on a blocking thread
+        "threads" | "stack" | "handles" => {
+            let Some(pid) = attached_pid() else {
+                return Some(err(orig, 3001, "not attached", "attach to a process first"));
+            };
+            let (relay2, req2) = (relay.clone(), req.clone());
+            let mut r = tokio::task::spawn_blocking(move || crate::local_threads::handle(&relay2, &req2, pid))
+                .await
+                .unwrap_or_else(|e| err(orig, 3003, "operation failed", &e.to_string()));
+            if let Value::Object(m) = &mut r {
+                m.insert("id".into(), orig.clone());
+            }
+            return Some(r);
+        }
         v if v.starts_with("dbg_") => {
             let (relay2, req2) = (relay.clone(), req.clone());
             let mut r = tokio::task::spawn_blocking(move || crate::local_dbg::handle(&relay2, &req2))
