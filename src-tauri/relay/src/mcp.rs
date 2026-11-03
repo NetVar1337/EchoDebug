@@ -223,6 +223,11 @@ mod tests {
         assert_eq!((set["readOnlyHint"].as_bool(), set["destructiveHint"].as_bool(), set["idempotentHint"].as_bool()), (Some(false), Some(false), Some(true)));
         assert_eq!(annotations("ui_set_comment", "c")["readOnlyHint"], false);
         assert_eq!(annotations("ui_revert_patch", "r")["destructiveHint"], true);
+        // the heap explorer only reads memory
+        for v in ["ui_heaps", "ui_heap_chunks", "ui_heap_find"] {
+            assert_eq!(annotations(v, "h")["readOnlyHint"], true);
+            assert!(!is_gated(v));
+        }
         // time-travel traces: recording changes state, the queries only read
         assert_eq!(annotations("trace_record", "t")["readOnlyHint"], false);
         assert_eq!(annotations("trace_query", "t")["readOnlyHint"], true);

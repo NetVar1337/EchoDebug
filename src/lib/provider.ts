@@ -63,6 +63,7 @@ import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
+import { heapHandlers } from "./heaptools";
 import { sehForMcp, tlsReport } from "./threadslive";
 
 export type Args = Record<string, unknown>;
@@ -415,6 +416,7 @@ provide("ui_approve", (args) => new Promise((resolve) => {
 
 // Names, comments, the patch journal and saved signatures (MCP tools list_names, set_name, …).
 for (const [verb, h] of Object.entries(annotationHandlers)) provide(verb, h);
+for (const [verb, h] of Object.entries(heapHandlers)) provide(verb, h);
 
 // Resource templates and completion (echodebug://names, memory/{address}/{size}, disasm/{address}, module/{name}/exports).
 provide("ui_names", async () => ({

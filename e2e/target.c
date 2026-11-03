@@ -1,5 +1,7 @@
 // The process the end-to-end test attaches to: a counter, a switch, an XOR string routine, a tiny VM.
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 volatile int counter = 100;
 volatile int mode = 0;
@@ -43,6 +45,13 @@ __attribute__((noinline)) long vm_run(const unsigned char *pc) {
 }
 static const unsigned char s0[] = {59, 42, 51, 116, 63, 34, 59, 55, 42, 54, 63, 116, 57, 53, 55}; /* api.example.com */
 static const unsigned char s1[] = {62, 63, 57, 40, 35, 42, 46, 63, 62, 122, 53, 49}; /* decrypted ok */
+/* one malloc for the heap explorer step (a process that never mallocs has no arena); in a
+   constructor so main stays free of libc calls the batch-decrypt emulation would run into */
+char *heap_note;
+__attribute__((constructor)) static void make_heap_note(void) {
+  heap_note = malloc(0x123);
+  strcpy(heap_note, "heap note for the e2e test");
+}
 int main(void) {
   const char *greet = "hello from the EchoDebug UI test";
   for (;;) {
