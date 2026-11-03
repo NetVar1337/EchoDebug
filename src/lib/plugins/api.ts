@@ -18,6 +18,7 @@ import { register, type AddressActionSpec, type AnalysisSpec, type CommandSpec, 
 // Raw target writes (refused for every plugin), stateful verbs (need `write`) and annotation
 // verbs (need `annotate`): the lists mirror the MCP annotations in src-tauri/relay/src/mcp.rs.
 import { kAnnotate, kRawWrites, kStateful } from "@/lib/verbclass";
+import { globMatch } from "@/lib/audit";
 export { kAnnotate, kRawWrites, kStateful };
 const kCatalog = new Set((tools as { verb: string }[]).map((t) => t.verb));
 
@@ -28,10 +29,11 @@ export class PermissionError extends Error {
   }
 }
 
-/** Throws unless a plugin with `perms` may call `verb`. */
-export function checkVerb(pluginId: string, perms: readonly Permission[], verb: string): void {
+/** Throws unless a plugin with `perms` (and optional `verbs` scope globs) may call `verb`. */
+export function checkVerb(pluginId: string, perms: readonly Permission[], verb: string, verbs?: readonly string[]): void {
   if (kRawWrites.has(verb)) throw new PermissionError(`plugin ${pluginId}: '${verb}' is not available to plugins; use ed.write (journaled, needs the "write" permission)`);
   if (!kCatalog.has(verb)) throw new PermissionError(`plugin ${pluginId}: '${verb}' is not a verb plugins can call (see the MCP tool catalog)`);
+  if (verbs && !verbs.some((p) => globMatch(p, verb))) throw new PermissionError(`plugin ${pluginId}: '${verb}' is outside the manifest's "verbs" scope (${verbs.join(", ")})`);
   if (kStateful.has(verb) && !perms.includes("write")) throw new PermissionError(`plugin ${pluginId}: '${verb}' changes state and needs the "write" permission in manifest.json`);
   if (kAnnotate.has(verb) && !perms.includes("annotate")) throw new PermissionError(`plugin ${pluginId}: '${verb}' changes names or comments and needs the "annotate" permission`);
 }
@@ -49,12 +51,12 @@ export function makePluginContext(manifest: Manifest, print: (...a: unknown[]) =
   const ed = Object.freeze({
     ...base,
     request: (verb: string, args: Record<string, unknown> = {}) => {
-      checkVerb(id, perms, verb);
+      checkVerb(id, perms, verb, manifest.verbs);
       return base.request(verb, args);
     },
     ui: (verb: string, args: Record<string, unknown> = {}) => {
       if (!verb.startsWith("ui_")) throw new PermissionError(`plugin ${id}: ed.ui takes ui_* analyses`);
-      checkVerb(id, perms, verb);
+      checkVerb(id, perms, verb, manifest.verbs);
       return base.ui(verb, args);
     },
     write: async (a: string | number | bigint, data: Uint8Array | string, note?: string) => {

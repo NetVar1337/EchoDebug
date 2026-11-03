@@ -7,11 +7,17 @@ import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry, type Bookmark } from "@/store/watch";
 import { useNames, type NameEntry } from "@/store/names";
 import { useTypes, type TypeDef } from "@/store/types";
+import { useSigs, type Signature } from "@/store/sigs";
+import { usePatches, type Patch } from "@/store/patches";
+import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
+import type { Rule } from "./automation";
+import type { PersistedTargetState } from "./resume";
 
 export type SessionFile = {
   format: "echodebug.session";
-  version: 1;
+  /** v2 adds target state (resume), signatures, patches and automation rules */
+  version: 1 | 2;
   savedAt: string;
   ui: {
     theme: string;
@@ -23,14 +29,20 @@ export type SessionFile = {
   bookmarks: Bookmark[];
   names: NameEntry[];
   types: TypeDef[];
+  /** v2: */
+  target?: PersistedTargetState;
+  signatures?: Signature[];
+  patches?: Patch[];
+  rules?: Rule[];
 };
 
 export function buildSession(): SessionFile {
   const ui = useUi.getState();
   const w = useWatch.getState();
+  const target = useConn.getState().target;
   return {
     format: "echodebug.session",
-    version: 1,
+    version: 2,
     savedAt: new Date().toISOString(),
     ui: {
       theme: ui.theme,
@@ -42,6 +54,17 @@ export function buildSession(): SessionFile {
     bookmarks: w.bookmarks,
     names: useNames.getState().names,
     types: useTypes.getState().types,
+    target: target
+      ? {
+          pid: target.pid,
+          name: target.name,
+          savedAt: Date.now(),
+          watches: w.watches.map((x) => ({ address: x.address, type: x.type, label: x.label, frozen: x.frozen })),
+          frozen: w.watches.filter((x) => x.frozen).map((x) => x.address),
+        }
+      : undefined,
+    signatures: useSigs.getState().sigs,
+    patches: usePatches.getState().patches.filter((p) => !p.reverted),
   };
 }
 
@@ -98,6 +121,10 @@ export function applySession(data: SessionFile): boolean {
   w.setWatches(data.watches ?? [], data.bookmarks ?? []);
   useNames.getState().setNames(data.names ?? []);
   useTypes.getState().setTypes(data.types ?? []);
-  log("info", "session", `imported (${(data.watches ?? []).length} watches, ${(data.names ?? []).length} names, ${(data.types ?? []).length} types)`);
+  if (data.version >= 2) {
+    if (data.signatures) useSigs.getState().setSigs(data.signatures);
+    if (data.patches) for (const p of data.patches) usePatches.getState().add(p);
+  }
+  log("info", "session", `imported (${(data.watches ?? []).length} watches, ${(data.names ?? []).length} names, ${(data.types ?? []).length} types${data.version >= 2 ? `, ${(data.signatures ?? []).length} signatures, ${(data.patches ?? []).length} patches` : ""})`);
   return true;
 }

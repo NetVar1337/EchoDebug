@@ -30,6 +30,8 @@ type SigStore = {
   update: (id: string, p: Partial<Signature>) => void;
   remove: (id: string) => void;
   clear: () => void;
+  /** replaces the whole list, used by the session importer */
+  setSigs: (sigs: Signature[]) => void;
 };
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -54,6 +56,7 @@ export const useSigs = create<SigStore>()(
         })),
       remove: (id) => set((st) => ({ sigs: st.sigs.filter((s) => s.id !== id) })),
       clear: () => set({ sigs: [] }),
+      setSigs: (sigs) => set({ sigs }),
     }),
     { name: "echodebug.sigs" },
   ),
