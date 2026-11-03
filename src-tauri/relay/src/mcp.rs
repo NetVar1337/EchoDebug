@@ -53,17 +53,19 @@ pub struct Policy {
     pub deny: Vec<String>,
     /// append every call to <config>/EchoDebug/mcp-audit.jsonl
     pub audit: bool,
+    /// "ask": let a client that supports form elicitation ask its user (else the app window asks)
+    pub elicit: bool,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Policy { mode: "allow".into(), allow: Vec::new(), deny: Vec::new(), audit: false }
+        Policy { mode: "allow".into(), allow: Vec::new(), deny: Vec::new(), audit: false, elicit: true }
     }
 }
 
 impl Policy {
     pub fn to_json(&self) -> Value {
-        json!({ "mode": self.mode, "allow": self.allow, "deny": self.deny, "audit": self.audit, "audit_path": audit_path().display().to_string() })
+        json!({ "mode": self.mode, "allow": self.allow, "deny": self.deny, "audit": self.audit, "elicit": self.elicit, "audit_path": audit_path().display().to_string() })
     }
 
     pub fn from_json(v: &Value, cur: &Policy) -> Result<Policy, String> {
@@ -74,7 +76,9 @@ impl Policy {
         if !matches!(mode.as_str(), "allow" | "ask" | "readonly") {
             return Err(format!("unknown policy mode '{mode}' (allow, ask, readonly)"));
         }
-        Ok(Policy { mode, allow: list("allow", &cur.allow), deny: list("deny", &cur.deny), audit: v.get("audit").and_then(Value::as_bool).unwrap_or(cur.audit) })
+        Ok(Policy { mode, allow: list("allow", &cur.allow), deny: list("deny", &cur.deny), audit: v.get("audit").and_then(Value::as_bool).unwrap_or(cur.audit),
+            elicit: v.get("elicit").and_then(Value::as_bool).unwrap_or(cur.elicit),
+        })
     }
 }
 
@@ -134,7 +138,7 @@ pub fn template_request(uri: &str) -> Option<Map<String, Value>> {
     let rest = uri.strip_prefix("echodebug://")?;
     let parts: Vec<&str> = rest.split('/').collect();
     let mut m = Map::new();
-    let dec = |s: &str| s.replace("%2B", "+").replace("%2b", "+").replace("%20", " ");
+    let dec = |s: &str| percent_decode(s);
     match parts.as_slice() {
         ["memory", addr, size] => {
             m.insert("type".into(), json!("ui_read_text"));
@@ -165,6 +169,104 @@ pub fn template_request(uri: &str) -> Option<Map<String, Value>> {
         _ => return None,
     }
     Some(m)
+}
+
+/// Percent-encodes one URI path segment (RFC 3986 unreserved characters stay).
+pub fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
+}
+
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---- structured output ---------------------------------------------------------------------------
+
+/// The outputSchema of a tool. Replies are JSON objects; failed calls carry `code`, `message` and
+/// `detail` (and `isError`), so no property is required and unknown ones are allowed.
+pub fn output_schema(verb: &str) -> Value {
+    let mut props = json!({
+        "success": { "type": "boolean" },
+        "code": { "type": "integer", "description": "error code when the call failed (see PROTOCOL.md)" },
+        "message": { "type": "string", "description": "error message when the call failed" },
+        "detail": { "description": "more about the error" },
+    });
+    let extra = match verb {
+        "status" => json!({
+            "agent": { "type": "boolean", "description": "Echo's memory server is connected" },
+            "ext": { "type": "boolean", "description": "the EchoDebug agent is loaded in Echo" },
+            "provider": { "type": "boolean", "description": "the EchoDebug app window serves the ui_* tools" },
+            "backend": { "type": "string", "enum": ["echo", "local", "none"] },
+            "target": { "description": "the attached process (pid, name, base) or null" },
+            "app_version": { "type": "string" },
+        }),
+        "processes" => json!({ "processes": { "type": "array", "items": { "type": "object", "properties": {
+            "pid": { "type": "integer" }, "name": { "type": "string" }, "path": { "type": "string" }, "memory": { "type": "integer" } } } } }),
+        "modules" => json!({ "modules": { "type": "array", "description": "loaded modules (name, base, size, path)", "items": { "type": "object", "properties": { "name": { "type": "string" } } } } }),
+        "read" => json!({ "data": { "type": "string", "description": "the bytes as lowercase hex" } }),
+        "disassemble" | "disasm_function" | "disasm_bytes" => json!({
+            "address": { "type": "string" },
+            "count": { "type": "integer" },
+            "complete": { "type": "boolean" },
+            "arch": { "type": "string" },
+            "results": { "type": "array", "items": { "type": "object", "properties": {
+                "address": { "type": "string" }, "length": { "type": "integer" }, "bytes": { "type": "string" }, "text": { "type": "string" } } } },
+        }),
+        "dump" => json!({ "path": { "type": "string", "description": "where the dump was written" } }),
+        _ => json!({}),
+    };
+    if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
+        p.extend(e.clone());
+    }
+    json!({ "type": "object", "properties": props, "additionalProperties": true })
+}
+
+/// `resource_link` content for a successful call: the resource that shows the same thing (memory,
+/// disassembly, a module's PE view) or the file it wrote.
+pub fn resource_links(verb: &str, args: &Map<String, Value>, reply: &Value) -> Vec<Value> {
+    let link = |uri: String, name: String, description: &str| json!({ "type": "resource_link", "uri": uri, "name": name, "description": description, "mimeType": "application/json" });
+    let addr = args.get("address").and_then(Value::as_str).filter(|a| !a.is_empty());
+    match verb {
+        "read" => match (addr, args.get("size").and_then(Value::as_u64)) {
+            (Some(a), Some(n)) if n > 0 && n <= 0x10000 => vec![link(format!("echodebug://memory/{}/{n}", percent_encode(a)), format!("memory {a}"), "these bytes, re-read live")],
+            _ => vec![],
+        },
+        "disassemble" | "disasm_function" => addr.map(|a| vec![link(format!("echodebug://disasm/{}", percent_encode(a)), format!("disassembly {a}"), "the function at this address")]).unwrap_or_default(),
+        "modules" => reply["modules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["name"].as_str())
+            .take(16)
+            .map(|n| link(format!("echodebug://module/{}/pe", percent_encode(n)), format!("{n} PE"), "headers, sections, imports, exports (EchoDebug window)"))
+            .collect(),
+        "dump" => reply["path"]
+            .as_str()
+            .map(|p| {
+                let slashed = p.replace('\\', "/");
+                let path: String = slashed.split('/').map(|seg| percent_encode(seg).replace("%3A", ":")).collect::<Vec<_>>().join("/");
+                let path = if path.starts_with('/') { path } else { format!("/{path}") };
+                vec![json!({ "type": "resource_link", "uri": format!("file://{path}"), "name": p.rsplit(['/', '\\']).next().unwrap_or(p), "description": "the dumped module", "mimeType": "application/octet-stream" })]
+            })
+            .unwrap_or_default(),
+        _ => vec![],
+    }
 }
 
 // ---- completion ---------------------------------------------------------------------------------
@@ -263,6 +365,34 @@ mod tests {
         assert!(Policy::from_json(&json!({ "mode": "yolo" }), &p).is_err());
         let q = Policy::from_json(&json!({ "mode": "ask", "audit": true }), &p).unwrap();
         assert_eq!((q.mode.as_str(), q.audit, q.allow.len()), ("ask", true, 1));
+    }
+
+    #[test]
+    fn output_schemas_and_resource_links() {
+        for verb in ["read", "status", "modules", "disassemble", "dump", "ui_pe_info"] {
+            let s = output_schema(verb);
+            assert_eq!(s["type"], "object");
+            assert!(s.get("required").is_none(), "{verb}: error replies must conform too");
+            assert_eq!(s["properties"]["code"]["type"], "integer");
+        }
+        assert_eq!(output_schema("read")["properties"]["data"]["type"], "string");
+        let args = |v: Value| v.as_object().unwrap().clone();
+        let l = resource_links("read", &args(json!({ "address": "a b+0x1", "size": 8 })), &json!({}));
+        assert_eq!(l[0]["uri"], "echodebug://memory/a%20b%2B0x1/8");
+        assert_eq!(template_request(l[0]["uri"].as_str().unwrap()).unwrap()["address"], "a b+0x1");
+        assert!(resource_links("read", &args(json!({ "address": "0x1", "size": 0x20000 })), &json!({})).is_empty(), "too big for the template");
+        let m = resource_links("modules", &Map::new(), &json!({ "modules": [{ "name": "game.exe" }, { "name": "ntdll.dll" }] }));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[1]["uri"], "echodebug://module/ntdll.dll/pe");
+        let d = resource_links("dump", &Map::new(), &json!({ "path": "C:\\dumps\\game dump.exe" }));
+        assert_eq!(d[0]["uri"], "file:///C:/dumps/game%20dump.exe");
+        assert_eq!(d[0]["name"], "game dump.exe");
+        let d = resource_links("dump", &Map::new(), &json!({ "path": "/tmp/x.bin" }));
+        assert_eq!(d[0]["uri"], "file:///tmp/x.bin");
+        assert!(resource_links("write", &args(json!({ "address": "0x1" })), &json!({})).is_empty());
+        assert_eq!(percent_decode("%zz%41"), "%zzA");
+        assert!(Policy::default().elicit);
+        assert!(!Policy::from_json(&json!({ "elicit": false }), &Policy::default()).unwrap().elicit);
     }
 
     #[test]

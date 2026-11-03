@@ -110,12 +110,15 @@ async fn thread_verbs_with_echo_say_unsupported() {
         assert_eq!(r["code"], 2006, "{r}");
         assert!(r["message"].as_str().unwrap().contains("Echo backend can't"), "{r}");
     }
+    // under Echo the thread tools cannot work, so tools/list leaves them out
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
     let tools = r["result"]["tools"].as_array().unwrap();
-    for name in ["list_threads", "thread_stack", "list_handles", "tls_callbacks", "exception_handlers"] {
-        let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} missing"));
-        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
-        assert_eq!(t["annotations"]["destructiveHint"], false, "{t}");
+    for name in ["list_threads", "thread_stack", "list_handles"] {
+        assert!(!tools.iter().any(|t| t["name"] == name), "{name} listed under Echo");
+    }
+    for verb in ["threads", "stack", "handles", "ui_tls_callbacks", "ui_exception_handlers"] {
+        let a = echo_debug_relay::mcp::annotations(verb, "");
+        assert_eq!((a["readOnlyHint"].as_bool(), a["destructiveHint"].as_bool()), (Some(true), Some(false)), "{verb}");
     }
 }
 
@@ -254,7 +257,8 @@ async fn origin_checks() {
 }
 
 async fn mcp(relay: &Relay, body: Value, origin: Option<&str>) -> (StatusCode, Value) {
-    let mut req = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
+    // a sessionless client of the initialize-based 2025-06-18 revision (tests/mcp.rs covers the others)
+    let mut req = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json").header("mcp-protocol-version", "2025-06-18");
     if let Some(o) = origin {
         req = req.header(header::ORIGIN, o);
     }
@@ -466,7 +470,7 @@ async fn mcp_prompts_resources_and_call_log() {
 
     // initialize advertises tools + prompts + resources
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }), None).await;
-    assert_eq!(r["result"]["capabilities"], json!({ "tools": { "listChanged": false }, "prompts": {}, "resources": { "subscribe": true }, "logging": {}, "completions": {} }));
+    assert_eq!(r["result"]["capabilities"], json!({ "tools": { "listChanged": true }, "prompts": { "listChanged": false }, "resources": { "subscribe": true, "listChanged": false }, "logging": {}, "completions": {} }));
     assert!(r["result"]["instructions"].as_str().unwrap().contains("attach"));
 
     // prompts/list + prompts/get with argument substitution
@@ -489,7 +493,8 @@ async fn mcp_prompts_resources_and_call_log() {
     let status: Value = serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(status["type"], "status");
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": { "uri": "echodebug://target/modules" } }), None).await;
-    assert_eq!(r["error"]["code"], -32000, "modules resource needs the memory server");
+    assert_eq!(r["error"]["code"], -32603, "modules resource needs the memory server");
+    assert!(r["error"]["message"].as_str().unwrap().contains("not connected"), "{r}");
 
     // a tools/call lands in the ring buffer → echodebug://mcp/log and the local mcp_log verb
     let mut ext = connect(addr, "/ext").await;
@@ -668,9 +673,13 @@ async fn mcp_event_stream_and_progress() {
     assert_eq!(resp.status(), StatusCode::OK);
     let mut body = resp.into_body().into_data_stream();
     let _ext = connect(addr, "/ext").await;
-    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next()).await.unwrap().unwrap().unwrap();
-    let text = String::from_utf8_lossy(&chunk);
-    assert!(text.contains("notifications/resources/updated"), "{text}");
+    let mut text = String::new();
+    while !text.contains("notifications/resources/updated") || !text.contains("notifications/tools/list_changed") {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), body.next()).await.unwrap().unwrap().unwrap();
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    // the Echo backend hides the thread tools: the tool list changed too
+    assert!(text.contains("notifications/tools/list_changed"), "{text}");
 
     // tools/call with a progressToken over SSE: progress events, then the result
     let mut ext = connect(addr, "/ext").await;
@@ -791,6 +800,20 @@ async fn annotation_tools_go_through_provider_and_policy() {
     let call = |id: u64, name: &str, args: Value| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
     let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap().to_owned();
 
+    // no app window: the window's tools are not listed
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
+    assert!(!r["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "list_names"));
+
+    // ... and calling one anyway gives the provider error, not a hang
+    let (_, r) = mcp(&relay, call(2, "list_names", json!({})), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("app window"), "{r}");
+
+    // the window serves them as ui_* provider verbs
+    let mut app = connect(addr, "/client").await;
+    send(&mut app, json!({ "type": "provide", "id": 9, "verbs": ["ui_set_name", "ui_revert_patch", "ui_approve"] })).await;
+    recv_until(&mut app, |v| v["type"] == "provide_result" && v["id"] == 9).await;
+
     // annotations: listing is read-only, naming changes EchoDebug state, revert writes the target
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
     let tools = r["result"]["tools"].as_array().unwrap();
@@ -803,15 +826,6 @@ async fn annotation_tools_go_through_provider_and_policy() {
     assert_eq!(tool("set_comment")["annotations"]["readOnlyHint"], false);
     assert_eq!(tool("revert_patch")["annotations"]["destructiveHint"], true);
 
-    // no app window: the provider error, not a hang
-    let (_, r) = mcp(&relay, call(2, "list_names", json!({})), None).await;
-    assert_eq!(r["result"]["isError"], true);
-    assert!(text(&r).contains("app window"), "{r}");
-
-    // the window serves them as ui_* provider verbs
-    let mut app = connect(addr, "/client").await;
-    send(&mut app, json!({ "type": "provide", "id": 9, "verbs": ["ui_set_name", "ui_revert_patch", "ui_approve"] })).await;
-    recv_until(&mut app, |v| v["type"] == "provide_result" && v["id"] == 9).await;
     let relay2 = relay.clone();
     let pending = tokio::spawn(async move { mcp(&relay2, call(3, "set_name", json!({ "address": "0x140001000", "name": "main" })), None).await });
     let req = recv_until(&mut app, |v| v["type"] == "provider_call").await;
