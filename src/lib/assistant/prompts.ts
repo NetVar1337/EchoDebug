@@ -2,19 +2,7 @@
 // submit_* tool calls into review lists. Pure, so they are unit-tested.
 import { kFieldSizes, layout, type Field, type FieldType } from "../analysis/struct";
 import { apiTools } from "./tools";
-
-export type ModelInfo = { id: string; label: string; note: string; fallback: boolean };
-
-/** Default first; the ids are the API's model ids. */
-export const kModels: ModelInfo[] = [
-  { id: "claude-opus-5-5", label: "Claude Opus 5.5", note: "default", fallback: true },
-  { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", note: "faster, cheaper", fallback: true },
-  { id: "claude-haiku-5-5", label: "Claude Haiku 5.5", note: "fastest, cheapest", fallback: false },
-  { id: "claude-fable-5-1", label: "Claude Fable 5.1", note: "most capable, most expensive", fallback: true },
-];
-export const kDefaultModel = kModels[0].id;
-export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
-export const kEfforts: Effort[] = ["low", "medium", "high", "xhigh", "max"];
+import { defaultSettings, kFallbackModels, type ModelInfo, type ModelSettings, type ProviderKind } from "./providers";
 
 export const kSystemPrompt = `You are the analysis assistant inside EchoDebug, a reverse-engineering workbench attached to a live process the user is authorized to analyze (their own software, or a target they are permitted to test).
 
@@ -26,20 +14,40 @@ When asked for names or struct fields, call submit_name_suggestions or submit_st
 
 export type Msg = { role: "user" | "assistant"; content: unknown };
 
-/** Messages API request body (the desktop side adds the key and streams it). */
-export function buildRequest(opts: { model: string; effort: Effort; messages: Msg[]; tools?: boolean; maxTokens?: number }): Record<string, unknown> {
-  const info = kModels.find((m) => m.id === opts.model);
+export type RequestOpts = {
+  kind: ProviderKind;
+  modelId: string;
+  /** what the provider reported about the model (capabilities, output limit) */
+  model?: ModelInfo;
+  settings?: ModelSettings;
+  messages: Msg[];
+  tools?: boolean;
+  system?: string;
+};
+
+/**
+ * The provider-neutral request body. The desktop side checks it (read-only tools only) and writes
+ * each provider's own request from it (relay/src/assistant/provider.rs).
+ */
+export function buildRequest(o: RequestOpts): Record<string, unknown> {
+  const d = defaultSettings(o.kind, o.model);
+  const s = { ...d, ...Object.fromEntries(Object.entries(o.settings ?? {}).filter(([, v]) => v !== undefined)) } as typeof d;
+  const anthropic = o.kind === "anthropic";
+  const effort = s.effort && s.effort !== "off" ? s.effort : anthropic ? "medium" : undefined;
+  // current Claude models always think (adaptively); elsewhere thinking follows the effort setting
+  const thinking = anthropic || (!!effort && o.model?.reasoning !== false);
+  const withTools = o.tools !== false && o.model?.tools !== false;
+  const temp = !anthropic && s.temperature != null && o.model?.temperature !== false ? s.temperature : undefined;
   return {
-    model: opts.model,
-    max_tokens: opts.maxTokens ?? 64000,
-    system: [{ type: "text", text: kSystemPrompt }],
-    // the tools and system prompt are the same every turn: cache them and the history
-    cache_control: { type: "ephemeral" },
-    thinking: { type: "adaptive", display: "summarized" },
-    output_config: { effort: opts.effort },
-    ...(info?.fallback ? { fallbacks: "default" } : {}),
-    ...(opts.tools === false ? {} : { tools: apiTools() }),
-    messages: opts.messages,
+    model: o.modelId,
+    max_tokens: s.maxTokens,
+    system: o.system ?? kSystemPrompt,
+    messages: o.messages,
+    thinking,
+    ...(effort ? { effort } : {}),
+    ...(temp !== undefined ? { temperature: temp } : {}),
+    ...(anthropic && kFallbackModels.has(o.modelId) ? { fallbacks: true } : {}),
+    ...(withTools ? { tools: apiTools() } : {}),
   };
 }
 

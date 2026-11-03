@@ -1,7 +1,7 @@
 // Which of EchoDebug's MCP tools the in-app assistant may call, and their Messages API
 // definitions. Only read-only analysis tools: never a write, freeze, dump, patch revert, name
 // change, attach, scan session, alert, emulation or debugger control. The same rule is enforced
-// again on the desktop side (relay/src/assistant.rs) before a request leaves the app, and the
+// again on the desktop side (relay/src/assistant.rs) for every provider before a request leaves the app, and the
 // lists below are checked against relay/src/mcp.rs and assistant.rs by a unit test.
 import kTools from "../tools.json";
 
@@ -93,13 +93,12 @@ export function allowedTool(name: string): ToolDef | undefined {
   return kByName.get(name);
 }
 
-/** Messages API `tools` entries. Streaming requests set eager_input_streaming (inputs are validated before running). */
-export function apiTools(): { name: string; description: string; input_schema: JsonSchema; eager_input_streaming: boolean }[] {
+/** Tool definitions for a request (the desktop side writes each provider's own format). */
+export function apiTools(): { name: string; description: string; input_schema: JsonSchema }[] {
   return [...assistantTools(), ...kLocalTools].map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: { type: "object", ...t.input_schema },
-    eager_input_streaming: true,
   }));
 }
 

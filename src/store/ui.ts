@@ -90,6 +90,8 @@ type UiStore = {
   selected: string | null;
   disasmAt: string | null;
   memoryAt: string | null;
+  /** the Memory view's selected range (inclusive), for the assistant's @selection */
+  memSel: { from: string; to: string } | null;
   structAt: string | null;
   sigAt: string | null;
   chainAt: { base: string; offsets: number[] } | null;
@@ -152,6 +154,7 @@ export const useUi = create<UiStore>()(
       selected: null,
       disasmAt: null,
       memoryAt: null,
+      memSel: null,
       structAt: null,
       sigAt: null,
       chainAt: null,

@@ -1,4 +1,6 @@
-// Folds the Messages API's streamed events into the assistant message's content blocks.
+// Folds the streamed events into the assistant message's content blocks. Every provider's stream
+// arrives in the Messages API's event shape (the desktop side translates OpenAI, Gemini and
+// OpenRouter streams, see relay/src/assistant/decode.rs), so this one accumulator serves them all.
 // Tool inputs arrive as input_json_delta fragments (eager streaming), so they are parsed strictly
 // at the end and checked against the tool's schema before anything runs.
 
@@ -10,7 +12,15 @@ export type Block =
   | { type: "fallback"; [k: string]: unknown }
   | { type: string; [k: string]: unknown };
 
-export type Usage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+export type Usage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  reasoning_tokens?: number;
+  /** USD, when the provider reports what the request cost (OpenRouter) */
+  cost?: number;
+};
 export type StreamEvent = { type: string; [k: string]: unknown };
 
 export class MessageAccumulator {
@@ -51,6 +61,7 @@ export class MessageAccumulator {
         else if (d.type === "thinking_delta") b.thinking = String(b.thinking ?? "") + String(d.thinking ?? "");
         else if (d.type === "signature_delta") b.signature = String(b.signature ?? "") + String(d.signature ?? "");
         else if (d.type === "input_json_delta") this.partial.set(i, (this.partial.get(i) ?? "") + String(d.partial_json ?? ""));
+        else if (d.type === "details_delta") b.details = d.details;
         else if (d.type === "citations_delta") b.citations = [...((b.citations as unknown[] | undefined) ?? []), d.citation];
         return;
       }

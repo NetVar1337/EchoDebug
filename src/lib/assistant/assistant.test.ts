@@ -4,10 +4,11 @@ import kTools from "../tools.json";
 import { allowedTool, apiTools, assistantTools, isReadOnlyVerb, kAssistantDeny, kDestructive, kStateful, validateInput, type ToolDef } from "./tools";
 import { MessageAccumulator, echoContent, toolsMayRun } from "./stream";
 import {
-  applyFieldAt, buildRequest, capLines, cleanIdentifier, explainFunctionPrompt, kDefaultModel, kModels, kSystemPrompt, parseNameSuggestions,
+  applyFieldAt, buildRequest, capLines, cleanIdentifier, explainFunctionPrompt, kSystemPrompt, parseNameSuggestions,
   parseStructFields, sampleStrings, suggestNamesPrompt, suggestStructPrompt, summariseModulePrompt, type FunctionContext,
 } from "./prompts";
 import type { Field } from "../analysis/struct";
+import { builtinModels, type ModelInfo } from "./providers";
 
 /** a `const NAME: &[&str] = &[ ... ];` list from a Rust source file */
 function rustList(file: string, name: string): string[] {
@@ -48,7 +49,7 @@ describe("assistant tool filtering", () => {
     for (const name of ["read_memory", "disassemble", "list_modules", "ui_strings", "ui_pe_info", "ui_xrefs_to", "list_names", "list_comments", "ui_cfg", "submit_name_suggestions", "submit_struct_fields"]) {
       expect(offered.has(name), name).toBe(true);
     }
-    expect(apiTools().every((t) => t.eager_input_streaming && t.input_schema.type === "object")).toBe(true);
+    expect(apiTools().every((t) => t.input_schema.type === "object")).toBe(true);
     expect(assistantTools().length).toBeLessThan((kTools as ToolDef[]).length);
     expect(isReadOnlyVerb("dbg_continue")).toBe(false);
   });
@@ -66,23 +67,55 @@ describe("assistant tool filtering", () => {
 });
 
 describe("request builder", () => {
-  it("defaults to the current default model with adaptive thinking, effort, caching and fallbacks", () => {
-    expect(kDefaultModel).toBe("claude-opus-5-5");
-    const b = buildRequest({ model: kDefaultModel, effort: "medium", messages: [{ role: "user", content: "hi" }] });
+  const ant = builtinModels({ id: "anthropic", kind: "anthropic" });
+  it("defaults Claude to adaptive thinking, medium effort and fallbacks; the desktop adds caching", () => {
+    const b = buildRequest({ kind: "anthropic", modelId: "claude-opus-5-5", model: ant[0], messages: [{ role: "user", content: "hi" }] });
     expect(b.model).toBe("claude-opus-5-5");
-    expect(b.thinking).toEqual({ type: "adaptive", display: "summarized" });
-    expect(b.output_config).toEqual({ effort: "medium" });
-    expect(b.cache_control).toEqual({ type: "ephemeral" });
-    expect(b.fallbacks).toBe("default");
+    expect(b.thinking).toBe(true);
+    expect(b.effort).toBe("medium");
+    expect(b.fallbacks).toBe(true);
+    expect(b.max_tokens).toBe(64000);
     expect(b).not.toHaveProperty("temperature");
     expect((b.tools as unknown[]).length).toBeGreaterThan(10);
-    expect((b.system as { text: string }[])[0].text).toBe(kSystemPrompt);
+    expect(b.system).toBe(kSystemPrompt);
   });
   it("sends no fallbacks for models without server-side fallback, and no tools on request", () => {
-    const haiku = kModels.find((m) => m.id === "claude-haiku-5-5")!;
-    const b = buildRequest({ model: haiku.id, effort: "low", messages: [], tools: false });
+    const b = buildRequest({ kind: "anthropic", modelId: "claude-haiku-5-5", settings: { effort: "low" }, messages: [], tools: false });
     expect(b).not.toHaveProperty("fallbacks");
     expect(b).not.toHaveProperty("tools");
+    expect(b.effort).toBe("low");
+  });
+  it("follows each provider's capabilities and the per-model settings", () => {
+    const gpt: ModelInfo = { id: "gpt-4.1", name: "GPT-4.1", provider: "openai", context: null, max_output: null, tools: true, vision: true, reasoning: false, effort: false, temperature: true, price: null };
+    let b = buildRequest({ kind: "openai", modelId: gpt.id, model: gpt, settings: { temperature: 0.3, maxTokens: 2000 }, messages: [] });
+    expect(b.temperature).toBe(0.3);
+    expect(b.thinking).toBe(false);
+    expect(b).not.toHaveProperty("effort");
+    expect(b.max_tokens).toBe(2000);
+    // temperature is never sent where the model refuses it, nor to Anthropic
+    b = buildRequest({ kind: "openai", modelId: "o3", model: { ...gpt, id: "o3", temperature: false, reasoning: true, effort: true }, settings: { temperature: 0.3, effort: "high" }, messages: [] });
+    expect(b).not.toHaveProperty("temperature");
+    expect(b.effort).toBe("high");
+    expect(b.thinking).toBe(true);
+    expect(buildRequest({ kind: "anthropic", modelId: "claude-opus-5-5", settings: { temperature: 0.5 }, messages: [] })).not.toHaveProperty("temperature");
+    // local servers: no reasoning parameters unless asked; models without tool calling get no tools
+    b = buildRequest({ kind: "openai_compat", modelId: "llama3", model: { ...gpt, id: "llama3", tools: false }, messages: [] });
+    expect(b).not.toHaveProperty("effort");
+    expect(b).not.toHaveProperty("tools");
+    expect(b.max_tokens).toBe(16000);
+  });
+  it("the same read-only tool list goes to every provider", () => {
+    const kinds = ["anthropic", "openai", "gemini", "openrouter", "openai_compat", "anthropic_compat"] as const;
+    for (const kind of kinds) {
+      const names = ((buildRequest({ kind, modelId: "m", messages: [] }).tools ?? []) as { name: string }[]).map((t) => t.name);
+      expect(names.length, kind).toBeGreaterThan(10);
+      for (const bad of ["write_memory", "freeze_value", "dump_module", "revert_patch", "set_name", "emulate", "emu_run", "attach"]) expect(names, `${kind} ${bad}`).not.toContain(bad);
+      for (const t of names) {
+        const def = allowedTool(t);
+        expect(def, t).toBeDefined();
+        if (def!.verb) expect(isReadOnlyVerb(def!.verb), t).toBe(true);
+      }
+    }
   });
 });
 

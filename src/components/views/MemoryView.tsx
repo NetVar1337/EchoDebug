@@ -112,6 +112,10 @@ export default function MemoryView() {
     return (e < sel ? [e, sel] : [sel, e]) as [bigint, bigint];
   }, [sel, selEnd]);
   const rangeLen = rangeLo !== null && rangeHi !== null ? Number(rangeHi - rangeLo) + 1 : 0;
+  // published for the assistant's @selection
+  useEffect(() => {
+    useUi.getState().set({ memSel: rangeLo !== null && rangeHi !== null ? { from: fmtAddr(rangeLo), to: fmtAddr(rangeHi) } : null });
+  }, [rangeLo, rangeHi]);
   const inRange = (a: bigint) => rangeLo !== null && rangeHi !== null && a >= rangeLo && a <= rangeHi;
 
   const write = async (addr: bigint, bytes: Uint8Array | string, note: string) => {

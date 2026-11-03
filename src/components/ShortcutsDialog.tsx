@@ -8,6 +8,7 @@ const kGroups: [string, [string, string][]][] = [
   ["Edit", [["Ctrl+Z", "Undo a name / comment / type edit"], ["Ctrl+Y · Ctrl+Shift+Z", "Redo"]]],
   ["Disassembly", [["F3", "Next search match"], ["Enter · Shift+Enter", "In the go-to box: disassembly · memory"], ["Double-click", "Follow / edit"]]],
   ["Memory", [["Click · Shift+click", "Select · extend the selection"], ["Double-click a byte", "Edit it"]]],
+  ["Assistant", [["Ctrl+L", "Focus the message box"], ["Enter · Shift+Enter", "Send · new line"], ["Esc", "Stop the reply"], ["↑ (empty box)", "Edit and resend the last message"], ["/ · @", "Commands · attach context (Tab or Enter picks)"]]],
   ["Help", [["F1 · Ctrl+/", "This list"], ["Esc", "Close a dialog or menu"]]],
 ];
 
