@@ -36,7 +36,10 @@ mod mcp_bridge;
 pub mod mcp_clients;
 pub mod mcp_server;
 pub mod monitor;
+pub mod driver_info;
+pub mod kdump;
 pub mod pdbinfo;
+pub mod procdump;
 pub mod symbols;
 pub mod sync;
 pub mod trace;
@@ -395,6 +398,29 @@ impl Relay {
                     "module_timeline" => monitor::module_timeline(self),
                     _ => monitor::page_monitor_list(self),
                 };
+                v["id"] = orig;
+                return v;
+            }
+            // Full process dump (MINIDUMP on Windows, raw segment archive on Linux).
+            "dump_process_full" => {
+                let mut v = procdump::handle(&req);
+                v["id"] = orig;
+                return v;
+            }
+            // Kernel / process dump file analysis: open, list modules, extract a PE.
+            "kdump_open" => {
+                let mut v = kdump::handle_open(&req);
+                v["id"] = orig;
+                return v;
+            }
+            "kdump_extract" => {
+                let mut v = kdump::handle_extract(&req);
+                v["id"] = orig;
+                return v;
+            }
+            // Driver static analysis: IRP dispatch, IOCTL codes, driver imports.
+            "driver_info" => {
+                let mut v = driver_info::handle(&req);
                 v["id"] = orig;
                 return v;
             }
