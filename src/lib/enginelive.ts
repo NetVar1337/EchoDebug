@@ -2,11 +2,12 @@
 // metadata + method RVAs, Source netvars.
 import { invoke } from "@tauri-apps/api/core";
 import { fmtAddr, toBig, type Module } from "./hex";
-import { loadImage, readBytes } from "./memory";
+import { request } from "./client";
+import { loadImage, readBytes, readU64 } from "./memory";
 import { readMany } from "./batch";
 import { searchMemory } from "./memsearch";
 import { parsePe } from "./analysis/pe";
-import { dumpObjects, findNamePools, findObjectArrays, kDefaultOffsets, NamePool, ObjectArray, readStruct, sdkText, type Mem, type Offsets, type ObjectDump, type SdkStruct } from "./analysis/engines/unreal";
+import { dumpObjects, findNamePools, findObjectArrays, kDefaultOffsets, LegacyNames, NamePool, ObjectArray, readStruct, ripTarget, sdkText, type Mem, type Names, type Offsets, type ObjectDump, type SdkStruct, type UnrealSig } from "./analysis/engines/unreal";
 import { applyMethodPointers, isMetadata, parseMetadata, type Il2CppMetadata } from "./analysis/engines/il2cpp";
 import { dumpNetvars, type NetvarDump } from "./analysis/engines/source";
 import { useConn } from "@/store/conn";
@@ -79,22 +80,30 @@ export function guessEngine(): EngineGuess {
 
 // ---- Unreal ------------------------------------------------------------------------------------
 
-export type UnrealSession = { mem: CachedMem; names: NamePool; objects: ObjectArray; dump: ObjectDump; module: string; namesAddr: bigint; objectsAddr: bigint };
+export type UnrealSession = { mem: CachedMem; names: Names; objects: ObjectArray; dump: ObjectDump; module: string; namesAddr: bigint; objectsAddr: bigint };
 
-export async function unrealOpen(opts: { module?: string; names?: bigint; objects?: bigint; offsets?: Offsets; limit?: number; onProgress?: (done: number, total: number) => void } = {}): Promise<UnrealSession> {
-  const m = (opts.module && findModule(new RegExp(`^${opts.module.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"))) || mainModule();
+const moduleNamed = (name?: string) => (name && findModule(new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"))) || mainModule();
+
+/** The name table at `address`: FNamePool (4.23+), or legacy GNames (≤4.22) when `legacy`. */
+function nameTable(mem: Mem, address: bigint, legacy?: boolean): Names {
+  return legacy ? new LegacyNames(mem, address) : new NamePool(mem, address);
+}
+
+export async function unrealOpen(opts: { module?: string; names?: bigint; legacyNames?: boolean; objects?: bigint; offsets?: Offsets; limit?: number; onProgress?: (done: number, total: number) => void } = {}): Promise<UnrealSession> {
+  const m = moduleNamed(opts.module);
   if (!m) throw new Error("attach to the game first");
   const mem = new CachedMem();
   const off = opts.offsets ?? kDefaultOffsets;
   const base = toBig(m.base);
-  let names: NamePool | null = null;
+  let names: Names | null = null;
   let objects: ObjectArray | null = null;
+  if (opts.legacyNames && opts.names === undefined) throw new Error("legacy GNames cannot be found by shape: pass its address (or use Find with the pattern)");
   const { img, ranges } = opts.names !== undefined && opts.objects !== undefined ? { img: new Uint8Array(), ranges: [] } : await dataRanges(m);
   for (const c of opts.names !== undefined ? [{ address: opts.names }] : findNamePools(img, base, ranges)) {
-    const np = new NamePool(mem, c.address);
+    const np = nameTable(mem, c.address, opts.legacyNames);
     if (await np.init().catch(() => false)) { names = np; break; }
   }
-  if (!names) throw new Error(`no FNamePool (GNames) found in ${m.name}: pass its address (the static NamePoolData)`);
+  if (!names) throw new Error(opts.legacyNames ? `no legacy GNames at that address (entry 0 is not "None")` : `no FNamePool (GNames) found in ${m.name}: pass its address (the static NamePoolData)`);
   for (const c of opts.objects !== undefined ? [{ address: opts.objects }] : findObjectArrays(img, base, ranges)) {
     const oa = new ObjectArray(mem, c.address, off);
     if (!(await oa.init().catch(() => false))) continue;
@@ -105,6 +114,33 @@ export async function unrealOpen(opts: { module?: string; names?: bigint; object
   if (!objects) throw new Error(`no FUObjectArray (GObjects) found in ${m.name}: pass its address, or adjust the offsets`);
   const dump = await dumpObjects(names, objects, opts.onProgress, opts.limit);
   return { mem, names, objects, dump, module: m.name, namesAddr: names.address, objectsAddr: objects.address };
+}
+
+/**
+ * The name table (and optionally GUObjectArray) at known addresses, without dumping anything:
+ * for decoding single FNames and paging through objects with listObjects.
+ */
+export async function unrealTables(opts: { names: bigint; legacyNames?: boolean; objects?: bigint; offsets?: Offsets }): Promise<{ names: Names; objects: ObjectArray | null }> {
+  const mem = new CachedMem();
+  const names = nameTable(mem, opts.names, opts.legacyNames);
+  if (!(await names.init().catch(() => false))) throw new Error(`no ${opts.legacyNames ? "legacy GNames" : "FNamePool"} at ${fmtAddr(opts.names)} (entry 0 is not "None")`);
+  if (opts.objects === undefined) return { names, objects: null };
+  const objects = new ObjectArray(mem, opts.objects, opts.offsets ?? kDefaultOffsets);
+  if (!(await objects.init().catch(() => false))) throw new Error(`no FUObjectArray at ${fmtAddr(opts.objects)}`);
+  return { names, objects };
+}
+
+/** Scans `module` for one of kUnrealSigs (with a possibly edited pattern) and resolves its operand. */
+export async function unrealFindBySig(sig: UnrealSig, pattern: string, module?: string): Promise<bigint | null> {
+  const m = moduleNamed(module);
+  if (!m) throw new Error("attach to the game first");
+  const r = await request<{ results: string[] }>("sig_scan_ida", { pattern, module: m.name, find_all: false }, true);
+  const hit = r.results?.[0];
+  if (!hit) return null;
+  const disp = await readBytes(toBig(hit) + BigInt(sig.disp), 4);
+  if (!disp || disp.length < 4) return null;
+  const at = ripTarget(toBig(hit), disp, sig.len) - BigInt(sig.adjust);
+  return sig.deref ? readU64(at) : at;
 }
 
 export async function unrealSdk(s: UnrealSession, opts: { filter?: string; max?: number; offsets?: Offsets; onProgress?: (done: number, total: number) => void } = {}): Promise<{ structs: SdkStruct[]; text: string }> {
