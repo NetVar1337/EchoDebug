@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { Field } from "@/lib/analysis/struct";
+import { record } from "@/lib/history";
 
 export type TypeDef = {
   id: string;
@@ -26,23 +27,36 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 
 export const useTypes = create<TypesStore>()(
   persist(
-    (set, get) => ({
+    (rawSet, get) => {
+      const set = (label: string, f: (s: TypesStore) => Partial<TypesStore>) => {
+        const before = get().types;
+        rawSet(f);
+        const after = get().types;
+        if (after !== before) record({ label, undo: () => rawSet({ types: before }), redo: () => rawSet({ types: after }) });
+      };
+      return {
       types: [],
       add: (name, fields = []) => {
         const id = uid();
-        set((s) => ({ types: [...s.types, { id, name, fields }] }));
+        set(`new type ${name}`, (s) => ({ types: [...s.types, { id, name, fields }] }));
         return id;
       },
-      update: (id, p) => set((s) => ({ types: s.types.map((t) => (t.id === id ? { ...t, ...p } : t)) })),
-      remove: (id) => set((s) => ({ types: s.types.filter((t) => t.id !== id) })),
+      update: (id, p) => {
+        const cur = get().types.find((t) => t.id === id);
+        // views sync their local copy on every render: unchanged updates are not undo steps
+        if (!cur || JSON.stringify({ ...cur, ...p }) === JSON.stringify(cur)) return;
+        set(`edit type ${cur.name}`, (s) => ({ types: s.types.map((t) => (t.id === id ? { ...t, ...p } : t)) }));
+      },
+      remove: (id) => set("delete type", (s) => ({ types: s.types.filter((t) => t.id !== id) })),
       ensure: (name) => {
         const hit = get().types.find((t) => t.name.toLowerCase() === name.toLowerCase());
         if (hit) return hit.id;
         return get().add(name);
       },
       find: (name) => get().types.find((t) => t.name.toLowerCase() === name.toLowerCase()),
-      setTypes: (types) => set({ types }),
-    }),
+      setTypes: (types) => set("replace types", () => ({ types })),
+      };
+    },
     { name: "echodebug.types" },
   ),
 );

@@ -1,10 +1,87 @@
-// Struct auto-detect: proposes a field type per 8-byte slot (split into 4-byte halves where that
-// reads better) from a raw dump of an object plus the process memory map. Pure: the caller does
-// the reads (the dump, the regions, and a few bytes at every pointer target) and passes them in.
-import { labelAddr, moduleOf, toBig, type Module } from "../hex";
+// Guesses a struct layout from the live bytes of an object, the way you would by eye in ReClass:
+// pointers into code are function pointers (a vtable when at offset 0 and into read-only data),
+// pointers into data/heap are pointers, printable runs are strings, runs of sane floats are
+// vectors or floats, small integers are ints, zeros stay padding.
+import { labelAddr, type Module } from "../hex";
 import { kFieldSizes, layout, type Field, type FieldType } from "./struct";
 
-export type MapRegion = { base: string | bigint; size: number; writable: boolean; executable: boolean; present?: boolean };
+export type PtrKind = "code" | "rdata" | "data" | "heap";
+export type GuessContext = { kindOf: (v: bigint) => PtrKind | null };
+
+export function plausibleFloat(f: number): boolean {
+  const a = Math.abs(f);
+  return Number.isFinite(f) && f !== 0 && a >= 1e-4 && a <= 1e7;
+}
+
+function asciiRun(b: Uint8Array, o: number): number {
+  let n = 0;
+  while (o + n < b.length && b[o + n] >= 0x20 && b[o + n] < 0x7f) n++;
+  return o + n < b.length && b[o + n] === 0 ? n : 0;
+}
+
+export function guessFields(b: Uint8Array, ctx: GuessContext): Field[] {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const out: Field[] = [];
+  let o = 0;
+  while (o < b.length) {
+    if (o % 8 === 0 && o + 8 <= b.length) {
+      const v = dv.getBigUint64(o, true);
+      const k = v ? ctx.kindOf(v) : null;
+      if (k) {
+        const name = o === 0 && k === "rdata" ? "vftable" : k === "code" ? `fn_${o.toString(16)}` : `p_${o.toString(16)}`;
+        out.push({ type: "ptr", name });
+        o += 8;
+        continue;
+      }
+      const s = asciiRun(b, o);
+      if (s >= 6 && o + 32 <= b.length) {
+        out.push({ type: "ascii", name: `str_${o.toString(16)}` });
+        o += 32;
+        continue;
+      }
+      if (v === 0n) {
+        out.push({ type: "hex64", name: "" });
+        o += 8;
+        continue;
+      }
+    }
+    if (o + 4 <= b.length) {
+      let run = 0;
+      while (run < 4 && o + (run + 1) * 4 <= b.length && plausibleFloat(dv.getFloat32(o + run * 4, true))) run++;
+      if (run >= 2) {
+        const n = run === 4 ? 4 : run === 3 ? 3 : 2;
+        out.push({ type: n === 4 ? "vec4" : n === 3 ? "vec3" : "vec2", name: `v_${o.toString(16)}` });
+        o += n * 4;
+        continue;
+      }
+      const f = dv.getFloat32(o, true);
+      const i = dv.getInt32(o, true);
+      if (plausibleFloat(f)) out.push({ type: "f32", name: `f_${o.toString(16)}` });
+      else if (i !== 0 && Math.abs(i) < 1_000_000) out.push({ type: "i32", name: `i_${o.toString(16)}` });
+      else out.push({ type: "hex32", name: "" });
+      o += 4;
+      continue;
+    }
+    out.push({ type: "hex8", name: "" });
+    o += 1;
+  }
+  return out;
+}
+
+/** Per-field change counters for a struct being watched over time. */
+export function changedFields(prev: Uint8Array, cur: Uint8Array, offsets: readonly { offset: number; size: number }[]): boolean[] {
+  return offsets.map(({ offset, size }) => {
+    for (let i = offset; i < offset + size && i < prev.length && i < cur.length; i++) if (prev[i] !== cur[i]) return true;
+    return false;
+  });
+}
+
+// ---- per-slot proposals (Structs → Auto-detect) ------------------------------------------------
+// Unlike guessFields, which retypes the whole layout at once, proposeFields returns one proposal
+// per 8-byte slot (split into 4-byte halves where that reads better) with the evidence behind it,
+// so the user can accept them one by one. Pointers are classified with the same kindOf as
+// guessFields (lib/ptrkind); the bytes behind each pointer (`deref`) tell vtables and string
+// pointers apart. Pure: the caller does the reads.
 
 export type GuessKind =
   | "zero" | "vtable" | "code-ptr" | "module-ptr" | "heap-ptr" | "string-ptr" | "wstring-ptr"
@@ -12,67 +89,38 @@ export type GuessKind =
 
 export type Guess = { offset: number; type: FieldType; kind: GuessKind; name: string; label: string };
 
-export type GuessContext = {
+export type ProposeContext = GuessContext & {
+  /** for "module+rva" labels */
   modules: readonly Module[];
-  /** from the `regions` verb; empty when it failed, then only module pointers are recognised */
-  regions: readonly MapRegion[];
   /** first bytes (32 is plenty) at each pointer target, keyed by lowercase 0x address */
   deref?: ReadonlyMap<string, Uint8Array>;
   /** RTTI class name per slot offset, for slots that look like vtable pointers */
   rtti?: ReadonlyMap<number, string>;
 };
 
-type Span = { base: bigint; end: bigint; w: boolean; x: boolean };
-const kUserMin = 0x10000n;
-const kUserMax = 0x7fffffffffffn;
-
-function spans(regions: readonly MapRegion[]): Span[] {
-  return regions
-    .filter((r) => r.present !== false)
-    .map((r) => ({ base: toBig(r.base), end: toBig(r.base) + BigInt(r.size), w: r.writable, x: r.executable }))
-    .sort((a, b) => (a.base < b.base ? -1 : 1));
-}
-
-function regionOf(v: bigint, s: readonly Span[]): Span | undefined {
-  let lo = 0, hi = s.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (v < s[mid].base) hi = mid - 1;
-    else if (v >= s[mid].end) lo = mid + 1;
-    else return s[mid];
-  }
-  return undefined;
-}
-
 const key = (v: bigint) => "0x" + v.toString(16);
 const u64 = (b: Uint8Array, o: number) => new DataView(b.buffer, b.byteOffset + o, 8).getBigUint64(0, true);
 
-/** True when v is a canonical user address inside a module or a mapped region. */
-function mapped(v: bigint, ctx: GuessContext, s: readonly Span[]): boolean {
-  return v >= kUserMin && v <= kUserMax && (!!regionOf(v, s) || !!moduleOf(v, ctx.modules));
-}
-
 /** Every distinct pointer-looking value in the dump, for the caller to read `deref` bytes at. */
 export function pointerTargets(buf: Uint8Array, ctx: GuessContext): string[] {
-  const s = spans(ctx.regions);
   const out = new Set<string>();
   for (let o = 0; o + 8 <= buf.length; o += 8) {
     const v = u64(buf, o);
-    if (mapped(v, ctx, s)) out.add(key(v));
+    if (v && ctx.kindOf(v)) out.add(key(v));
   }
   return [...out];
 }
 
 const printable = (c: number) => c >= 0x20 && c < 0x7f;
 
-/** Length of the printable ASCII run at o (stops at NUL, a non-printable byte or the end). */
-function asciiRun(b: Uint8Array, o: number): { n: number; nul: boolean } {
+/** Printable ASCII run at o (stops at NUL, a non-printable byte or the end). */
+function asciiSpan(b: Uint8Array, o: number): { n: number; nul: boolean } {
   let n = 0;
   while (o + n < b.length && printable(b[o + n])) n++;
   return { n, nul: o + n < b.length && b[o + n] === 0 };
 }
 
-function utf16Run(b: Uint8Array, o: number): { n: number; nul: boolean } {
+function utf16Span(b: Uint8Array, o: number): { n: number; nul: boolean } {
   let n = 0;
   while (o + n * 2 + 1 < b.length && printable(b[o + n * 2]) && b[o + n * 2 + 1] === 0) n++;
   const i = o + n * 2;
@@ -85,9 +133,9 @@ const preview = (b: Uint8Array, o: number, n: number, step: number) => {
   return JSON.stringify(n > 24 ? s + "…" : s);
 };
 
-function plausibleFloat(f: number, min: number, max: number): boolean {
-  const a = Math.abs(f);
-  return Number.isFinite(f) && a >= min && a <= max;
+function plausibleDouble(d: number): boolean {
+  const a = Math.abs(d);
+  return Number.isFinite(d) && a >= 1e-6 && a <= 1e9;
 }
 
 function dword(lo: number, o: number): Guess {
@@ -98,47 +146,45 @@ function dword(lo: number, o: number): Guess {
   if (lo <= 0xff) return { offset: o, type: "u32", kind: "small-int", name: "", label: `small int / enum (${lo})` };
   if (i < 0 && i >= -0x10000) return { offset: o, type: "i32", kind: "int", name: "", label: `int (${i})` };
   // floats before ints: 0x3f800000 is far more likely 1.0f than 1065353216
-  if (plausibleFloat(f, 1e-4, 1e7)) return { offset: o, type: "f32", kind: "f32", name: "", label: `float ${+f.toPrecision(6)}` };
+  if (plausibleFloat(f)) return { offset: o, type: "f32", kind: "f32", name: "", label: `float ${+f.toPrecision(6)}` };
   if (lo <= 0xffffff) return { offset: o, type: "i32", kind: "int", name: "", label: `int (${lo})` };
   return { offset: o, type: "hex32", kind: "unknown", name: "", label: "" };
 }
 
 function strPtr(t: Uint8Array | undefined): { kind: GuessKind; label: string } | null {
   if (!t) return null;
-  const a = asciiRun(t, 0);
+  const a = asciiSpan(t, 0);
   if ((a.n >= 4 && a.nul) || a.n >= 16) return { kind: "string-ptr", label: `char* ${preview(t, 0, a.n, 1)}` };
-  const w = utf16Run(t, 0);
+  const w = utf16Span(t, 0);
   if ((w.n >= 3 && w.nul) || w.n >= 8) return { kind: "wstring-ptr", label: `wchar_t* ${preview(t, 0, w.n, 2)}` };
   return null;
 }
 
 /** Classifies one 8-byte slot (or an inline string starting there, which may cover several slots). */
-function slot(buf: Uint8Array, o: number, ctx: GuessContext, s: readonly Span[]): Guess[] {
+function slot(buf: Uint8Array, o: number, ctx: ProposeContext): Guess[] {
   const v = u64(buf, o);
   if (v === 0n) return [{ offset: o, type: "hex64", kind: "zero", name: "", label: "zero / padding" }];
 
-  if (mapped(v, ctx, s)) {
-    const r = regionOf(v, s);
-    // the Linux backend lists [heap]/[stack] as modules; those are not images
-    const mod = moduleOf(v, ctx.modules.filter((m) => !m.name.startsWith("[")));
+  const k = ctx.kindOf(v);
+  if (k) {
     const where = labelAddr(v, ctx.modules);
     const t = ctx.deref?.get(key(v));
-    const isCode = (p: bigint) => !!regionOf(p, s)?.x;
-    // vtable: lives in a non-writable image section and its first slots point at code
-    if (r && !r.w && t && t.length >= 16 && isCode(u64(t, 0)) && isCode(u64(t, 8))) {
+    const isCode = (p: bigint) => p !== 0n && ctx.kindOf(p) === "code";
+    // vtable: lives in read-only image data and its first slots point at code
+    if (k === "rdata" && t && t.length >= 16 && isCode(u64(t, 0)) && isCode(u64(t, 8))) {
       const cls = ctx.rtti?.get(o);
       return [{ offset: o, type: "ptr", kind: "vtable", name: o === 0 ? "vtable" : `vtable_${o.toString(16)}`, label: `vtable → ${where}${cls ? ` (${cls})` : ""}` }];
     }
-    if (r?.x) return [{ offset: o, type: "ptr", kind: "code-ptr", name: "", label: `code → ${where}` }];
+    if (k === "code") return [{ offset: o, type: "ptr", kind: "code-ptr", name: "", label: `code → ${where}` }];
     const sp = strPtr(t);
     if (sp) return [{ offset: o, type: "ptr", kind: sp.kind, name: "", label: sp.label }];
-    if (mod) return [{ offset: o, type: "ptr", kind: "module-ptr", name: "", label: `→ ${where}` }];
-    return [{ offset: o, type: "ptr", kind: "heap-ptr", name: "", label: `heap → ${where}${r?.w ? "" : " (read-only)"}` }];
+    if (k === "rdata" || k === "data") return [{ offset: o, type: "ptr", kind: "module-ptr", name: "", label: `→ ${where}` }];
+    return [{ offset: o, type: "ptr", kind: "heap-ptr", name: "", label: `heap → ${where}` }];
   }
 
-  const a = asciiRun(buf, o);
+  const a = asciiSpan(buf, o);
   if (a.n >= 8 && o + kFieldSizes.ascii <= buf.length) return [{ offset: o, type: "ascii", kind: "ascii", name: "", label: `inline ${preview(buf, o, a.n, 1)}` }];
-  const w = utf16Run(buf, o);
+  const w = utf16Span(buf, o);
   if (w.n >= 4 && o + kFieldSizes.utf16 <= buf.length) return [{ offset: o, type: "utf16", kind: "utf16", name: "", label: `inline L${preview(buf, o, w.n, 2)}` }];
 
   const lo = Number(v & 0xffffffffn), hi = Number(v >> 32n);
@@ -146,18 +192,17 @@ function slot(buf: Uint8Array, o: number, ctx: GuessContext, s: readonly Span[])
   // two plausible floats (a vec2, say) also decode as a plausible double, so they win
   if (halves.every((h) => h.kind === "f32")) return halves;
   const d = new DataView(buf.buffer, buf.byteOffset + o, 8).getFloat64(0, true);
-  if (plausibleFloat(d, 1e-6, 1e9)) return [{ offset: o, type: "f64", kind: "f64", name: "", label: `double ${+d.toPrecision(8)}` }];
+  if (plausibleDouble(d)) return [{ offset: o, type: "f64", kind: "f64", name: "", label: `double ${+d.toPrecision(8)}` }];
   if (halves.every((h) => h.kind === "unknown")) return [{ offset: o, type: "hex64", kind: "unknown", name: "", label: "" }];
   return halves;
 }
 
 /** One proposal per slot of the dump, in offset order; inline strings swallow the slots they cover. */
-export function guessFields(buf: Uint8Array, ctx: GuessContext): Guess[] {
-  const s = spans(ctx.regions);
+export function proposeFields(buf: Uint8Array, ctx: ProposeContext): Guess[] {
   const out: Guess[] = [];
   let o = 0;
   while (o + 8 <= buf.length) {
-    const g = slot(buf, o, ctx, s);
+    const g = slot(buf, o, ctx);
     out.push(...g);
     const last = g[g.length - 1];
     o = Math.max(o + 8, last.offset + kFieldSizes[last.type]);

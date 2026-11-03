@@ -13,7 +13,7 @@ type Region = { base: string; size: number; present: boolean; writable: boolean;
 const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i32", "i64", "f32", "f64", "ptr", "ascii", "utf16"];
 
 export default function InspectorPanel() {
-  const { target, modules, agent, ext } = useConn();
+  const { target, modules, mem: agent, extOk: ext } = useConn();
   const ui = useUi();
   const { addWatch, addBookmark } = useWatch();
   const sel = ui.selected;
