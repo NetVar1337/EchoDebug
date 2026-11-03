@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use echo_debug_relay::{auth, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
+use echo_debug_relay::{auth, mcp_clients, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
 use serde::Serialize;
+use serde_json::{json, Value};
 use tauri::Manager;
 
 mod plugins;
@@ -136,6 +137,96 @@ fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|e| format!("read {}: {e}", path))
 }
 
+// ---- MCP client setup ---------------------------------------------------------------------------
+//
+// One-click setup of MCP clients (relay/src/mcp_clients.rs). The file paths come only from that
+// module's table of known client configs; the UI passes a client id and never a path, and nothing
+// is written until the user confirms the previewed diff.
+
+/// What a client config gets: the HTTP endpoint with the token, or this executable in stdio mode.
+fn mcp_server_spec(state: &RelayState) -> mcp_clients::Server {
+    let token = state.token.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let command = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "echodebug".into());
+    let mut args = vec!["--mcp-stdio".to_owned()];
+    if state.port != DEFAULT_PORT {
+        args.push(state.port.to_string());
+    }
+    mcp_clients::Server { url: format!("http://127.0.0.1:{}/mcp", state.port), token, command, args }
+}
+
+fn mcp_action(action: &str, transport: Option<&str>) -> Result<mcp_clients::Action, String> {
+    match action {
+        "uninstall" => Ok(mcp_clients::Action::Uninstall),
+        "install" => {
+            let t = transport.and_then(mcp_clients::Transport::parse).ok_or("install needs transport 'http' or 'stdio'")?;
+            Ok(mcp_clients::Action::Install(t))
+        }
+        other => Err(format!("unknown action '{other}'")),
+    }
+}
+
+/// Every known client: whether it is installed, where its config is and how EchoDebug is in it.
+#[tauri::command]
+fn mcp_clients(state: tauri::State<'_, RelayState>) -> Value {
+    let env = mcp_clients::Env::current();
+    let server = mcp_server_spec(&state);
+    let clients: Vec<Value> = mcp_clients::CLIENTS
+        .iter()
+        .map(|c| {
+            let mut row = mcp_clients::status(c, &env);
+            let mut snippets = serde_json::Map::new();
+            if c.http {
+                snippets.insert("http".into(), json!(mcp_clients::snippet(c, mcp_clients::Transport::Http, &server)));
+            }
+            if c.stdio {
+                snippets.insert("stdio".into(), json!(mcp_clients::snippet(c, mcp_clients::Transport::Stdio, &server)));
+            }
+            row["snippets"] = Value::Object(snippets);
+            row
+        })
+        .collect();
+    json!({ "clients": clients, "stdio": { "command": server.command, "args": server.args } })
+}
+
+/// The diff one-click setup would apply to a client's config. Writes nothing.
+#[tauri::command]
+fn mcp_client_preview(state: tauri::State<'_, RelayState>, id: String, action: String, transport: Option<String>) -> Result<Value, String> {
+    let c = mcp_clients::client(&id).ok_or_else(|| format!("unknown MCP client '{id}'"))?;
+    let plan = mcp_clients::plan(c, &mcp_clients::Env::current(), &mcp_server_spec(&state), mcp_action(&action, transport.as_deref())?)?;
+    Ok(plan.to_json())
+}
+
+/// Applies the change the user saw: refused when the planned diff is no longer `diff`.
+#[tauri::command]
+fn mcp_client_apply(state: tauri::State<'_, RelayState>, id: String, action: String, transport: Option<String>, diff: String) -> Result<Value, String> {
+    let c = mcp_clients::client(&id).ok_or_else(|| format!("unknown MCP client '{id}'"))?;
+    let plan = mcp_clients::plan(c, &mcp_clients::Env::current(), &mcp_server_spec(&state), mcp_action(&action, transport.as_deref())?)?;
+    if plan.diff != diff {
+        return Err(format!("{} changed since the preview; preview again", plan.path.display()));
+    }
+    let done = mcp_clients::apply(&plan)?;
+    Ok(json!({ "path": done.path.display().to_string(), "backup": done.backup.map(|b| b.display().to_string()) }))
+}
+
+/// `EchoDebug --mcp-stdio [port]`: MCP over stdin/stdout for clients that launch servers
+/// (bridged to the running app, or its own relay when the app is closed). No window opens.
+pub fn run_mcp_stdio(args: &[String]) -> i32 {
+    let port = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .or_else(|| std::env::var("ECHODEBUG_PORT").ok())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    match tauri::async_runtime::block_on(echo_debug_relay::serve_stdio(port, env!("CARGO_PKG_VERSION").to_string())) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("echodebug --mcp-stdio failed: {e}");
+            1
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -205,7 +296,10 @@ pub fn run() {
             read_binary_file,
             plugins::plugins_dir,
             plugins::list_plugins,
-            plugins::read_plugin_file
+            plugins::read_plugin_file,
+            mcp_clients,
+            mcp_client_preview,
+            mcp_client_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

@@ -56,6 +56,42 @@ export async function openUrl(url: string): Promise<void> {
   await open(url);
 }
 
+// ---- MCP client setup (desktop app: src-tauri/src/lib.rs → relay/src/mcp_clients.rs) ----
+
+export type McpTransport = "http" | "stdio";
+export type McpClientRow = {
+  id: string;
+  name: string;
+  path: string;
+  exists: boolean;
+  installed: boolean;
+  configured: McpTransport | "other" | null;
+  error: string | null;
+  transports: McpTransport[];
+  docs: string;
+  note: string;
+  snippets: Partial<Record<McpTransport, string>>;
+};
+export type McpClients = { clients: McpClientRow[]; stdio: { command: string; args: string[] } };
+export type McpPlan = { path: string; exists: boolean; deletes: boolean; changes: boolean; diff: string };
+export type McpApplied = { path: string; backup: string | null };
+
+/** Detected clients and what EchoDebug's entry would be; null outside the desktop app. */
+export async function mcpClients(): Promise<McpClients | null> {
+  if (!isTauri()) return null;
+  return invoke<McpClients>("mcp_clients");
+}
+
+/** The change one-click setup would make (nothing is written). */
+export async function mcpClientPreview(id: string, action: "install" | "uninstall", transport?: McpTransport): Promise<McpPlan> {
+  return invoke<McpPlan>("mcp_client_preview", { id, action, transport: transport ?? null });
+}
+
+/** Writes the previewed change (refused when the file no longer matches `diff`). */
+export async function mcpClientApply(id: string, action: "install" | "uninstall", transport: McpTransport | undefined, diff: string): Promise<McpApplied> {
+  return invoke<McpApplied>("mcp_client_apply", { id, action, transport: transport ?? null, diff });
+}
+
 /**
  * Picks a file and returns its bytes. In the desktop app the native picker is
  * used; in a browser the caller falls back to a file input.

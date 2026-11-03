@@ -257,6 +257,29 @@ button:disabled { opacity: 0.45; cursor: default; }
 .mcp-log-row { display: flex; gap: 8px; align-items: baseline; padding: 1px 4px; border-radius: var(--radius-sm); }
 .mcp-log-row[data-ok="false"] { color: var(--danger); }
 .mcp-log-row:hover { background: var(--bg-2); }
+.mcp-log-row > * { white-space: nowrap; }
+.mcp-card { background: color-mix(in srgb, var(--accent) 7%, var(--bg-1, transparent)); border-left: 2px solid var(--accent); }
+.mcp-steps { display: flex; flex-direction: column; gap: 4px; }
+.mcp-ok, .mcp-error { color: var(--success); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.mcp-error { color: var(--danger); }
+.mcp-ok svg, .mcp-error svg { vertical-align: -2px; }
+.mcp-client, .mcp-session { display: flex; flex-direction: column; gap: 2px; padding: 4px 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+.mcp-client[data-configured="true"] { border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft)); }
+.mcp-diff span[data-kind="add"] { color: var(--success); }
+.mcp-diff span[data-kind="del"] { color: var(--danger); }
+.mcp-diff span[data-kind="head"], .mcp-diff span[data-kind="hunk"] { color: var(--text-faint); }
+.mcp-snippets summary, .mcp-policy summary, .panel-section details > summary { cursor: pointer; }
+.mcp-snippet { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+.mcp-presets { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 6px; }
+.mcp-preset { display: flex; flex-direction: column; gap: 3px; padding: 6px 8px; text-align: left; font-size: 11.5px; color: var(--text); background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.mcp-preset:hover { border-color: var(--accent); }
+.mcp-preset[data-active="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg-2)); }
+.mcp-badge[data-kind="danger"] { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.mcp-badge[data-kind="warn"] { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.mcp-badge[data-kind="ok"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.mcp-form { display: grid; grid-template-columns: max-content 1fr; gap: 4px 8px; align-items: center; }
+.mcp-field { display: contents; font-size: 11.5px; }
+.mcp-tool[data-off="true"] .mono { color: var(--text-faint); text-decoration: line-through; text-decoration-color: var(--border); }
 
 /* --- modal ---------------------------------------------------------------- */
 .modal-scrim { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgb(0 0 0 / 55%); }

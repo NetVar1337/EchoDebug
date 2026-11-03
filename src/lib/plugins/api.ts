@@ -15,17 +15,10 @@ import { useUi } from "@/store/ui";
 import type { Manifest, Permission } from "./manifest";
 import { register, type AddressActionSpec, type AnalysisSpec, type CommandSpec, type ViewSpec } from "./registry";
 
-/** Verbs that write target memory directly (mirrors DESTRUCTIVE in src-tauri/relay/src/mcp.rs). */
-export const kRawWrites = new Set(["write", "freeze", "freeze_group", "ui_revert_patch"]);
-/** Verbs that change state (mirrors STATEFUL in mcp.rs, plus alerts). Need `write`. */
-export const kStateful = new Set([
-  "attach", "detach", "dump", "reopen_socket", "watch", "unwatch", "scan_new", "scan_next", "scan_clear",
-  "ui_load_symbols", "ui_guess_struct", "emu_start", "emu_step", "emu_run", "emu_set", "emu_break", "emu_close",
-  "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
-  "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove", "trace_record",
-]);
-/** Verbs that change names, comments and the struct catalog. Need `annotate`. */
-export const kAnnotate = new Set(["ui_set_name", "ui_set_comment", "ui_import_pdb_type"]);
+// Raw target writes (refused for every plugin), stateful verbs (need `write`) and annotation
+// verbs (need `annotate`): the lists mirror the MCP annotations in src-tauri/relay/src/mcp.rs.
+import { kAnnotate, kRawWrites, kStateful } from "@/lib/verbclass";
+export { kAnnotate, kRawWrites, kStateful };
 const kCatalog = new Set((tools as { verb: string }[]).map((t) => t.verb));
 
 export class PermissionError extends Error {
