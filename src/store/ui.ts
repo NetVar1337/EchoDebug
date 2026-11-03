@@ -6,7 +6,7 @@ export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"
-  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors" | "engines" | "lifter";
+  | "debugger" | "cfg" | "sigtools" | "yara" | "bindiff" | "unpack" | "decrypt" | "script" | "emudbg" | "hooks" | "monitors" | "engines" | "lifter" | "trace";
 export type Theme = "obsidian" | "nord" | "blood-orange";
 
 export const kTabs: { id: TabId; label: string }[] = [
@@ -22,6 +22,7 @@ export const kTabs: { id: TabId; label: string }[] = [
   { id: "pointers", label: "Pointers" },
   { id: "emulator", label: "Emulator" },
   { id: "emudbg", label: "Emu Debugger" },
+  { id: "trace", label: "Trace" },
   { id: "lifter", label: "Lifter" },
   { id: "graph", label: "Graph" },
   { id: "dotnet", label: ".NET" },
@@ -50,14 +51,14 @@ export const kViewGroups: Record<ViewGroup, { blurb: string; tabs: TabId[] }> = 
   Code: { blurb: "disassembly, graphs, references, signatures", tabs: ["disassembly", "cfg", "graph", "xrefs", "strings", "signatures", "sigtools", "yara"] },
   Memory: { blurb: "bytes, structures, pointers, snapshots, patches", tabs: ["memory", "structs", "pointers", "snapshots", "map", "patches"] },
   Binary: { blurb: "PE, .NET, RTTI, triage, unpacking, engines", tabs: ["pe", "dotnet", "rtti", "triage", "crypto", "caves", "antidebug", "hooks", "bindiff", "unpack", "decrypt", "engines"] },
-  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "emudbg", "lifter", "emulator", "monitors", "script"] },
+  Dynamic: { blurb: "debuggers, emulation, lifting, devirtualization", tabs: ["debugger", "emudbg", "trace", "lifter", "emulator", "monitors", "script"] },
 };
 export const kTabHints: Partial<Record<TabId, string>> = {
   disassembly: "functions and instructions", cfg: "control-flow graph of a function", graph: "call graph", xrefs: "who references an address",
   strings: "ASCII / UTF-16 strings of a module", signatures: "make and test byte patterns", sigtools: "signature catalog, health and repair", yara: "YARA rules over memory",
   memory: "hex view with find and edit", structs: "typed structure view", pointers: "pointer scanner and chains", snapshots: "diff memory over time", map: "module layout and entropy", patches: "every byte you changed, with undo",
   pe: "headers, sections, imports, exports, resources", dotnet: ".NET metadata and IL", rtti: "C++ classes and vtables", triage: "suspicious imports", crypto: "crypto constants", caves: "free space in code sections", antidebug: "anti-debugging tricks", hooks: "inline / IAT hooks and patched code", bindiff: "compare with an older build", unpack: "find the OEP, rebuild imports", decrypt: "run string decryptors in the emulator", engines: "Unreal / Unity IL2CPP / Source dumps",
-  debugger: "breakpoints on the live process", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", emulator: "run a routine once", monitors: "module loads, page changes", script: "automate with JavaScript",
+  debugger: "breakpoints on the live process", lifter: "lift, deobfuscate traces, devirtualize VMs", emudbg: "step code in an emulator", trace: "record and replay a run: time travel, last write, where a value came from", emulator: "run a routine once", monitors: "module loads, page changes", script: "automate with JavaScript",
 };
 export const kDefaultOpenTabs: TabId[] = ["disassembly", "memory", "structs", "strings", "pe", "xrefs", "emudbg", "script"];
 export type PanelId = "left" | "scanner" | "inspector" | "output";
