@@ -50,18 +50,32 @@ export type Candidate = { address: bigint };
 export function findNamePools(img: Uint8Array, base: bigint, ranges: { rva: number; size: number }[]): Candidate[] {
   const dv = le(img);
   const out: Candidate[] = [];
+  const isBlock = (p: bigint) => p > 0x10000n && p < 0x7fffffffffffn && (p & 1n) === 0n;
+  let left = 2 * img.length + 0x10000; // overlapping section ranges cannot multiply the scan
   for (const r of ranges) {
+    const start = Math.max(0, r.rva);
     const end = Math.min(img.length, r.rva + r.size) - 0x40;
-    for (let o = r.rva; o < end; o += 8) {
+    if (end - start > left) continue;
+    left -= Math.max(0, end - start);
+    // run.get(q): block-pointer-like qwords from q on (same 8-byte phase as the scan), filled from
+    // the back on first use; checking up to 8192 of them per offset was ~1000x the range size
+    const run = new Map<number, number>();
+    const runAt = (q: number): number => {
+      const hit = run.get(q);
+      if (hit !== undefined) return hit;
+      let k = q;
+      while (k + 8 <= img.length && !run.has(k) && isBlock(dv.getBigUint64(k, true))) k += 8;
+      let n = k + 8 <= img.length ? (run.get(k) ?? 0) : 0;
+      for (let j = k - 8; j >= q; j -= 8) run.set(j, ++n);
+      if (k === q) run.set(q, n);
+      return run.get(q)!;
+    };
+    for (let o = start; o < end; o += 8) {
       const cur = dv.getUint32(o + 8, true);
       const cursor = dv.getUint32(o + 12, true);
       if (cur > 8191 || cursor === 0 || cursor > 0x20000 || (cursor & 1)) continue;
       if (o + 16 + (cur + 2) * 8 > img.length) continue;
-      let ok = true;
-      for (let b = 0; b <= cur && ok; b++) {
-        const p = dv.getBigUint64(o + 16 + b * 8, true);
-        ok = p > 0x10000n && p < 0x7fffffffffffn && (p & 1n) === 0n;
-      }
+      const ok = runAt(o + 16) >= cur + 1;
       if (ok && dv.getBigUint64(o + 16 + (cur + 1) * 8, true) === 0n) out.push({ address: base + BigInt(o) });
     }
   }
@@ -72,9 +86,12 @@ export function findNamePools(img: Uint8Array, base: bigint, ranges: { rva: numb
 export function findObjectArrays(img: Uint8Array, base: bigint, ranges: { rva: number; size: number }[]): Candidate[] {
   const dv = le(img);
   const out: Candidate[] = [];
+  let left = 2 * img.length + 0x10000;
   for (const r of ranges) {
     const end = Math.min(img.length, r.rva + r.size) - 0x30;
-    for (let o = r.rva; o < end; o += 4) {
+    if (end - r.rva > left) continue;
+    left -= Math.max(0, end - r.rva);
+    for (let o = Math.max(0, r.rva); o < end; o += 4) {
       const objs = dv.getBigUint64(o + 0x10, true);
       if (objs < 0x10000n || objs > 0x7fffffffffffn || (objs & 7n)) continue;
       const max = dv.getInt32(o + 0x20, true);

@@ -43,6 +43,8 @@ const T = {
 } as const;
 
 const kTableCount = 45;
+/** Deepest chain of nested types followed when naming one. */
+const kMaxNesting = 64;
 
 /* ------------------------------------------------------------------ */
 /* column kinds & table schemas (ECMA-335 II.22)                      */
@@ -195,11 +197,42 @@ function sliceAt(dv: DataView, off: number, size: number): Uint8Array | null {
   return new Uint8Array(dv.buffer, dv.byteOffset + off, size);
 }
 
+/** Longest #Strings entry read; identifiers are far shorter, a heap without NULs is not. */
+const kMaxIdentifier = 4096;
+
 function readHeapString(heap: Uint8Array, idx: number): string {
   if (idx <= 0 || idx >= heap.length) return "";
   let end = idx;
-  while (end < heap.length && heap[end] !== 0) end++;
+  const stop = Math.min(heap.length, idx + kMaxIdentifier);
+  while (end < stop && heap[end] !== 0) end++;
   return decodeUtf8(heap.subarray(idx, end));
+}
+
+/**
+ * readHeapString with a cache: every row naming the same index (a hostile table points all of
+ * them at one unterminated run) decodes it once.
+ */
+function heapReader(heap: Uint8Array): (idx: number) => string {
+  const cache = new Map<number, string>();
+  return (idx) => {
+    let v = cache.get(idx);
+    if (v === undefined) {
+      v = readHeapString(heap, idx);
+      cache.set(idx, v);
+    }
+    return v;
+  };
+}
+
+/**
+ * The row ranges the *List columns of a table describe: entry i owns [start_i, start_i+1). The
+ * starts of valid metadata never decrease; hostile ones alternate (1, N, 1, N...) so every other
+ * type owned all N rows, which was quadratic in time and memory. Each start is clamped to the
+ * previous one, which leaves valid metadata unchanged and makes the ranges disjoint.
+ */
+function monotonicStarts(list: readonly number[]): number[] {
+  let prev = 0;
+  return list.map((v) => (prev = Math.max(prev, v)));
 }
 
 type Row = Record<string, number>;
@@ -366,7 +399,7 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
   const fieldRows = meta.rows.get(T.Field) ?? [];
   const memberRefs = meta.rows.get(T.MemberRef) ?? [];
 
-  const readStr = (idx: number) => readHeapString(meta.strings, idx);
+  const readStr = heapReader(meta.strings);
 
   // nested types: TypeDef row -> enclosing TypeDef row
   const enclosing = new Map<number, number>();
@@ -377,13 +410,17 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
   // per TypeDef row: namespace + name part ("Outer+Inner" for nested types)
   const parts = new Map<number, { ns: string; name: string }>();
   const visiting = new Set<number>();
+  // nesting chains are attacker-controlled and as long as the TypeDef table: bounded like
+  // openMetadata's typeDefName, so the recursion cannot overflow the stack
+  let nestDepth = 0;
   function typeParts(row1: number): { ns: string; name: string } {
     const cached = parts.get(row1);
     if (cached) return cached;
     const td = typeDefs[row1 - 1];
     if (!td) return { ns: "", name: "" };
-    if (visiting.has(row1)) return { ns: "", name: "" };
+    if (visiting.has(row1) || nestDepth > kMaxNesting) return { ns: "", name: "" };
     visiting.add(row1);
+    nestDepth++;
     const own = readStr(td.TypeName);
     let ns = readStr(td.TypeNamespace);
     let name = own;
@@ -394,6 +431,7 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
       if (!ns) ns = outer.ns; // nested types carry no namespace of their own
     }
     visiting.delete(row1);
+    nestDepth--;
     const res = { ns, name };
     parts.set(row1, res);
     return res;
@@ -412,13 +450,15 @@ function buildInfo(meta: Meta, cli: CliHeader, root: MetaRoot): DotnetInfo {
 
   // method / field row ranges per type (the *List columns are 1 based start
   // markers, a type owns every row up to the next type's marker)
-  const ranges = typeDefs.map((td, i) => {
-    const next = typeDefs[i + 1];
+  const mStarts = monotonicStarts(typeDefs.map((td) => td.MethodList ?? 0));
+  const fStarts = monotonicStarts(typeDefs.map((td) => td.FieldList ?? 0));
+  const ranges = typeDefs.map((_, i) => {
+    const next = i + 1 < typeDefs.length;
     return {
-      mStart: td.MethodList ?? 0,
-      mEnd: next ? (next.MethodList ?? 0) : methodRows.length + 1,
-      fStart: td.FieldList ?? 0,
-      fEnd: next ? (next.FieldList ?? 0) : fieldRows.length + 1,
+      mStart: mStarts[i],
+      mEnd: next ? mStarts[i + 1] : methodRows.length + 1,
+      fStart: fStarts[i],
+      fEnd: next ? fStarts[i + 1] : fieldRows.length + 1,
     };
   });
   const methodOwner = new Map<number, number>();
@@ -631,7 +671,7 @@ export function openMetadata(img: Uint8Array): DotnetMetadata | null {
   if (!o) return null;
   const { meta, us } = o;
   const rows = meta.rows;
-  const str = (i: number) => readHeapString(meta.strings, i);
+  const str = heapReader(meta.strings);
   const typeDefs = rows.get(T.TypeDef) ?? [];
   const typeRefs = rows.get(T.TypeRef) ?? [];
   const methodRows = rows.get(T.MethodDef) ?? [];
@@ -654,14 +694,25 @@ export function openMetadata(img: Uint8Array): DotnetMetadata | null {
     const ns = str(tr.TypeNamespace);
     return ns ? `${ns}.${str(tr.TypeName)}` : str(tr.TypeName);
   };
-  // owner TypeDef of a method / field row: the last TypeDef whose list starts at or before it
-  const owner = (row: number, col: "MethodList" | "FieldList"): number => {
-    let best = 0;
-    for (let i = 0; i < typeDefs.length; i++) if (typeDefs[i][col] && typeDefs[i][col] <= row) best = i + 1;
-    return best;
+  // owner TypeDef of each method / field row: the last TypeDef whose list starts at or before it.
+  // One sweep instead of a scan of every TypeDef per row (types x methods was quadratic, minutes
+  // on big assemblies): best[start] = the last TypeDef starting there, then a running maximum.
+  const owners = (count: number, col: "MethodList" | "FieldList"): number[] => {
+    const best = new Array<number>(count + 1).fill(0);
+    for (let i = 0; i < typeDefs.length; i++) {
+      const start = typeDefs[i][col];
+      if (start && start <= count) best[start] = i + 1;
+    }
+    const out: number[] = [];
+    let cur = 0;
+    for (let row = 1; row <= count; row++) {
+      cur = Math.max(cur, best[row]);
+      out.push(cur);
+    }
+    return out;
   };
-  const methodOwner = methodRows.map((_, i) => owner(i + 1, "MethodList"));
-  const fieldOwner = fieldRows.map((_, i) => owner(i + 1, "FieldList"));
+  const methodOwner = owners(methodRows.length, "MethodList");
+  const fieldOwner = owners(fieldRows.length, "FieldList");
 
   const coded = (kind: string, v: number) => splitCoded(kind, v);
   const typeName = (table: number, row: number): string =>

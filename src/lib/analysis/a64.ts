@@ -92,9 +92,13 @@ export function a64Refs(img: Uint8Array, ranges: readonly { rva: number; size: n
     seen.add(k);
     out.push({ fromRva, toRva, kind });
   };
+  let left = 2 * img.length + 0x10000; // overlapping section ranges cannot multiply the scan
   for (const r of ranges) {
-    const start = (r.rva + 3) & ~3;
+    // align up without 32-bit bit operations: `(rva + 3) & ~3` went negative for an RVA >= 2^31
+    const start = Math.max(0, r.rva + ((4 - (r.rva % 4)) % 4));
     const end = Math.min(img.length, r.rva + r.size);
+    if (end - start > left) continue;
+    left -= Math.max(0, end - start);
     // adrp register → { page, at, age }
     const pending = new Map<number, { page: number; at: number; age: number }>();
     for (let i = start; i + 4 <= end && out.length < limit; i += 4) {

@@ -46,6 +46,8 @@ pub mod unwind;
 pub mod windbg;
 #[cfg(windows)]
 pub mod win_threads;
+#[cfg(test)]
+mod fuzz;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);

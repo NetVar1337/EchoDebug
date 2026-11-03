@@ -21,6 +21,7 @@ cab = "0.6"
 ureq = "3"
 
 [dev-dependencies]
+proptest = "1"
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 

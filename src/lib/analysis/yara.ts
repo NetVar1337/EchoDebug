@@ -13,7 +13,7 @@
 export class YaraError extends Error {}
 
 type Mods = { nocase: boolean; wide: boolean; ascii: boolean; fullword: boolean; xor: [number, number] | null; private: boolean };
-type YString = { id: string; kind: "text" | "hex" | "regex"; source: string; mods: Mods; res: RegExp[] };
+type YString = { id: string; kind: "text" | "hex" | "regex"; source: string; mods: Mods; res: RegExp[]; chain?: Chain };
 type Expr =
   | { t: "bool"; v: boolean }
   | { t: "num"; v: number }
@@ -162,21 +162,35 @@ function textRes(s: string, m: Mods): RegExp[] {
   return out.map((b) => new RegExp(word(b), "gs"));
 }
 
-export function hexToRegex(hex: string): string {
+// Hex strings are parsed into a small tree first. They compile to one RegExp, except when a
+// top-level jump has a range ([2-40], [0-], [8-]): a lazy `[\s\S]{lo,hi}?` makes the regex
+// engine retry every jump length from every start, which is quadratic on bytes a target controls
+// (`{ 4D 5A [0-] 50 45 }` over a module full of "MZ" and no "PE" took 1.6 s per 128 KiB). Such
+// patterns are matched as a chain of fixed-length fragments instead (see `chainMatches`), with
+// the same results the regex would give.
+
+type HexNode = { t: "byte"; re: string } | { t: "jump"; lo: number; hi: number; range: boolean } | { t: "alt"; alts: HexNode[][] };
+
+/** Deepest ( … ) nesting a hex string may use, and the largest jump. */
+const kHexDepth = 32;
+const kMaxJump = 0x7fffffff;
+
+function parseHex(hex: string): HexNode[] {
   const src = hex.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, " ");
   let i = 0;
-  const parse = (): string => {
-    let out = "";
+  const parse = (depth: number): HexNode[] => {
+    if (depth > kHexDepth) throw new YaraError("hex string alternatives nested too deeply");
+    const out: HexNode[] = [];
     while (i < src.length) {
       const c = src[i];
       if (/\s/.test(c)) { i++; continue; }
       if (c === "(") {
         i++;
-        const alts = [parse()];
-        while (src[i] === "|") { i++; alts.push(parse()); }
+        const alts = [parse(depth + 1)];
+        while (src[i] === "|") { i++; alts.push(parse(depth + 1)); }
         if (src[i] !== ")") throw new YaraError("unbalanced ( in hex string");
         i++;
-        out += `(?:${alts.join("|")})`;
+        out.push({ t: "alt", alts });
         continue;
       }
       if (c === "|" || c === ")") return out;
@@ -187,34 +201,174 @@ export function hexToRegex(hex: string): string {
         i = e + 1;
         const m = /^(\d*)(-?)(\d*)$/.exec(body);
         if (!m) throw new YaraError(`bad jump [${body}]`);
-        if (!m[2]) out += `[\\s\\S]{${Number(m[1])}}`;
-        else out += `[\\s\\S]{${m[1] ? Number(m[1]) : 0},${m[3] ?? ""}}?`;
+        const lo = m[1] ? Number(m[1]) : 0;
+        const hi = !m[2] ? lo : m[3] ? Number(m[3]) : Infinity;
+        if (lo > kMaxJump || (hi !== Infinity && hi > kMaxJump) || hi < lo) throw new YaraError(`bad jump [${body}]`);
+        out.push({ t: "jump", lo, hi, range: Boolean(m[2]) });
         continue;
       }
       const pair = src.slice(i, i + 2);
       if (!/^[0-9a-fA-F?]{2}$/.test(pair)) throw new YaraError(`bad hex token '${pair}'`);
       i += 2;
-      if (pair === "??") out += "[\\s\\S]";
+      let re: string;
+      if (pair === "??") re = "[\\s\\S]";
       else if (pair[0] === "?") {
         const lo = parseInt(pair[1], 16);
-        out += `[${Array.from({ length: 16 }, (_, h) => byteRe((h << 4) | lo)).join("")}]`;
+        re = `[${Array.from({ length: 16 }, (_, h) => byteRe((h << 4) | lo)).join("")}]`;
       } else if (pair[1] === "?") {
         const hi = parseInt(pair[0], 16);
-        out += `[${byteRe(hi << 4)}-${byteRe((hi << 4) | 15)}]`;
-      } else out += byteRe(parseInt(pair, 16));
+        re = `[${byteRe(hi << 4)}-${byteRe((hi << 4) | 15)}]`;
+      } else re = byteRe(parseInt(pair, 16));
+      out.push({ t: "byte", re });
     }
     return out;
   };
-  const r = parse();
+  const r = parse(0);
   if (i < src.length) throw new YaraError("unexpected ) or | in hex string");
-  if (!r) throw new YaraError("empty hex string");
+  if (!r.length) throw new YaraError("empty hex string");
   return r;
 }
 
-function regexRes(body: string, flags: string, m: Mods): RegExp[] {
+const isRange = (n: HexNode): boolean => n.t === "jump" && n.range;
+
+function hexSource(nodes: readonly HexNode[]): string {
+  return nodes.map((n) => {
+    if (n.t === "byte") return n.re;
+    if (n.t === "alt") return `(?:${n.alts.map(hexSource).join("|")})`;
+    if (!n.range) return `[\\s\\S]{${n.lo}}`;
+    return `[\\s\\S]{${n.lo},${n.hi === Infinity ? "" : n.hi}}?`;
+  }).join("");
+}
+
+export function hexToRegex(hex: string): string {
+  return hexSource(parseHex(hex));
+}
+
+/** Byte length of a node sequence when every way of matching it has the same length, else null. */
+function fixedLength(nodes: readonly HexNode[]): number | null {
+  let n = 0;
+  for (const x of nodes) {
+    if (x.t === "byte") n++;
+    else if (x.t === "jump") {
+      if (x.range) return null;
+      n += x.lo;
+    } else {
+      const lens = x.alts.map(fixedLength);
+      if (lens.some((l) => l === null || l !== lens[0])) return null;
+      n += lens[0]!;
+    }
+  }
+  return n;
+}
+
+/** One fixed-length piece of a chained hex string and the jump range that precedes it. */
+type Fragment = { re: RegExp; len: number; lo: number; hi: number };
+type Chain = Fragment[];
+
+/** Splits a hex string at its top-level ranged jumps; null when the regex is safe or the pattern does not split cleanly. */
+function hexChain(nodes: readonly HexNode[]): Chain | null {
+  if (!nodes.some(isRange)) return null;
+  const chain: Chain = [];
+  let cur: HexNode[] = [];
+  let lo = 0;
+  let hi = 0;
+  const flush = () => {
+    const len = fixedLength(cur);
+    if (len === null || len === 0) return false;
+    chain.push({ re: compileRe(hexSource(cur), "gs", "hex string"), len, lo, hi });
+    cur = [];
+    lo = 0;
+    hi = 0;
+    return true;
+  };
+  for (const n of nodes) {
+    if (n.t === "jump" && n.range) {
+      if (!cur.length) return null; // a leading jump, or two in a row: leave it to the regex
+      if (!flush()) return null;
+      lo = n.lo;
+      hi = n.hi;
+    } else cur.push(n);
+  }
+  if (!cur.length || !flush()) return null;
+  return chain;
+}
+
+/**
+ * The matches of a chained hex string: for every start where fragment 0 matches and the rest of
+ * the chain completes, the match the lazy regex would report (the smallest jump at each step).
+ * Each later fragment keeps a forward cursor: the positions asked about only ever increase (they
+ * follow the starts, which increase), so every fragment occurrence is examined once per level and
+ * the whole scan is linear in the buffer, whatever the jump ranges.
+ */
+function chainMatches(chain: Chain, text: string, limit: number): { offset: number; length: number }[] {
+  type Level = { f: Fragment; cand: number; candEnd: number; asked: number };
+  const levels: Level[] = chain.map((f) => ({ f, cand: -2, candEnd: 0, asked: -1 }));
+  /** Smallest q >= x where level k matches and the chain after it completes (-1: none). */
+  const nextOk = (k: number, x: number): number => {
+    const L = levels[k];
+    if (L.asked >= 0 && x >= L.asked && (L.cand === -1 || L.cand >= x)) return L.cand;
+    L.asked = x;
+    const re = L.f.re;
+    for (let from = x; from <= text.length;) {
+      re.lastIndex = from;
+      const m = re.exec(text);
+      if (!m) break;
+      const q = m.index;
+      if (k + 1 === levels.length) {
+        L.cand = q;
+        L.candEnd = q + L.f.len;
+        return q;
+      }
+      const nf = levels[k + 1].f;
+      const y = q + L.f.len + nf.lo;
+      const r = nextOk(k + 1, y);
+      if (r < 0) break; // nothing completes after y, so nothing completes after any later q either
+      if (r - y <= nf.hi - nf.lo) {
+        L.cand = q;
+        L.candEnd = levels[k + 1].candEnd;
+        return q;
+      }
+      from = q + 1;
+    }
+    L.cand = -1;
+    return -1;
+  };
+  const out: { offset: number; length: number }[] = [];
+  const first = levels[0].f;
+  const second = levels[1].f;
+  first.re.lastIndex = 0;
+  for (let m = first.re.exec(text); m && out.length < limit; m = first.re.exec(text)) {
+    const p = m.index;
+    const y = p + first.len + second.lo;
+    const r = nextOk(1, y);
+    if (r < 0) break;
+    if (r - y <= second.hi - second.lo) out.push({ offset: p, length: levels[1].candEnd - p });
+    first.re.lastIndex = p + 1;
+  }
+  return out;
+}
+
+/** Test hook: the matches of one hex string with the chained matcher, or with the plain regex. */
+export function hexMatches(hex: string, buf: Uint8Array, engine: "auto" | "regex" = "auto", limit = 1000): { offset: number; length: number }[] {
+  const nodes = parseHex(hex);
+  const chain = engine === "auto" ? hexChain(nodes) : null;
+  const s: YString = { id: "$", kind: "hex", source: hex, mods: { nocase: false, wide: false, ascii: false, fullword: false, xor: null, private: false }, res: chain ? [] : [new RegExp(hexSource(nodes), "gs")], chain: chain ?? undefined };
+  return stringMatches(s, latin1(buf), limit);
+}
+
+/** A RegExp from rule text: a bad pattern is the rule's YaraError, not an engine SyntaxError. */
+function compileRe(src: string, flags: string, id: string): RegExp {
+  try {
+    return new RegExp(src, flags);
+  } catch (e) {
+    throw new YaraError(`${id}: ${(e as Error).message}`);
+  }
+}
+
+function regexRes(body: string, flags: string, m: Mods, id: string): RegExp[] {
   const f = "g" + (flags.includes("s") ? "s" : "") + (flags.includes("i") || m.nocase ? "i" : "");
-  const out = [new RegExp(m.fullword ? `(?<![A-Za-z0-9_])(?:${body})(?![A-Za-z0-9_])` : body, f)];
-  if (m.wide) out.push(new RegExp(body.replace(/(\\.|[^\\])/g, "$1\\x00"), f));
+  const out = [compileRe(m.fullword ? `(?<![A-Za-z0-9_])(?:${body})(?![A-Za-z0-9_])` : body, f, id)];
+  if (m.wide) out.push(compileRe(body.replace(/(\\.|[^\\])/g, "$1\\x00"), f, id));
   return m.wide && !m.ascii ? out.slice(1) : out;
 }
 
@@ -222,9 +376,26 @@ function regexRes(body: string, flags: string, m: Mods): RegExp[] {
 // Parser
 // ------------------------------------------------------------------------------------------------
 
+/** Deepest parenthesis / not / minus nesting while parsing, and deepest finished condition tree. */
+const kMaxNesting = 256;
+const kMaxExprDepth = 2000;
+
+/** Depth of an expression tree, without recursion. */
+function exprDepth(root: Expr): number {
+  let max = 0;
+  const stack: [Expr, number][] = [[root, 1]];
+  while (stack.length) {
+    const [e, d] = stack.pop()!;
+    if (d > max) max = d;
+    for (const v of Object.values(e)) if (v && typeof v === "object" && "t" in v) stack.push([v as Expr, d + 1]);
+  }
+  return max;
+}
+
 export function parseYara(src: string): YaraRule[] {
   const t = lex(src);
   let p = 0;
+  let nesting = 0;
   const peek = (o = 0) => t[p + o];
   const err = (m: string): never => { throw new YaraError(`line ${peek()?.line ?? t[t.length - 1]?.line ?? 0}: ${m}`); };
   const eat = (v?: string) => {
@@ -284,18 +455,25 @@ export function parseYara(src: string): YaraRule[] {
                 let b = a;
                 if (is("-")) { eat("-"); b = eat().n!; }
                 eat(")");
+                // a bad range would otherwise spin over millions of keys (xor(5-1000000))
+                if (!(Number.isInteger(a) && Number.isInteger(b) && a >= 0 && a <= b && b <= 255)) err(`bad xor range for ${id}: (${a}-${b})`);
                 mods.xor = [a, b];
               }
             } else (mods as Record<string, unknown>)[m] = true;
           }
           let res: RegExp[];
           let kind: YString["kind"];
+          let chain: Chain | null = null;
           if (body.k === "str") { kind = "text"; res = textRes(body.v, mods); }
-          else if (body.k === "hex") { kind = "hex"; res = [new RegExp(hexToRegex(body.v), "gs")]; }
-          else if (body.k === "re") { kind = "regex"; res = regexRes(body.v, reFlags, mods); }
+          else if (body.k === "hex") {
+            kind = "hex";
+            const nodes = parseHex(body.v);
+            chain = hexChain(nodes);
+            res = chain ? [] : [compileRe(hexSource(nodes), "gs", id)];
+          } else if (body.k === "re") { kind = "regex"; res = regexRes(body.v, reFlags, mods, id); }
           else return err(`bad string value for ${id}`);
           if (strings.some((s) => s.id === id) && id !== "$") err(`duplicate string ${id}`);
-          strings.push({ id, kind, source: body.v, mods, res });
+          strings.push({ id, kind, source: body.v, mods, res, ...(chain ? { chain } : {}) });
         }
       } else if (section === "condition") {
         condition = parseExpr();
@@ -307,7 +485,22 @@ export function parseYara(src: string): YaraRule[] {
   }
   return rules;
 
-  function parseExpr(): Expr { return parseOr(); }
+  // Nesting is bounded while parsing (parentheses, "not not …", "- - …") and the finished tree's
+  // depth is checked too (a chain of 10000 "and"s is 10000 deep), so neither the parser nor the
+  // evaluator can overflow the stack.
+  function nested<T>(f: () => T): T {
+    if (++nesting > kMaxNesting) err("condition nested too deeply");
+    try {
+      return f();
+    } finally {
+      nesting--;
+    }
+  }
+  function parseExpr(): Expr {
+    const e = nested(parseOr);
+    if (nesting === 0 && exprDepth(e) > kMaxExprDepth) err("condition nested too deeply");
+    return e;
+  }
   function parseOr(): Expr {
     let a = parseAnd();
     while (is("or")) { eat(); a = { t: "bin", op: "or", a, b: parseAnd() }; }
@@ -319,7 +512,7 @@ export function parseYara(src: string): YaraRule[] {
     return a;
   }
   function parseNot(): Expr {
-    if (is("not")) { eat(); return { t: "not", e: parseNot() }; }
+    if (is("not")) { eat(); return { t: "not", e: nested(parseNot) }; }
     return parseCmp();
   }
   function parseCmp(): Expr {
@@ -349,8 +542,8 @@ export function parseYara(src: string): YaraRule[] {
     return a;
   }
   function parseUnary(): Expr {
-    if (is("-")) { eat(); return { t: "neg", e: parseUnary() }; }
-    if (is("~")) { eat(); return { t: "bin", op: "^", a: parseUnary(), b: { t: "num", v: -1 } }; }
+    if (is("-")) { eat(); return { t: "neg", e: nested(parseUnary) }; }
+    if (is("~")) { eat(); return { t: "bin", op: "^", a: nested(parseUnary), b: { t: "num", v: -1 } }; }
     return parsePrimary();
   }
   function idList(): string[] {
@@ -426,6 +619,7 @@ export function latin1(buf: Uint8Array): string {
 }
 
 function stringMatches(s: YString, text: string, limit: number): { offset: number; length: number }[] {
+  if (s.chain) return chainMatches(s.chain, text, limit);
   const out: { offset: number; length: number }[] = [];
   const seen = new Set<number>();
   for (const re of s.res) {

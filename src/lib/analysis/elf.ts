@@ -106,6 +106,7 @@ export function elfFunctions(info: ElfInfo): { address: bigint; size: number; na
 
 export function parseElf(buf: Uint8Array): ElfInfo {
   if (!isElf(buf)) throw new ElfError("not an ELF file");
+  if (buf.length < 64) throw new ElfError("truncated ELF header");
   if (buf[4] !== 2) throw new ElfError("only ELF64 is supported");
   if (buf[5] !== 1) throw new ElfError("only little-endian ELF is supported");
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -115,6 +116,14 @@ export function parseElf(buf: Uint8Array): ElfInfo {
   const i64 = (o: number) => dv.getBigInt64(o, true);
   const n = (o: number) => Number(u64(o));
   const inside = (o: number, len: number) => o >= 0 && len >= 0 && o + len <= buf.length;
+  // symbol / reloc / dynamic names, decoded once per string-table offset: half a million symbols
+  // all naming one unterminated 4 KiB run would otherwise build 2 GB of strings
+  const nameCache = new Map<number, string>();
+  const name = (o: number) => {
+    let v = nameCache.get(o);
+    if (v === undefined) nameCache.set(o, (v = cstr(buf, o)));
+    return v;
+  };
 
   const type = u16(16);
   const machine = u16(18);
@@ -141,7 +150,7 @@ export function parseElf(buf: Uint8Array): ElfInfo {
     raw.push({ index: i, type: t, typeName: kSht[t] ?? `0x${t.toString(16)}`, flags: secFlags(u64(o + 8)), addr: u64(o + 16), offset: n(o + 24), size: n(o + 32), link: u32(o + 40), info: u32(o + 44), entsize: n(o + 56) });
   }
   const shstr = raw[header.shstrndx];
-  const sections: ElfSection[] = raw.map((s, i) => ({ ...s, name: shstr ? cstr(buf, shstr.offset + names[i]) : "" }));
+  const sections: ElfSection[] = raw.map((s, i) => ({ ...s, name: shstr ? name(shstr.offset + names[i]) : "" }));
   const byName = (nm: string) => sections.find((s) => s.name === nm);
 
   const symbols: ElfSymbol[] = [];
@@ -151,7 +160,7 @@ export function parseElf(buf: Uint8Array): ElfInfo {
     for (let o = s.offset + 24; o + 24 <= s.offset + s.size && symbols.length < 500_000; o += 24) {
       const info = buf[o + 4];
       symbols.push({
-        name: cstr(buf, strtab.offset + u32(o)), value: u64(o + 8), size: n(o + 16),
+        name: name(strtab.offset + u32(o)), value: u64(o + 8), size: n(o + 16),
         type: kStt[info & 0xf] ?? String(info & 0xf), bind: kStb[info >> 4] ?? String(info >> 4), section: u16(o + 6), dynamic: s.type === 11,
       });
     }
@@ -170,7 +179,7 @@ export function parseElf(buf: Uint8Array): ElfInfo {
       const value = u64(o + 8);
       if (tag === 0) break;
       const d: ElfDynamic = { tag, tagName: kDt[tag] ?? `0x${tag.toString(16)}`, value };
-      if ((tag === 1 || tag === 14 || tag === 15 || tag === 29) && dynstr) d.text = cstr(buf, dynstr.offset + Number(value));
+      if ((tag === 1 || tag === 14 || tag === 15 || tag === 29) && dynstr) d.text = name(dynstr.offset + Number(value));
       dynamic.push(d);
     }
   }
@@ -184,7 +193,7 @@ export function parseElf(buf: Uint8Array): ElfInfo {
       const info = u64(o + 8);
       const symIdx = Number(info >> 32n);
       let symbol = "";
-      if (symIdx && symtab && strtab && inside(symtab.offset + symIdx * 24, 24)) symbol = cstr(buf, strtab.offset + u32(symtab.offset + symIdx * 24));
+      if (symIdx && symtab && strtab && inside(symtab.offset + symIdx * 24, 24)) symbol = name(strtab.offset + u32(symtab.offset + symIdx * 24));
       relocs.push({ section: s.name, offset: u64(o), type: Number(info & 0xffffffffn), symbol, addend: i64(o + 16) });
     }
   }

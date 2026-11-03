@@ -5,7 +5,7 @@
 //      module (jmp rel32, jmp [rip], mov rax,imm64 + jmp rax, push imm32 + ret, int3);
 //   3. IAT hooks: import slots that point outside every loaded module (unbacked memory) or into
 //      a module other than the one they import from (forwarded APIs are reported as info).
-import type { PeInfo } from "./pe";
+import { scanBudget, type PeInfo } from "./pe";
 import { parseRelocs } from "./peextra";
 
 export type ModuleRange = { name: string; base: bigint; size: number };
@@ -67,8 +67,10 @@ function symbolAt(pe: PeInfo, rva: number): string {
 /** Differences between memory and the rebased file in executable sections, merged when ≤ 8 bytes apart. */
 export function diffCode(mem: Uint8Array, file: Uint8Array, pe: PeInfo, base: bigint, maxPatches = 2000): Patch[] {
   const out: Patch[] = [];
+  const take = scanBudget(Math.min(mem.length, file.length));
   for (const s of pe.sections.filter((x) => x.x)) {
     const end = Math.min(s.rva + Math.max(s.vsize, s.rawSize), mem.length, file.length);
+    if (!take(s.rva, end)) continue;
     let i = s.rva;
     while (i < end && out.length < maxPatches) {
       if (mem[i] === file[i]) { i++; continue; }

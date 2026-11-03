@@ -633,13 +633,15 @@ impl Trace {
         let nc = r.get()? as usize;
         let mut pc = 0u64;
         for _ in 0..nc {
-            pc += r.get()?;
+            pc = pc.wrapping_add(r.get()?);
             let l = r.take(1)?[0] as usize;
             b.t.code.insert(pc, r.take(l)?.to_vec());
         }
         let nk = r.get()? as usize;
         let mut kprev = [0u64; NREG];
-        let mut stored = Vec::with_capacity(nk);
+        // every keyframe takes at least NREG bytes of the file, so a count read from the file
+        // cannot size the allocation (2^63 was a capacity-overflow panic, in release too)
+        let mut stored = Vec::with_capacity(nk.min(r.b.len() / NREG));
         for _ in 0..nk {
             let mut k = [0u64; NREG];
             for (reg, v) in k.iter_mut().enumerate() {
@@ -852,7 +854,8 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.i + n > self.b.len() {
+        // `n` comes from the file: `i + n` must not overflow (it wrapped past this check in release)
+        if self.i.checked_add(n).is_none_or(|e| e > self.b.len()) {
             return Err("trace file truncated".into());
         }
         let s = &self.b[self.i..self.i + n];

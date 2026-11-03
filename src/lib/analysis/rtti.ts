@@ -7,7 +7,7 @@
 //   CompleteObjectLocator { signature, offset, cdOffset, pTypeDescriptor,
 //                           pClassDescriptor, pSelf }     (RTTI_TYPE_DESCRIPTOR)
 //   Vftable             { pVFTable, ... }                points at the COL
-import { parsePe, type PeInfo } from "./pe";
+import { parsePe, scanBudget, type PeInfo } from "./pe";
 
 export type RttiClass = {
   /** the mangled name, e.g. ".?AVPlayerController@@" */
@@ -57,10 +57,12 @@ export function demangleTypeName(mangled: string): string {
 function scanTypeDescriptors(img: Uint8Array, pe: PeInfo): { rva: number; name: string }[] {
   const out: { rva: number; name: string }[] = [];
   const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const take = scanBudget(img.length);
   for (const s of pe.sections) {
     if (!s.r || s.x) continue;
     const start = s.rva;
     const end = Math.min(img.length, s.rva + s.vsize);
+    if (!take(start, end)) continue;
     for (let i = start; i + 16 < end; i += 8) {
       // The name pointer is at +8 and points at the ".?A..." string.
       const namePtr = dv.getBigUint64(i + 8, true);
@@ -159,12 +161,41 @@ export function findVftables(img: Uint8Array, base: bigint, cls: RttiClass, pe?:
   const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
   const out: RttiClass["vftables"] = [];
   const want = BigInt(cls.rva);
-  const codeRanges = info.sections.filter((s) => s.x).map((s) => ({ start: base + BigInt(s.rva), end: base + BigInt(s.rva + s.vsize) }));
-  const inCode = (p: bigint) => codeRanges.some((r) => p >= r.start && p < r.end);
+  // executable ranges merged and sorted, so a pointer is classified with a binary search
+  const code: [bigint, bigint][] = [];
+  for (const r of info.sections.filter((s) => s.x).map((s) => [base + BigInt(s.rva), base + BigInt(s.rva + s.vsize)] as [bigint, bigint]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+    const last = code[code.length - 1];
+    if (last && r[0] <= last[1]) { if (r[1] > last[1]) last[1] = r[1]; } else code.push(r);
+  }
+  const inCode = (p: bigint) => {
+    let lo = 0, hi = code.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (p < code[mid][0]) hi = mid - 1;
+      else if (p >= code[mid][1]) lo = mid + 1;
+      else return true;
+    }
+    return false;
+  };
+  const isPtr = (p: bigint) => p >= 0x1000n && p <= 0x7fffffffffffn;
+  const take = scanBudget(img.length);
   for (const s of info.sections) {
     if (!s.r || s.x) continue;
     const start = s.rva;
     const end = Math.min(img.length, s.rva + s.vsize);
+    if (!take(start, end)) continue;
+    // run[k]: consecutive pointer-like qwords from start + 8k to the end of the section, computed
+    // once from the back; counting the slots of every candidate forward was quadratic when a
+    // hostile section repeats one locator pointer throughout
+    let run: Uint32Array | null = null;
+    const slotsAt = (i: number) => {
+      if (!run) {
+        const n = Math.max(0, Math.floor((end - start) / 8));
+        run = new Uint32Array(n + 1);
+        for (let k = n - 1; k >= 0; k--) run[k] = isPtr(dv.getBigUint64(start + k * 8, true)) ? run[k + 1] + 1 : 0;
+      }
+      return run[(i - start) / 8];
+    };
     for (let i = start; i + 16 <= end; i += 8) {
       const col = dv.getBigUint64(i, true);
       if (col < 0x1000n || col > 0x7fffffffffffn) continue;
@@ -178,12 +209,7 @@ export function findVftables(img: Uint8Array, base: bigint, cls: RttiClass, pe?:
       const first = dv.getBigUint64(i + 8, true);
       if (!inCode(first)) continue;
       // Count the slots: consecutive pointers into the module.
-      let slots = 0;
-      for (let k = i; k + 8 <= end; k += 8) {
-        const p = dv.getBigUint64(k, true);
-        if (p < 0x1000n || p > 0x7fffffffffffn) break;
-        slots++;
-      }
+      const slots = slotsAt(i);
       if (slots === 0) continue;
       out.push({ address: "0x" + (base + BigInt(i)).toString(16), rva: i, slots });
     }

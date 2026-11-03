@@ -10,6 +10,8 @@ export type SwitchLine = { address: string; length: number; text: string };
 export type JumpTable = { jumpAt: bigint; table: bigint; kind: "msvc-rva" | "relative" | "absolute"; count: number; targets: bigint[]; bounded: boolean };
 
 const kMaxCases = 1024;
+/** Largest case count taken from a `cmp` (the immediate is target-controlled: `cmp eax, -1`). */
+const kMaxBound = 1 << 16;
 
 /** AT&T → Intel for the operand forms the switch shapes use. Intel text passes through. */
 export function toIntel(text: string): string {
@@ -84,7 +86,7 @@ function caseCount(lines: readonly SwitchLine[], upto: number, idx: string): num
     const m = /^cmp\s+(\w+),\s*(0x[0-9a-f]+|\d+)$/.exec(t);
     if (!m || reg64(m[1]) !== idx) continue;
     const next = toIntel(lines[i + 1]?.text ?? "").toLowerCase();
-    const n = Number(num(m[2]));
+    const n = Math.min(Number(num(m[2])), kMaxBound - 1);
     if (/^ja\b|^jnbe\b/.test(next)) return n + 1;
     if (/^jae\b|^jnb\b|^jnc\b/.test(next)) return n;
     if (/^jbe\b|^jna\b/.test(next)) return n + 1;
