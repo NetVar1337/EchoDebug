@@ -31,6 +31,9 @@ pub mod lift;
 pub mod mcp;
 pub mod monitor;
 pub mod symbols;
+pub mod trace;
+pub mod trace_emu;
+pub mod trace_rec;
 
 pub const DEFAULT_PORT: u16 = 47110;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -316,6 +319,12 @@ impl Relay {
             // Lifting / deobfuscation / devirtualization over code read through any backend.
             "lift_block" | "lift_trace" | "devirt" => {
                 let mut v = self.lift_verb(&verb, &req).await;
+                v["id"] = orig;
+                return v;
+            }
+            // Time-travel traces: recorded from the emulator or ptrace, stored and queried here.
+            v if crate::trace_rec::VERBS.contains(&v) => {
+                let mut v = crate::trace_rec::handle(self, req).await;
                 v["id"] = orig;
                 return v;
             }
