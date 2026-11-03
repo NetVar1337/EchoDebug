@@ -1088,11 +1088,106 @@ mod imp {
                     };
                     self.run_temp(verb, temp, plan, req)
                 }
+                "dbg_hide" => failed("hiding the debugger is for the Win32 debugger: ptrace shows in /proc/<pid>/status (TracerPid), which a process cannot be kept from reading"),
+                // x64dbg's Trace into / Trace over with a break condition and log text
+                "dbg_trace_run" => {
+                    let o = match ext::parse_trace_opts(req) {
+                        Ok(o) => o,
+                        Err(e) => return bad(&e),
+                    };
+                    self.need_stopped();
+                    let tid = self.tid_arg(req);
+                    let pid = self.pid;
+                    let r = ext::trace_run(&mut Tracing { d: self, tid }, ABI, pid, tid as u64, &o);
+                    if let Some(other) = r.other.as_ref().filter(|v| v["event"] == "dbg_exit") {
+                        return json!({ "type": "dbg_trace_run_result", "success": true, "steps": r.steps, "reason": "exited", "logged": r.logged, "since": r.first_seq, "stop": other, "detached": true });
+                    }
+                    let ev = match r.other {
+                        Some(stop) => stop,
+                        None => self.stop_event(tid, "trace", json!({ "trace_reason": r.reason, "steps": r.steps, "logged": r.logged, "error": r.error })),
+                    };
+                    self.relay.emit(ev.clone());
+                    json!({ "type": "dbg_trace_run_result", "success": true, "tid": tid, "steps": r.steps, "reason": if ev["reason"] == "trace" { json!(r.reason) } else { ev["reason"].clone() },
+                        "error": r.error, "logged": r.logged, "since": r.first_seq, "address": ev["address"], "regs": ev["regs"], "stop": ev })
+                }
                 "dbg_detach" => {
                     self.detach();
                     json!({ "type": "dbg_detach_result", "success": true })
                 }
                 other => json!({ "type": "error", "code": 3000, "message": "unknown verb", "detail": other }),
+            }
+        }
+    }
+
+    /// One thread traced by `dbg_trace_run`: single steps (breakpoint bytes stepped over) and
+    /// silent runs to a temporary breakpoint for the calls it steps over.
+    struct Tracing<'a> {
+        d: &'a mut Dbg,
+        tid: i32,
+    }
+
+    impl ext::Tracer for Tracing<'_> {
+        fn t_regs(&mut self) -> Result<Gprs, String> {
+            gprs(self.tid).ok_or_else(|| format!("cannot read the registers of thread {}", self.tid))
+        }
+        fn t_read(&self, addr: u64, buf: &mut [u8]) -> usize {
+            self.d.read(addr, buf)
+        }
+        fn t_modules(&self) -> Vec<(String, u64, u64)> {
+            self.d.host_modules()
+        }
+        fn t_step(&mut self) -> Result<Option<Value>, String> {
+            let tid = self.tid;
+            match (Stepping { d: self.d, tid }).step_raw()? {
+                None => Ok(None),
+                Some(sig) => Ok(Some(self.d.stop_event(tid, "signal", json!({ "signal": sig })))),
+            }
+        }
+        fn t_run_to(&mut self, t: ext::Temp, ms: u64) -> Result<Option<Value>, String> {
+            core::check_code(&self.d.mem, t.addr).and_then(|()| self.d.plant(t.addr))?;
+            let at = t.addr;
+            with_mon(ABI, |m| m.breaks.temps.push(t));
+            self.d.resume_all()?;
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_millis(ms) {
+                match self.d.poll() {
+                    Err(()) => std::thread::sleep(Duration::from_micros(200)),
+                    Ok(None) => {}
+                    Ok(Some(ev)) if ev["event"] == "dbg_exit" => {
+                        self.d.relay.emit(ev.clone());
+                        self.d.exit_cleanup();
+                        return Ok(Some(ev));
+                    }
+                    // the call returned: carry on tracing without telling anyone
+                    Ok(Some(ev)) if ev["event"] == "dbg_stop" && ev["reason"] == "step_over" && ev["tid"] == self.tid && ev["address"] == hex_addr(at) => return Ok(None),
+                    Ok(Some(ev)) if ev["event"] == "dbg_stop" => return Ok(Some(ev)),
+                    Ok(Some(ev)) => self.d.relay.emit(ev),
+                }
+            }
+            self.d.need_stopped();
+            for a in with_mon(ABI, |m| m.breaks.take_temps()) {
+                self.d.unplant_if_unused(a);
+            }
+            Err(format!("the call at {} did not return within the time limit", hex_addr(rip(self.tid))))
+        }
+        fn t_user_bp(&self, addr: u64) -> bool {
+            self.d.user.contains(&addr)
+        }
+    }
+
+    impl Stepping<'_> {
+        /// One instruction; `Some(signal)` when a signal stopped the thread instead.
+        fn step_raw(&mut self) -> Result<Option<String>, String> {
+            use crate::trace_rec::Stepper;
+            match self.step() {
+                Ok(_) => {
+                    if let Some(Some(ev)) = self.d.take_trace_hit(self.tid) {
+                        self.d.relay.emit(ev);
+                    }
+                    Ok(None)
+                }
+                Err(e) if e.starts_with("signal ") => Ok(Some(e.trim_start_matches("signal ").to_owned())),
+                Err(e) => Err(e),
             }
         }
     }
@@ -1397,6 +1492,26 @@ mod imp {
             let s = over.expect("mid calls leaf");
             assert_eq!(s["stop"]["reason"], "step_over", "{s}");
             assert_eq!(addr(&s["stop"]["address"]), addr(&s["plan"]["target"]));
+
+            // Trace into until we are in leaf, logging each instruction
+            let tr = call(json!({ "type": "dbg_trace_run", "mode": "into", "condition": format!("rip == {leaf:x}"), "log": "{p:rip}", "max_steps": 5000 }));
+            assert_eq!(tr["reason"], "condition", "{tr}");
+            assert_eq!(addr(&tr["address"]), leaf);
+            assert!(tr["logged"].as_u64().unwrap() >= 4, "{tr}");
+            let lines = call(json!({ "type": "dbg_bp_log", "since": tr["since"] }));
+            let texts: Vec<String> = lines["entries"].as_array().unwrap().iter().map(|e| e["text"].as_str().unwrap().to_owned()).collect();
+            assert!(texts.iter().any(|t| u64::from_str_radix(t, 16).ok() == Some(mid)), "mid's first instruction was traced: {texts:?}");
+            // Trace over from there: it finishes leaf and mid, then main's `call mid` is run, never entered
+            let to = call(json!({ "type": "dbg_trace_run", "mode": "over", "log": "{p:rip}", "max_steps": 30 }));
+            assert_eq!(to["reason"], "max_steps", "{to}");
+            assert_eq!(to["steps"], 30);
+            let lines = call(json!({ "type": "dbg_bp_log", "since": to["since"] }));
+            let rips: Vec<u64> = lines["entries"].as_array().unwrap().iter().filter_map(|e| u64::from_str_radix(e["text"].as_str()?, 16).ok()).collect();
+            assert_eq!(rips.len(), 30, "one line per executed instruction: {lines}");
+            assert!(!rips.contains(&mid), "trace over entered mid from main: {rips:x?}");
+            let after_call = rips.windows(2).filter(|w| w[0] > mid + 0x10 && w[1] == w[0] + 5).count();
+            assert!(after_call >= 2, "each call mid went straight to its return address: {rips:x?}");
+            assert!(call(json!({ "type": "dbg_trace_run", "mode": "into", "condition": "((" }))["type"] == "error");
 
             // single-shot: breaks once, then it is gone
             call(json!({ "type": "dbg_break", "address": hex_addr(leaf), "once": true }));

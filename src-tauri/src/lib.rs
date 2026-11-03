@@ -125,6 +125,51 @@ fn write_binary_file(path: String, contents: Vec<u8>) -> Result<String, String> 
     Ok(p.display().to_string())
 }
 
+/// Streams a large binary file (full-memory dumps) in chunks: the body is the raw bytes (no JSON
+/// array), the target path and whether to start a new file come in the `x-path` / `x-truncate`
+/// headers (percent-encoded path).
+#[tauri::command]
+fn append_file_raw(request: tauri::ipc::Request<'_>) -> Result<u64, String> {
+    use std::io::Write;
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else { return Err("append_file_raw takes a raw byte body".into()) };
+    let header = |k: &str| request.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let path = header("x-path").ok_or("missing x-path")?;
+    let path = percent_decode(&path);
+    let p = PathBuf::from(&path);
+    if header("x-truncate").as_deref() == Some("1") {
+        if let Some(dir) = p.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(header("x-truncate").as_deref() != Some("1"))
+        .truncate(header("x-truncate").as_deref() == Some("1"))
+        .open(&p)
+        .map_err(|e| format!("open {}: {e}", p.display()))?;
+    f.write_all(bytes).map_err(|e| format!("write {}: {e}", p.display()))?;
+    f.metadata().map(|m| m.len()).map_err(|e| e.to_string())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Reads a session file the user picked.
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
@@ -291,6 +336,7 @@ pub fn run() {
             install_agent,
             scripts_dir,
             write_text_file,
+            append_file_raw,
             write_binary_file,
             read_text_file,
             read_binary_file,

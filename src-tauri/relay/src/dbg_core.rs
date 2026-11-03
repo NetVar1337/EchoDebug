@@ -993,7 +993,12 @@ pub fn handle(relay: &Relay, req: &Map<String, Value>, default_pid: Option<u32>,
         return failed("debug session ended");
     }
     // a trace recording (`dbg_record`, ptrace) single-steps for as long as its limits allow
-    let wait = if verb == "dbg_record" { Duration::from_secs(4 * 3600) } else { Duration::from_secs(20) };
+    let wait = match verb.as_str() {
+        "dbg_record" => Duration::from_secs(4 * 3600),
+        // a trace runs for at most its max_ms (capped)
+        "dbg_trace_run" => Duration::from_millis(crate::dbg_ext::TRACE_MAX_MS + 20_000),
+        _ => Duration::from_secs(20),
+    };
     let reply = rrx.recv_timeout(wait).unwrap_or_else(|_| failed("debugger did not answer"));
     if verb == "dbg_detach" || reply["detached"] == true {
         end_session();

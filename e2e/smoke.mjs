@@ -2,7 +2,7 @@
 // a compiled target process and Chromium. Run with `npm run test:e2e` (Linux; needs gcc, cargo and
 // the `playwright` package). Every step asserts on what the UI shows.
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -305,6 +305,39 @@ await step("YARA matches the greeting", async () => {
   await page.locator("textarea").fill('rule greeting { strings: $g = "hello from the EchoDebug" condition: $g }');
   await page.locator("button.primary", { hasText: /Scan/ }).last().click();
   await until(async () => (await page.locator(".accent.mono", { hasText: "greeting" }).count()) > 0);
+});
+
+await step("full target dump from memory: an ELF core gdb reads, a MINIDUMP the Open Dump tab lists", async () => {
+  await tab("Dump");
+  await page.locator(".dump-tab", { hasText: "Full target" }).click();
+  // the ELF core: gdb reads the counter at its runtime address out of it
+  await until(async () => (await page.locator(".dump-panel select").first().inputValue()) === "elf");
+  const [core] = await Promise.all([page.waitForEvent("download", { timeout: 120000 }), page.locator("button", { hasText: "Dump target" }).click()]);
+  const corePath = join(work, "target.core");
+  await core.saveAs(corePath);
+  expect(/Type:\s+CORE/.test(execFileSync("readelf", ["-h", corePath]).toString()), "readelf: not a core file");
+  const maps = readFileSync(`/proc/${target.p.pid}/maps`, "utf8").split("\n").find((l) => l.endsWith("e2e-target"));
+  const base = BigInt("0x" + maps.split("-")[0]);
+  const counterAt = "0x" + (base + BigInt(sym("counter"))).toString(16);
+  let out;
+  try {
+    out = execFileSync("gdb", ["-batch", "-nx", "-c", corePath, "-ex", `x/wd ${counterAt}`], { stdio: ["ignore", "pipe", "pipe"] }).toString();
+  } catch (e) {
+    throw new Error(e?.code === "ENOENT" ? "gdb is not installed: this step checks the ELF core with it (apt-get install gdb)" : String(e?.message ?? e));
+  }
+  const v = Number(/:\s+(-?\d+)/.exec(out)?.[1]);
+  expect(v >= 100, `gdb read counter = ${v} from the core: ${out.slice(-300)}`);
+  // the MINIDUMP: the relay's dump reader lists the target's modules from it
+  await page.locator(".dump-panel select").first().selectOption("minidump");
+  const [md] = await Promise.all([page.waitForEvent("download", { timeout: 120000 }), page.locator("button", { hasText: "Dump target" }).click()]);
+  const mdPath = join(work, "target.dmp");
+  await md.saveAs(mdPath);
+  await page.locator(".dump-tab", { hasText: "Open Dump" }).click();
+  await page.locator('input[placeholder="/path/to/memory.dmp"]').fill(mdPath);
+  await page.keyboard.press("Enter");
+  await page.locator(".dump-panel button", { hasText: /^Open/ }).first().click().catch(() => undefined);
+  await until(async () => (await page.locator(".dump-panel td", { hasText: "e2e-target" }).count()) > 0, 30000);
+  expect((await page.locator(".dump-panel", { hasText: "minidump" }).count()) > 0, "the dump is not reported as a minidump");
 });
 
 await step("heap explorer walks the target's malloc arena (view and MCP tools)", async () => {

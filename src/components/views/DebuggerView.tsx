@@ -43,12 +43,62 @@ export function describeStop(f: Frame, modules: Parameters<typeof symAddr>[1]): 
   if (f.event === "dbg_log") return `log ${symAddr(String(f.address), modules)} (thread ${f.tid}): ${f.text}`;
   const what = f.reason === "exception"
     ? `${f.first_chance === false ? "second-chance " : ""}exception ${f.code ?? ""} ${f.description ?? ""}`.replace(/\s+/g, " ").trim()
-    : `${String(f.reason).replace(/_/g, " ")}${f.signal ? ` ${f.signal}` : ""}${f.watch ? ` (DR${f.slot} ${f.watch})` : ""}${f.hits ? ` (hit ${f.hits})` : ""}`;
+    : `${String(f.reason).replace(/_/g, " ")}${f.reason === "trace" ? ` (${String(f.trace_reason ?? "").replace(/_/g, " ")}, ${f.steps} steps)` : ""}${f.signal ? ` ${f.signal}` : ""}${f.watch ? ` (DR${f.slot} ${f.watch})` : ""}${f.hits ? ` (hit ${f.hits})` : ""}`;
   const err = f.condition_error ? ` — condition failed: ${f.condition_error}` : "";
   return `${what} in thread ${f.tid} at ${symAddr(String(f.address), modules)}${err}`;
 }
 
 type Draft = { address: string; condition: string; log: string; log_condition: string; once: boolean };
+
+type TraceReply = { steps: number; reason: string; error?: string; logged: number; since: number; address?: string };
+
+/** x64dbg's Trace into / Trace over dialog: step until the break condition holds, logging each instruction. */
+function TracePanel({ tid, disabled, onDone }: { tid?: number; disabled: boolean; onDone: (summary: string, lines: Frame[]) => void }) {
+  const [mode, setMode] = useState<"into" | "over">("into");
+  const [condition, setCondition] = useState("");
+  const [logText, setLogText] = useState("{p:rip} {i:rip}");
+  const [logCond, setLogCond] = useState("");
+  const [maxSteps, setMaxSteps] = useState(50000);
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    setBusy(true);
+    try {
+      const r = await attempt("trace", request<TraceReply>("dbg_trace_run", { tid, mode, condition, log: logText, log_condition: logCond, max_steps: maxSteps, max_ms: 120000 }));
+      if (!r) return;
+      const lines = r.logged ? (await request<{ entries: Frame[] }>("dbg_bp_log", { since: r.since, limit: 10000 }, true).catch(() => ({ entries: [] }))).entries : [];
+      const why: Record<string, string> = { condition: "the break condition held", breakpoint: "reached a breakpoint", max_steps: "hit the step limit", time: "ran out of time", condition_error: "the break condition failed", error: "an error stopped it" };
+      onDone(`trace ${mode}: ${r.steps} instructions, ${why[r.reason] ?? r.reason}${r.error ? ` (${r.error})` : ""}${r.logged ? `, ${r.logged} logged` : ""}`, lines);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const field = (label: string, v: string, set: (v: string) => void, ph: string) => (
+    <label className="col" style={{ gap: 2 }}>
+      <span className="faint" style={{ fontSize: 11 }}>{label}</span>
+      <input className="input mono" value={v} placeholder={ph} spellCheck={false} onChange={(e) => set(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !disabled && !busy && void run()} />
+    </label>
+  );
+  return (
+    <div className="panel-section">
+      <div className="label">Trace (x64dbg Trace into / over)</div>
+      <div className="row">
+        <select className="select" value={mode} onChange={(e) => setMode(e.target.value as "into" | "over")}>
+          <option value="into">into (enter calls)</option>
+          <option value="over">over (run calls)</option>
+        </select>
+        <span className="faint" style={{ fontSize: 11 }}>max</span>
+        <input className="input mono" style={{ width: 80 }} value={maxSteps} onChange={(e) => setMaxSteps(Math.max(1, Number(e.target.value) || 1))} />
+      </div>
+      {field("Break condition (empty: run to the limit)", condition, setCondition, "e.g. rip == game.exe+1234 · rax == 0 · $tracecounter > .1000")}
+      {field("Log text (each instruction)", logText, setLogText, "{p:rip} {i:rip}")}
+      {field("Log condition (empty: every instruction)", logCond, setLogCond, "e.g. byte:[rip] == e8")}
+      <div className="row">
+        <button className="btn small primary" disabled={disabled || busy} onClick={() => void run()}>{busy ? "Tracing…" : "Trace"}</button>
+        <span className="faint" style={{ fontSize: 11 }}>stops at breakpoints too; the log holds the last 5,000 lines</span>
+      </div>
+    </div>
+  );
+}
 
 /** x64dbg's Edit breakpoint dialog, inline. */
 function BreakpointEditor({ draft, tid, onClose, onSaved }: { draft: Draft; tid?: number; onClose: () => void; onSaved: () => void }) {
@@ -305,6 +355,13 @@ export default function DebuggerView() {
               <IconButton tip="Execute till return (Ctrl+F9)" onClick={() => act("stepOut")} disabled={!stopped}><CornerRightUp size={14} /></IconButton>
               <IconButton tip="Detach debugger" onClick={() => void call("dbg_detach")}><Unplug size={14} /></IconButton>
               <span className="grow" />
+              {status.backend === "windows" && (
+                <button className="btn small" title="x64dbg's HideDebugger: clear PEB.BeingDebugged, NtGlobalFlag's debug-heap bits and the process heap's debug flags"
+                  onClick={async () => {
+                    const r = await attempt("hide", request<{ changed: { field: string }[] }>("dbg_hide"));
+                    if (r) log("info", "debugger", r.changed.length ? `hidden: ${r.changed.map((c) => c.field).join(", ")}` : "nothing to hide: the PEB already looks undebugged");
+                  }}>Hide</button>
+              )}
               <span className="faint" style={{ fontSize: 12 }}>{status.backend === "windows" ? "Win32" : "ptrace"} · {status.state} · pid {status.pid}{status.auto ? " · started by a monitor" : ""}</span>
             </div>
           )}
@@ -369,6 +426,12 @@ export default function DebuggerView() {
               </div>
             ))}
           </div>
+          {status.active && (
+            <TracePanel tid={status.focus} disabled={!stopped} onDone={(summary, lines) => {
+              setEvents((x) => [summary, ...lines.slice(-200).reverse().map((f) => `  ${symAddr(String(f.address), modules)}  ${f.text}`), ...x].slice(0, 400));
+              log("info", "debugger", summary);
+            }} />
+          )}
           {status.api_hooks ? (
             <div className="panel-section">
               <span>API monitor: {status.api_hooks} functions hooked · <span className="link" onClick={() => ui.setTab("apimon")}>open log</span></span>

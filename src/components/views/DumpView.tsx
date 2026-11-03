@@ -10,6 +10,7 @@ import { fmtAddr } from "@/lib/hex";
 import { request } from "@/lib/client";
 import { useConn } from "@/store/conn";
 import { log } from "@/store/output";
+import { DriversPanel, HiddenImagesPanel, ModuleDumpPanel, TargetDumpPanel } from "./dump/RuntimeDumps";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -26,7 +27,7 @@ function errText(e: unknown) {
   return e instanceof Error ? e.message : String(e);
 }
 
-type PanelName = "process" | "kdump" | "driver";
+type PanelName = "module" | "hidden" | "drivers" | "target" | "process" | "kdump" | "driver";
 
 // ---------------------------------------------------------------------------
 // Types from backend
@@ -97,7 +98,8 @@ function ProcessDumpPanel() {
   return (
     <div className="dump-panel">
       <p className="dump-blurb">
-        Write a full process dump to disk. On Windows this produces a MINIDUMP with full memory,
+        Write a full process dump with the operating system's own API (it opens the process, so unlike the
+        Full target tab the target can notice). On Windows this produces a MINIDUMP with full memory,
         thread info and handles (via <code>MiniDumpWriteDump</code>). On Linux it writes an
         EchoDebug raw-segment archive from <code>/proc/&lt;pid&gt;/mem</code>.
         The output can be opened with <b>Open Dump</b> below, WinDbg, or GDB.
@@ -395,14 +397,18 @@ function DriverInfoPanel() {
 // ---------------------------------------------------------------------------
 
 export default function DumpView() {
-  const [panel, setPanel] = useState<PanelName>("process");
+  const [panel, setPanel] = useState<PanelName>("module");
 
   return (
     <div className="dump-view">
       <div className="dump-tabs">
-        {(["process", "kdump", "driver"] as PanelName[]).map((p) => {
+        {(["module", "hidden", "drivers", "target", "process", "kdump", "driver"] as PanelName[]).map((p) => {
           const labels: Record<PanelName, string> = {
-            process: "Process Dump",
+            module: "Module",
+            hidden: "Hidden images",
+            drivers: "Drivers",
+            target: "Full target",
+            process: "Process (OS API)",
             kdump: "Open Dump",
             driver: "Driver Info",
           };
@@ -418,6 +424,10 @@ export default function DumpView() {
         })}
       </div>
       <div className="dump-body">
+        {panel === "module" && <ModuleDumpPanel />}
+        {panel === "hidden" && <HiddenImagesPanel />}
+        {panel === "drivers" && <DriversPanel />}
+        {panel === "target" && <TargetDumpPanel />}
         {panel === "process" && <ProcessDumpPanel />}
         {panel === "kdump" && <KdumpPanel />}
         {panel === "driver" && <DriverInfoPanel />}

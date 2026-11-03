@@ -11,11 +11,11 @@ export const kStateful = new Set([
   "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
   "ptr_save", "cancel", "agent_config", "alert_add", "alert_remove", "trace_record",
   // dump tools: write files to disk
-  "dump_process_full", "kdump_extract",
+  "dump_process_full", "kdump_extract", "ui_dump_module", "ui_dump_target", "ui_dump_all",
   // the native debuggers: attaching, int3s and debug registers, the access finder, the API monitor
   "dbg_attach", "dbg_detach", "dbg_break", "dbg_hwbreak", "dbg_continue", "dbg_step", "dbg_pause", "dbg_set_regs",
   "dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear",
-  "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_bp_log_clear",
+  "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_trace_run", "dbg_hide", "dbg_bp_log_clear",
 ]);
 /** Verbs that change names, comments and the struct catalog. */
 export const kAnnotate = new Set(["ui_set_name", "ui_set_comment", "ui_import_pdb_type"]);
@@ -28,10 +28,10 @@ export function isReadOnlyVerb(verb: string): boolean {
 /** Stateful debugger verbs gated like writes (GATED in mcp.rs): int3s, debug registers, execution. */
 export const kGatedDebugger = new Set([
   "dbg_attach", "dbg_break", "dbg_hwbreak", "dbg_set_regs", "dbg_step", "dbg_continue", "dbg_trace_start", "dbg_api_start",
-  "dbg_step_over", "dbg_step_out", "dbg_run_to",
+  "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_trace_run", "dbg_hide",
 ]);
 
 /** What the "ask" and "readonly" policies gate (mcp.rs `is_gated`). */
 export function isGatedVerb(verb: string): boolean {
-  return kRawWrites.has(verb) || verb === "dump" || verb === "dump_process_full" || verb === "trace_record" || kGatedDebugger.has(verb);
+  return kRawWrites.has(verb) || verb === "dump" || verb === "dump_process_full" || verb === "ui_dump_module" || verb === "ui_dump_target" || verb === "ui_dump_all" || verb === "trace_record" || kGatedDebugger.has(verb);
 }
