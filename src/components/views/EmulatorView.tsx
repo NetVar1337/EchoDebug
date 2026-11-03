@@ -26,9 +26,21 @@ type EmuResult = {
   faults?: { address: string; rip: string }[];
   fault_count?: number;
   xmm?: Record<string, string>;
+  /** Windows agent: ymm0..ymm15 where the emulated CPU exposes them */
+  ymm?: Record<string, string>;
+  /** Windows agent: everything mapped in the emulator after the run */
+  regions?: { address: string; end: string; perms: string }[];
+  regions_truncated?: boolean;
 };
 
 const kRegs = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"];
+
+/** Register values known at each reg_trace step: everything changed so far, and what changed right here. */
+function stepState(t: NonNullable<EmuResult["reg_trace"]>, i: number): { known: Record<string, string>; changed: Set<string> } {
+  const known: Record<string, string> = {};
+  for (let k = 0; k <= i; k++) Object.assign(known, t[k].changes ?? {});
+  return { known, changed: new Set(Object.keys(t[i].changes ?? {})) };
+}
 
 /** A scratch buffer the emulator writes into, so a routine can be fed input. */
 type Blob = { address: string; size: number; input: string; output: string };
@@ -47,6 +59,7 @@ export default function EmulatorView() {
   const [layers, setLayers] = useState(false);
   const [zero, setZero] = useState(false);
   const [regTrace, setRegTrace] = useState(false);
+  const [step, setStep] = useState(0);
   const [res, setRes] = useState<EmuResult | null>(null);
   const [busy, setBusy] = useState(false);
   // Oracle mode: a buffer that is written before the run and read back after it.
@@ -96,6 +109,7 @@ export default function EmulatorView() {
     setBusy(false);
     if (out) {
       setRes(out);
+      setStep(0);
       if (out.mem?.length) {
         setBlobs(out.mem.map((m) => ({ address: m.address, size: m.size, input: bufInput.replace(/[^0-9a-f]/gi, ""), output: m.data })));
       }
@@ -176,6 +190,41 @@ export default function EmulatorView() {
                 <div className={res.error === 0 ? "ok" : "warn"}>{res.error_name} · {res.instructions} instructions{res.error ? ` · fault ${res.fault_address}` : ""}</div>
               </div>
               <div className="kv">{kRegs.filter((r) => res.regs[r]).flatMap((r) => [<span key={r + "k"}>{r}</span>, <span key={r} className="link" onClick={() => ui.select(res.regs[r])}>{res.regs[r]}</span>])}</div>
+              {res.reg_trace && res.reg_trace.length > 0 && (() => {
+                const t = res.reg_trace;
+                const n = t.length;
+                const i = Math.min(step, n - 1);
+                const { known, changed } = stepState(t, i);
+                return (
+                  <div className="panel-section">
+                    <div className="label">Steps ({n}) · registers changed so far when this instruction is reached; the ones the previous instruction changed are highlighted</div>
+                    <div className="row">
+                      <button className="btn" disabled={i === 0} onClick={() => setStep(i - 1)}>‹</button>
+                      <input type="range" className="grow" min={0} max={n - 1} value={i} onChange={(e) => setStep(Number(e.target.value))} />
+                      <button className="btn" disabled={i === n - 1} onClick={() => setStep(i + 1)}>›</button>
+                      <span className="mono" style={{ minWidth: 70, textAlign: "right" }}>{i + 1}/{n}</span>
+                    </div>
+                    <div className="row mono">rip <span className="link" onClick={() => ui.goDisasm(t[i].rip)}>{labelAddr(t[i].rip, modules)}</span></div>
+                    <div className="kv">{kRegs.filter((r) => known[r]).flatMap((r) => [
+                      <span key={r + "k"}>{r}</span>,
+                      <span key={r} className={changed.has(r) ? "warn" : undefined}>{known[r]}</span>,
+                    ])}</div>
+                  </div>
+                );
+              })()}
+              {res.regions && res.regions.length > 0 && (
+                <table className="table mono">
+                  <colgroup><col /><col /><col style={{ width: 48 }} /></colgroup>
+                  <thead><tr><th>Mapped regions ({res.regions.length}{res.regions_truncated ? ", truncated" : ""})</th><th>End</th><th /></tr></thead>
+                  <tbody>{res.regions.map((m) => (
+                    <tr key={m.address}>
+                      <td className="link" onClick={() => ui.select(m.address)}>{labelAddr(m.address, modules)}</td>
+                      <td>{m.end}</td>
+                      <td className={m.perms.includes("x") ? "warn" : "dim"}>{m.perms}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              )}
               {blobs.length > 0 && (
                 <div className="panel-section">
                   <div className="label">Oracle buffer</div>
@@ -226,6 +275,9 @@ export default function EmulatorView() {
               )}
               {res.xmm && Object.values(res.xmm).some((v) => /[1-9a-f]/.test(v)) && (
                 <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.xmm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k}>{v}</span>])}</div>
+              )}
+              {res.ymm && Object.values(res.ymm).some((v) => /[1-9a-f]/.test(v)) && (
+                <div className="kv mono" style={{ fontSize: 12 }}>{Object.entries(res.ymm).filter(([, v]) => /[1-9a-f]/.test(v)).flatMap(([k, v]) => [<span key={k + "k"}>{k}</span>, <span key={k} title={v}>{v}</span>])}</div>
               )}
               {res.trace.length > 0 && (
                 <table className="table mono">
