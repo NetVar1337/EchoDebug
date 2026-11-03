@@ -425,3 +425,25 @@ html[data-motion="off"] *::after {
 .ctx-menu button:hover { background: var(--selection); }
 .search-dialog { width: min(760px, calc(100vw - 40px)); }
 .search-foot { display: flex; align-items: center; gap: 10px; padding: 6px 10px; font-size: 11.5px; border-top: 1px solid var(--border-soft); }
+
+/* assistant */
+.assistant .panel-head select { max-width: 120px; }
+.as-disclosure { font-size: 11.5px; color: var(--text-faint); border-bottom: 1px solid var(--border-soft); }
+.as-transcript { display: flex; flex-direction: column; gap: 6px; padding: 6px var(--pad-md); }
+.as-msg { padding: 6px 8px; border-radius: var(--radius-md); font-size: var(--type-small); line-height: 1.45; }
+.as-user { background: color-mix(in srgb, var(--accent) 12%, var(--bg-2)); align-self: flex-end; max-width: 92%; }
+.as-bot { background: var(--bg-2); }
+.as-text { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.as-text code { padding: 0 3px; background: var(--bg-0); border-radius: 3px; font-size: 12px; }
+.as-pre { margin: 4px 0 0; max-height: 260px; overflow: auto; padding: 6px; font-family: var(--font-mono); font-size: 11.5px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg-0); border-radius: var(--radius-sm); user-select: text; }
+.as-meta { margin-top: 4px; font-size: 10.5px; }
+.as-note { font-size: 11.5px; padding: 0 4px; }
+.as-tool { font-size: 11.5px; padding: 3px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+.as-tool summary { cursor: pointer; display: flex; align-items: center; gap: 5px; white-space: nowrap; overflow: hidden; }
+.as-tool summary .faint { overflow: hidden; text-overflow: ellipsis; }
+.as-think summary { cursor: pointer; font-size: 11px; }
+.as-review { max-height: 40%; overflow: auto; border-bottom: 1px solid var(--border-soft); }
+.as-sugg { padding: 3px 0; border-bottom: 1px solid var(--border-soft); }
+.as-reason { font-size: 11px; padding-left: 4px; }
+.as-input { display: flex; gap: 6px; align-items: flex-end; border-top: 1px solid var(--border-soft); }
+.as-input textarea { flex: 1; resize: vertical; min-height: 44px; height: auto; padding: 4px 6px; font-family: var(--font-ui); }

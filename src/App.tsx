@@ -43,6 +43,7 @@ const kLeft = {
   watch: lazy(() => import("@/components/panels/WatchPanel")),
   names: lazy(() => import("@/components/panels/NamesPanel")),
   mcp: lazy(() => import("@/components/panels/McpPanel")),
+  assistant: lazy(() => import("@/components/panels/AssistantPanel")),
 };
 const SettingsModal = lazy(() => import("@/components/SettingsModal"));
 

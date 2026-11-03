@@ -2,7 +2,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-export type RailView = "targets" | "modules" | "watch" | "names" | "mcp";
+export type RailView = "targets" | "modules" | "watch" | "names" | "mcp" | "assistant";
 export type TabId =
   | "disassembly" | "memory" | "structs" | "strings" | "pe" | "signatures" | "pointers" | "emulator"
   | "graph" | "dotnet" | "crypto" | "caves" | "snapshots" | "map" | "patches" | "triage" | "rtti" | "xrefs" | "antidebug"

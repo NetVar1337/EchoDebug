@@ -19,6 +19,13 @@ async function pickJson(): Promise<unknown> {
   return f ? JSON.parse(await f.text()) : null;
 }
 
+/** Opens the assistant panel and runs one of its actions (the store loads on first use). */
+function assistant(run: (a: AssistantActions) => Promise<void>): void {
+  useUi.getState().setRail("assistant");
+  void import("@/store/assistant").then((m) => run(m.useAssistant.getState()));
+}
+type AssistantActions = { explainFunction: () => Promise<void>; suggestNames: () => Promise<void>; suggestFields: () => Promise<void>; summariseModule: () => Promise<void> };
+
 type Cmd = { id: string; label: string; group: string; hint?: string; run: () => void };
 
 const kThemes: [Theme, string][] = [["obsidian", "Obsidian"], ["nord", "Nord"], ["blood-orange", "Blood Orange"]];
@@ -90,6 +97,11 @@ export default function CommandPalette() {
       { id: "watch", label: "Open watchlist", group: "Target", run: () => ui.setRail("watch") },
       { id: "names", label: "Open names & comments", group: "Target", run: () => ui.setRail("names") },
       { id: "mcp", label: "Open MCP server panel", group: "Target", run: () => ui.setRail("mcp") },
+      { id: "assistant", label: "Open assistant (Claude)", group: "Assistant", run: () => ui.setRail("assistant") },
+      { id: "as-explain", label: "Assistant: explain function at cursor", group: "Assistant", run: () => assistant((a) => a.explainFunction()) },
+      { id: "as-names", label: "Assistant: suggest names for function at cursor", group: "Assistant", run: () => assistant((a) => a.suggestNames()) },
+      { id: "as-struct", label: "Assistant: suggest struct fields", group: "Assistant", run: () => assistant((a) => a.suggestFields()) },
+      { id: "as-module", label: "Assistant: summarise module", group: "Assistant", run: () => assistant((a) => a.summariseModule()) },
       { id: "export", label: "Export session to file", group: "Session", run: () => ui.set({ sessionExportOpen: true }) },
       { id: "undo", label: "Undo last name / comment / type edit", group: "Session", hint: "Ctrl+Z", run: () => log("info", "edit", `undo: ${undo() ?? "nothing"}`) },
       { id: "redo", label: "Redo", group: "Session", hint: "Ctrl+Y", run: () => log("info", "edit", `redo: ${redo() ?? "nothing"}`) },
