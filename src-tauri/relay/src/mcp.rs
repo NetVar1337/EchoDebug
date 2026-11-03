@@ -15,18 +15,18 @@ const STATEFUL: &[&str] = &[
     "module_monitor", "page_monitor", "emu_watch", "emu_snapshot", "emu_restore", "mem_snapshot",
     "ptr_save", "cancel", "agent_config", "ui_set_name", "ui_set_comment", "trace_record",
     // Process / kernel dump tools: write files to disk.
-    "dump_process_full", "kdump_extract",
+    "dump_process_full", "kdump_extract", "ui_dump_module", "ui_dump_target",
     // the native debuggers (ptrace / Win32): execution control, the access finder, the API monitor
     "dbg_attach", "dbg_detach", "dbg_break", "dbg_hwbreak", "dbg_continue", "dbg_step", "dbg_pause", "dbg_set_regs",
     "dbg_trace_start", "dbg_trace_stop", "dbg_api_start", "dbg_api_stop", "dbg_api_clear",
-    "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_bp_log_clear",
+    "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_trace_run", "dbg_hide", "dbg_bp_log_clear",
 ];
 /// Stateful verbs the ask / read-only policies gate like `write`: they plant int3s in the target
 /// (`dbg_break`, `dbg_api_start`) or change how it executes (attaching a debugger, debug
 /// registers, registers, stepping).
 const GATED: &[&str] = &[
     "dbg_attach", "dbg_break", "dbg_hwbreak", "dbg_set_regs", "dbg_step", "dbg_continue", "dbg_trace_start", "dbg_api_start",
-    "dbg_step_over", "dbg_step_out", "dbg_run_to",
+    "dbg_step_over", "dbg_step_out", "dbg_run_to", "dbg_trace_run", "dbg_hide",
 ];
 
 /// MCP 2025-06-18 tool annotations, derived from the verb.
@@ -52,7 +52,7 @@ pub fn is_read_only(verb: &str) -> bool {
 /// recording (its ptrace source runs the real thread). Attach, scans and the emulator change only
 /// EchoDebug's own state.
 pub fn is_gated(verb: &str) -> bool {
-    DESTRUCTIVE.contains(&verb) || verb == "dump" || verb == "dump_process_full" || GATED.contains(&verb) || verb == "trace_record"
+    DESTRUCTIVE.contains(&verb) || matches!(verb, "dump" | "dump_process_full" | "ui_dump_module" | "ui_dump_target") || GATED.contains(&verb) || verb == "trace_record"
 }
 
 /// What MCP clients may call. Set by the app (Settings → MCP), kept in memory by the relay.

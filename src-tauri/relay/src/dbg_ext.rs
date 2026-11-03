@@ -490,7 +490,8 @@ fn ident(w: &str, ctx: &Ctx) -> Result<u64, String> {
         return Ok(v);
     }
     match lw.as_str() {
-        "$hits" | "$breakpointcounter" | "$hitcount" => return Ok(ctx.hits),
+        // in a trace (dbg_trace_run) the counter is the number of instructions traced so far
+        "$hits" | "$breakpointcounter" | "$hitcount" | "$tracecounter" | "$steps" => return Ok(ctx.hits),
         "$tid" => return Ok(ctx.tid),
         "$pid" => return Ok(ctx.pid as u64),
         "$ip" => return Ok(ctx.regs.rip),
@@ -837,6 +838,21 @@ impl Breaks {
         json!({ "entries": entries, "next": next, "total": self.next })
     }
 
+    /// Adds a log line that does not come from a breakpoint (a trace); returns its event.
+    pub fn push_log(&mut self, tid: u64, addr: u64, hits: u64, text: String, source: &str) -> Value {
+        self.next += 1;
+        let ev = json!({ "type": "event", "event": "dbg_log", "seq": self.next, "t": now_ms(), "tid": tid, "address": hex(addr), "hits": hits, "text": text, "source": source });
+        self.log.push_back(ev.clone());
+        while self.log.len() > LOG_KEEP {
+            self.log.pop_front();
+        }
+        ev
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.next
+    }
+
     pub fn clear_log(&mut self) {
         self.log.clear();
     }
@@ -863,6 +879,172 @@ pub fn parse_opts(req: &Map<String, Value>, old: Option<&BpOpts>) -> Result<Opti
         o.hits = old.map(|o| o.hits).unwrap_or(0);
     }
     Ok(Some(o))
+}
+
+// ---- conditional tracing (x64dbg's Trace into / Trace over) -------------------------------------
+
+/// Parsed `dbg_trace_run` options.
+pub struct TraceOpts {
+    pub over: bool,
+    pub cond: Option<Compiled>,
+    pub log: Option<Format>,
+    pub log_cond: Option<Compiled>,
+    pub max_steps: u64,
+    pub max_ms: u64,
+}
+
+pub const TRACE_MAX_MS: u64 = 600_000;
+
+pub fn parse_trace_opts(req: &Map<String, Value>) -> Result<TraceOpts, String> {
+    let text = |k: &str| req.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let expr = |k: &str, what: &str| text(k).map(|s| parse(s).map_err(|e| format!("{what}: {e}"))).transpose();
+    let mode = req.get("mode").and_then(Value::as_str).unwrap_or("into");
+    if !matches!(mode, "into" | "over") {
+        return Err("mode must be 'into' or 'over'".into());
+    }
+    Ok(TraceOpts {
+        over: mode == "over",
+        cond: expr("condition", "break condition")?,
+        log: req.get("log").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|s| parse_format(s).map_err(|e| format!("log text: {e}"))).transpose()?,
+        log_cond: expr("log_condition", "log condition")?,
+        max_steps: req.get("max_steps").and_then(Value::as_u64).unwrap_or(50_000).clamp(1, 10_000_000),
+        max_ms: req.get("max_ms").and_then(Value::as_u64).unwrap_or(10_000).clamp(10, TRACE_MAX_MS),
+    })
+}
+
+/// What a backend does for a trace: one thread, single-stepped or run to the next instruction.
+pub trait Tracer {
+    fn t_regs(&mut self) -> Result<Gprs, String>;
+    fn t_read(&self, addr: u64, buf: &mut [u8]) -> usize;
+    fn t_modules(&self) -> Vec<(String, u64, u64)>;
+    /// Executes one instruction. `Some(stop)` when something else stopped the thread (a signal,
+    /// an exception): the trace ends there.
+    fn t_step(&mut self) -> Result<Option<Value>, String>;
+    /// Runs to a temporary breakpoint (step over a call). `None`: reached it; `Some(stop)`:
+    /// stopped elsewhere first (a breakpoint inside the call, an exception, the time ran out).
+    fn t_run_to(&mut self, t: Temp, ms: u64) -> Result<Option<Value>, String>;
+    fn t_user_bp(&self, addr: u64) -> bool;
+}
+
+pub struct TraceResult {
+    pub steps: u64,
+    pub reason: String,
+    pub logged: u64,
+    pub first_seq: u64,
+    /// a stop that ended the trace and must be reported as it is (not as a trace stop)
+    pub other: Option<Value>,
+    pub error: Option<String>,
+}
+
+/// Steps the thread until the break condition holds (checked at every instruction reached after
+/// the first), a user breakpoint is reached, `max_steps` / `max_ms` run out, or something else
+/// stops it. Every instruction about to execute is logged when the log text is set and the log
+/// condition holds; the lines go to the breakpoint log (`dbg_bp_log`), not out as events (a trace
+/// would flood the clients).
+pub fn trace_run(t: &mut impl Tracer, abi: Abi, pid: u32, tid: u64, o: &TraceOpts) -> TraceResult {
+    let t0 = std::time::Instant::now();
+    let modules = t.t_modules();
+    let mut steps = 0u64;
+    let mut logged = 0u64;
+    let first_seq = crate::dbg_core::with_mon(abi, |m| m.breaks.next_seq());
+    let done = |steps: u64, logged: u64, reason: &str, other: Option<Value>, error: Option<String>| TraceResult { steps, reason: reason.to_owned(), logged, first_seq, other, error };
+    loop {
+        let regs = match t.t_regs() {
+            Ok(r) => r,
+            Err(e) => return done(steps, logged, "error", None, Some(e)),
+        };
+        let read = |a: u64, b: &mut [u8]| t.t_read(a, b);
+        let ctx = Ctx { regs: &regs, read: &read, abi, tid, pid, hits: steps, modules: &modules };
+        if steps > 0 {
+            if t.t_user_bp(regs.rip) {
+                return done(steps, logged, "breakpoint", None, None);
+            }
+            if let Some(c) = &o.cond {
+                match c.eval(&ctx) {
+                    Ok(v) if v.truthy() => return done(steps, logged, "condition", None, None),
+                    Ok(_) => {}
+                    Err(e) => return done(steps, logged, "condition_error", None, Some(e)),
+                }
+            }
+        }
+        if steps >= o.max_steps {
+            return done(steps, logged, "max_steps", None, None);
+        }
+        let left = o.max_ms.saturating_sub(t0.elapsed().as_millis() as u64);
+        if left == 0 {
+            return done(steps, logged, "time", None, None);
+        }
+        // logged right before it executes: every logged instruction ran
+        if let Some(f) = &o.log {
+            if o.log_cond.as_ref().is_none_or(|c| c.eval(&ctx).map(|v| v.truthy()).unwrap_or(true)) {
+                let text = f.render(&ctx);
+                crate::dbg_core::with_mon(abi, |m| m.breaks.push_log(tid, regs.rip, steps, text, "trace"));
+                logged += 1;
+            }
+        }
+        let next = if o.over { step_over_target(&read, &regs, tid) } else { None };
+        let r = match next {
+            Some(temp) => t.t_run_to(temp, left),
+            None => t.t_step(),
+        };
+        steps += 1;
+        match r {
+            Ok(None) => {}
+            Ok(Some(stop)) => return done(steps, logged, "stopped", Some(stop), None),
+            Err(e) => return done(steps, logged, "error", None, Some(e)),
+        }
+    }
+}
+
+// ---- hiding the debugger (x64dbg's HideDebugger) ------------------------------------------------
+
+/// One write that hides the debugger from the target.
+#[derive(Debug, PartialEq)]
+pub struct HideWrite {
+    pub addr: u64,
+    pub old: Vec<u8>,
+    pub new: Vec<u8>,
+    pub what: &'static str,
+}
+
+/// What a Win32 debugger leaves in a 64-bit PEB, and how to undo it: `BeingDebugged` (+0x2),
+/// the debug-heap bits of `NtGlobalFlag` (+0xBC: tail check, free check, validate parameters) and
+/// the matching flags of the NT process heap (`PEB.ProcessHeap` +0x30, heap Flags +0x70 and
+/// ForceFlags +0x74; a segment heap, signature 0xDDEEDDEE at +0x10, keeps its flags elsewhere and
+/// is left alone). Only fields that need a change are returned.
+pub fn hide_plan(read: ReadFn, peb: u64) -> Result<Vec<HideWrite>, String> {
+    let mut b1 = [0u8; 1];
+    if read(peb + 2, &mut b1) != 1 {
+        return Err(format!("cannot read the PEB at {}", hex(peb)));
+    }
+    let mut out = Vec::new();
+    if b1[0] != 0 {
+        out.push(HideWrite { addr: peb + 2, old: b1.to_vec(), new: vec![0], what: "PEB.BeingDebugged" });
+    }
+    let r32 = |a: u64| {
+        let mut b = [0u8; 4];
+        (read(a, &mut b) == 4).then(|| u32::from_le_bytes(b))
+    };
+    if let Some(g) = r32(peb + 0xbc) {
+        if g & 0x70 != 0 {
+            out.push(HideWrite { addr: peb + 0xbc, old: g.to_le_bytes().to_vec(), new: (g & !0x70).to_le_bytes().to_vec(), what: "PEB.NtGlobalFlag" });
+        }
+    }
+    let heap = crate::dbg_core::read_u64(read, peb + 0x30).unwrap_or(0);
+    if heap != 0 && r32(heap + 0x10) != Some(0xddee_ddee) {
+        const DEBUG: u32 = 0x20 | 0x40 | 0x4000_0000; // tail checking, free checking, validate parameters
+        if let Some(f) = r32(heap + 0x70) {
+            if f & DEBUG != 0 {
+                out.push(HideWrite { addr: heap + 0x70, old: f.to_le_bytes().to_vec(), new: (f & !DEBUG).to_le_bytes().to_vec(), what: "ProcessHeap.Flags" });
+            }
+        }
+        if let Some(ff) = r32(heap + 0x74) {
+            if ff != 0 {
+                out.push(HideWrite { addr: heap + 0x74, old: ff.to_le_bytes().to_vec(), new: vec![0; 4], what: "ProcessHeap.ForceFlags" });
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---- stepping plans -----------------------------------------------------------------------------
@@ -1307,6 +1489,117 @@ mod tests {
         assert_eq!(e[3]["text"], "\"hello\"");
         assert!(e[4].get("kind").is_none());
         assert_eq!(e[4]["offset"], 0x20);
+    }
+
+    /// A fake CPU: rip walks a little program; `call` at 0x1004 jumps to 0x2000 and returns.
+    struct Fake {
+        regs: Gprs,
+        stepped: Vec<u64>,
+        ran_to: Vec<u64>,
+    }
+
+    impl Tracer for Fake {
+        fn t_regs(&mut self) -> Result<Gprs, String> {
+            Ok(self.regs)
+        }
+        fn t_read(&self, addr: u64, buf: &mut [u8]) -> usize {
+            // 0x1000: nop, nop, nop, nop, call rel32 (5 bytes), then nops
+            let code = |a: u64| -> u8 {
+                match a {
+                    0x1004 => 0xe8,
+                    0x1005..=0x1008 => 0,
+                    _ => 0x90,
+                }
+            };
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = code(addr + i as u64);
+            }
+            buf.len()
+        }
+        fn t_modules(&self) -> Vec<(String, u64, u64)> {
+            Vec::new()
+        }
+        fn t_step(&mut self) -> Result<Option<Value>, String> {
+            self.stepped.push(self.regs.rip);
+            self.regs.rip += if self.regs.rip == 0x1004 { 0xffc } else { 1 };
+            self.regs.rax += 1;
+            Ok(None)
+        }
+        fn t_run_to(&mut self, t: Temp, _ms: u64) -> Result<Option<Value>, String> {
+            self.ran_to.push(t.addr);
+            self.regs.rip = t.addr;
+            Ok(None)
+        }
+        fn t_user_bp(&self, addr: u64) -> bool {
+            addr == 0x100b
+        }
+    }
+
+    fn opts(req: Value) -> TraceOpts {
+        let Value::Object(m) = req else { unreachable!() };
+        parse_trace_opts(&m).unwrap()
+    }
+
+    #[test]
+    fn trace_into_until_a_condition() {
+        let mut f = Fake { regs: Gprs { rip: 0x1000, ..Default::default() }, stepped: vec![], ran_to: vec![] };
+        let o = opts(json!({ "mode": "into", "condition": "rip == 2002", "log": "{p:rip} {d:$tracecounter}" }));
+        let r = trace_run(&mut f, Abi::SysV, 1, 9, &o);
+        assert_eq!(r.reason, "condition");
+        // 0x1000..0x1004 (5 steps), the call lands at 0x2000, then 0x2001, 0x2002
+        assert_eq!(f.stepped, vec![0x1000, 0x1001, 0x1002, 0x1003, 0x1004, 0x2000, 0x2001]);
+        assert_eq!(r.steps, 7);
+        assert_eq!(r.logged, 7, "the instruction it stops at is not executed, so not logged");
+        let log = crate::dbg_core::with_mon(Abi::SysV, |m| m.breaks.log_json(r.first_seq, 100));
+        let lines: Vec<&str> = log["entries"].as_array().unwrap().iter().filter(|e| e["tid"] == 9).map(|e| e["text"].as_str().unwrap()).collect();
+        assert_eq!(lines.first(), Some(&"0000000000001000 0"));
+        assert_eq!(lines.last(), Some(&"0000000000002001 6"));
+    }
+
+    #[test]
+    fn trace_over_runs_calls_and_stops_at_breakpoints_and_limits() {
+        let mut f = Fake { regs: Gprs { rip: 0x1000, ..Default::default() }, stepped: vec![], ran_to: vec![] };
+        let r = trace_run(&mut f, Abi::SysV, 1, 9, &opts(json!({ "mode": "over" })));
+        assert_eq!(f.ran_to, vec![0x1009], "the call is run, not entered");
+        assert_eq!(r.reason, "breakpoint");
+        assert_eq!(f.regs.rip, 0x100b);
+        let mut f = Fake { regs: Gprs { rip: 0x1000, ..Default::default() }, stepped: vec![], ran_to: vec![] };
+        let r = trace_run(&mut f, Abi::SysV, 1, 9, &opts(json!({ "max_steps": 3 })));
+        assert_eq!((r.reason.as_str(), r.steps), ("max_steps", 3));
+        let mut f = Fake { regs: Gprs { rip: 0x1000, ..Default::default() }, stepped: vec![], ran_to: vec![] };
+        let r = trace_run(&mut f, Abi::SysV, 1, 9, &opts(json!({ "condition": "nosuchsymbol == 1" })));
+        assert_eq!(r.reason, "condition_error");
+        let Value::Object(bad) = json!({ "mode": "sideways" }) else { unreachable!() };
+        assert!(parse_trace_opts(&bad).is_err());
+        let Value::Object(bad) = json!({ "condition": "((" }) else { unreachable!() };
+        assert!(parse_trace_opts(&bad).is_err());
+    }
+
+    #[test]
+    fn hide_debugger_plan() {
+        // PEB at 0x1000, NT heap at 0x2000
+        let mut m = vec![0u8; 0x2000];
+        m[2] = 1;
+        m[0xbc..0xc0].copy_from_slice(&0x70u32.to_le_bytes());
+        m[0x30..0x38].copy_from_slice(&0x2000u64.to_le_bytes());
+        m[0x1070..0x1074].copy_from_slice(&(0x4000_0062u32).to_le_bytes());
+        m[0x1074..0x1078].copy_from_slice(&0x4000_0060u32.to_le_bytes());
+        let read = mem(0x1000, m.clone());
+        let plan = hide_plan(&read, 0x1000).unwrap();
+        let what: Vec<(&str, u64, Vec<u8>)> = plan.iter().map(|w| (w.what, w.addr, w.new.clone())).collect();
+        assert_eq!(what, vec![
+            ("PEB.BeingDebugged", 0x1002, vec![0]),
+            ("PEB.NtGlobalFlag", 0x10bc, vec![0, 0, 0, 0]),
+            ("ProcessHeap.Flags", 0x2070, 2u32.to_le_bytes().to_vec()),
+            ("ProcessHeap.ForceFlags", 0x2074, vec![0; 4]),
+        ]);
+        // already hidden: nothing to do; a segment heap is left alone
+        let mut clean = vec![0u8; 0x2000];
+        clean[0x30..0x38].copy_from_slice(&0x2000u64.to_le_bytes());
+        clean[0x1010..0x1014].copy_from_slice(&0xddee_ddeeu32.to_le_bytes());
+        clean[0x1070..0x1074].copy_from_slice(&0x40u32.to_le_bytes());
+        assert!(hide_plan(&mem(0x1000, clean), 0x1000).unwrap().is_empty());
+        assert!(hide_plan(&mem(0x1000, vec![]), 0x1000).is_err());
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub mod mcp_server;
 pub mod monitor;
 pub mod driver_info;
 pub mod kdump;
+pub mod kmods;
 pub mod pdbinfo;
 pub mod procdump;
 pub mod symbols;
@@ -421,6 +422,12 @@ impl Relay {
             // Full process dump (MINIDUMP on Windows, raw segment archive on Linux).
             "dump_process_full" => {
                 let mut v = procdump::handle(&req);
+                v["id"] = orig;
+                return v;
+            }
+            // The machine's kernel drivers (bases for runtime driver dumps).
+            "kernel_modules" => {
+                let mut v = tokio::task::spawn_blocking(kmods::handle).await.unwrap_or_else(|e| error(Value::Null, 3003, &e.to_string()));
                 v["id"] = orig;
                 return v;
             }

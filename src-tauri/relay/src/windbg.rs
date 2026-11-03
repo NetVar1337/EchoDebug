@@ -339,6 +339,8 @@ mod imp {
         exited: bool,
         /// the module list for expressions, re-read at most every 2 s
         mods: ext::ModCache,
+        /// a dbg_trace_run is stepping: its intermediate stops are not broadcast
+        quiet: bool,
     }
 
     impl Host for Dbg {
@@ -784,7 +786,9 @@ mod imp {
             while self.held.is_none() && !self.exited && t0.elapsed() < timeout {
                 if let Some(ev) = wait_event(20) {
                     if let Some(e) = self.dispatch(ev) {
-                        self.relay.emit(e);
+                        if !(self.quiet && e["event"] == "dbg_stop") {
+                            self.relay.emit(e);
+                        }
                     }
                 }
             }
@@ -1007,6 +1011,44 @@ mod imp {
                 reply["state"] = json!("exited");
             }
             reply
+        }
+
+        /// Clears BeingDebugged, NtGlobalFlag's debug-heap bits and the process heap's debug flags.
+        fn hide(&mut self) -> Value {
+            #[repr(C)]
+            struct Pbi {
+                exit_status: isize,
+                peb: usize,
+                affinity: usize,
+                priority: isize,
+                pid: usize,
+                parent: usize,
+            }
+            #[link(name = "ntdll")]
+            extern "system" {
+                fn NtQueryInformationProcess(h: HANDLE, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+            }
+            let mut pbi = Pbi { exit_status: 0, peb: 0, affinity: 0, priority: 0, pid: 0, parent: 0 };
+            let mut got = 0u32;
+            // SAFETY: ProcessBasicInformation into a struct of exactly its size; hproc is the
+            // debuggee's handle from CREATE_PROCESS_DEBUG_EVENT.
+            let st = unsafe { NtQueryInformationProcess(self.hproc, 0, (&mut pbi as *mut Pbi).cast(), std::mem::size_of::<Pbi>() as u32, &mut got) };
+            if st != 0 || pbi.peb == 0 {
+                return failed(format!("NtQueryInformationProcess(ProcessBasicInformation) failed: 0x{:08x}", st as u32));
+            }
+            let read = |a: u64, b: &mut [u8]| self.read(a, b);
+            let plan = match ext::hide_plan(&read, pbi.peb as u64) {
+                Ok(p) => p,
+                Err(e) => return failed(e),
+            };
+            let mut done = Vec::new();
+            for w in &plan {
+                if let Err(e) = self.io.write_at(w.addr, &w.new) {
+                    return failed(format!("{} at {}: {e}", w.what, hex(w.addr)));
+                }
+                done.push(json!({ "field": w.what, "address": hex(w.addr), "old": w.old.iter().map(|b| format!("{b:02x}")).collect::<String>(), "new": w.new.iter().map(|b| format!("{b:02x}")).collect::<String>() }));
+            }
+            json!({ "type": "dbg_hide_result", "success": true, "peb": hex(pbi.peb as u64), "changed": done })
         }
 
         /// A dbg_step that did not complete: clear the trap flag, put the breakpoint back.
@@ -1339,12 +1381,107 @@ mod imp {
                     };
                     self.run_temp(verb, temp, plan, req)
                 }
+                // x64dbg's HideDebugger: the PEB fields a Win32 debugger gives away
+                "dbg_hide" => {
+                    let was_running = self.running();
+                    if !self.need_stopped() {
+                        return failed("cannot stop the process");
+                    }
+                    let r = self.hide();
+                    if was_running {
+                        self.resume();
+                    }
+                    r
+                }
+                // x64dbg's Trace into / Trace over with a break condition and log text
+                "dbg_trace_run" => {
+                    let o = match ext::parse_trace_opts(req) {
+                        Ok(o) => o,
+                        Err(e) => return bad(&e),
+                    };
+                    if !self.need_stopped() {
+                        return failed("cannot stop the process");
+                    }
+                    let tid = self.tid_arg(req);
+                    let pid = self.pid;
+                    self.quiet = true;
+                    let r = ext::trace_run(&mut Tracing { d: self, tid }, ABI, pid, tid as u64, &o);
+                    self.quiet = false;
+                    if self.exited {
+                        return json!({ "type": "dbg_trace_run_result", "success": true, "steps": r.steps, "reason": "exited", "logged": r.logged, "since": r.first_seq });
+                    }
+                    let ev = match r.other {
+                        Some(stop) => stop,
+                        None => self.stop_event(tid, "trace", json!({ "trace_reason": r.reason, "steps": r.steps, "logged": r.logged, "error": r.error })),
+                    };
+                    self.relay.emit(ev.clone());
+                    json!({ "type": "dbg_trace_run_result", "success": true, "tid": tid, "steps": r.steps, "reason": if ev["reason"] == "trace" { json!(r.reason) } else { ev["reason"].clone() },
+                        "error": r.error, "logged": r.logged, "since": r.first_seq, "address": ev["address"], "regs": ev["regs"], "stop": ev })
+                }
                 "dbg_detach" => {
                     self.detach();
                     json!({ "type": "dbg_detach_result", "success": true })
                 }
                 other => json!({ "type": "error", "code": 3000, "message": "unknown verb", "detail": other }),
             }
+        }
+    }
+
+    /// One thread traced by `dbg_trace_run`: dbg_step for single steps, a temporary breakpoint and
+    /// the event pump for the calls it steps over (stops stay quiet while it runs).
+    struct Tracing<'a> {
+        d: &'a mut Dbg,
+        tid: u32,
+    }
+
+    impl ext::Tracer for Tracing<'_> {
+        fn t_regs(&mut self) -> Result<Gprs, String> {
+            self.d.regs(self.tid).ok_or_else(|| format!("cannot read the context of thread {}", self.tid))
+        }
+        fn t_read(&self, addr: u64, buf: &mut [u8]) -> usize {
+            self.d.read(addr, buf)
+        }
+        fn t_modules(&self) -> Vec<(String, u64, u64)> {
+            self.d.host_modules()
+        }
+        fn t_step(&mut self) -> Result<Option<Value>, String> {
+            let mut req = Map::new();
+            req.insert("type".into(), json!("dbg_step"));
+            req.insert("tid".into(), json!(self.tid));
+            let r = self.d.command(&req);
+            if r["type"] == "error" {
+                return Err(r["detail"].as_str().unwrap_or("step failed").to_owned());
+            }
+            if self.d.exited {
+                return Ok(Some(json!({ "type": "event", "event": "dbg_exit", "pid": self.d.pid })));
+            }
+            Ok(if r["reason"] == "step" { None } else { Some(self.d.last.clone()) })
+        }
+        fn t_run_to(&mut self, t: ext::Temp, ms: u64) -> Result<Option<Value>, String> {
+            core::check_code(&self.d.io, t.addr).and_then(|()| self.d.plant(t.addr))?;
+            let at = t.addr;
+            with_mon(ABI, |m| m.breaks.temps.push(t));
+            self.d.resume();
+            let held = self.d.pump_until_held(Duration::from_millis(ms));
+            if self.d.exited {
+                return Ok(Some(json!({ "type": "event", "event": "dbg_exit", "pid": self.d.pid })));
+            }
+            if !held {
+                self.d.break_in(true);
+                for a in with_mon(ABI, |m| m.breaks.take_temps()) {
+                    self.d.unplant_if_unused(a);
+                }
+                return Err(format!("the call to the instruction before {} did not return within the time limit", hex(at)));
+            }
+            let last = self.d.last.clone();
+            if last["reason"] == "step_over" && last["tid"] == self.tid && last["address"] == hex(at) {
+                Ok(None)
+            } else {
+                Ok(Some(last))
+            }
+        }
+        fn t_user_bp(&self, addr: u64) -> bool {
+            self.d.user.contains(&addr)
         }
     }
 
@@ -1378,7 +1515,7 @@ mod imp {
             pid, io, hproc: std::ptr::null_mut(), threads: BTreeMap::new(), main_tid: 0, planted: BTreeMap::new(), user: BTreeSet::new(), retired: BTreeSet::new(),
             hw: [None, None, None, None], trace: [false; 4], held: None, focus: 0, last: Value::Null, relay, auto: false, rearm: HashMap::new(),
             user_step: None, suspended: Vec::new(), hw_stopped: BTreeSet::new(), breakins: 0, pause_wanted: false, pause_silent: false, attach_done: false, exited: false,
-            mods: Default::default(),
+            mods: Default::default(), quiet: false,
         };
         if !d.pump_until_held(Duration::from_secs(10)) {
             // SAFETY: undoes the attach above.

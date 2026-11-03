@@ -11,7 +11,18 @@ import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { CommitInput, IconButton, NeedsAgent } from "../ui";
 import { applyPatchSet, toPatchSet, useAutoPatches, type PatchSet } from "@/lib/patchsets";
-import { saveText } from "@/lib/save";
+import { saveBinary, saveText } from "@/lib/save";
+import { apply1337, journalBytePatches, patchedModuleFile } from "@/lib/patchfilelive";
+import { parse1337, to1337 } from "@/lib/analysis/patchfile";
+
+async function pickText(accept: string): Promise<string | null> {
+  const input = Object.assign(document.createElement("input"), { type: "file", accept });
+  const { promise, resolve } = Promise.withResolvers<File | null>();
+  input.onchange = () => resolve(input.files?.[0] ?? null);
+  input.click();
+  const f = await promise;
+  return f ? f.text() : null;
+}
 
 async function pickSet(): Promise<PatchSet | null> {
   const input = Object.assign(document.createElement("input"), { type: "file", accept: ".json,.edpatch" });
@@ -53,6 +64,39 @@ export default function PatchesView() {
     const text = `${s.name}: ${r.applied} applied, ${r.already} already in place, ${r.conflicts.length} conflicts${r.missing.length ? `, ${r.missing.length} for modules not loaded` : ""}${r.otherBuild ? `, ${r.otherBuild} on a different build` : ""}`;
     setReport(text + (r.conflicts.length ? ` — conflicts at ${r.conflicts.slice(0, 4).map((c) => `${c.entry.module}+0x${c.entry.rva.toString(16)} (found ${c.found || "unreadable"})`).join(", ")}` : ""));
     log(r.conflicts.length ? "warn" : "info", "patches", text);
+  };
+
+  // x64dbg: .1337 patch files and Patch file
+  const bytes = journalBytePatches(patches.pending(), modules);
+  const patchedMods = [...new Set(bytes.patches.map((p) => p.module))];
+  const [fileMod, setFileMod] = useState("");
+  const export1337 = async () => {
+    if (!bytes.patches.length) return log("warn", "patches", "no active patches inside a module");
+    const name = (patchedMods[0] ?? "patches").replace(/\.[^.]+$/, "");
+    await saveText(`${name}.1337`, to1337(bytes.patches), { name: "x64dbg patch", extensions: ["1337"] });
+    if (bytes.outside) log("warn", "patches", `${bytes.outside} patch(es) outside every module left out (a .1337 file is module + RVA)`);
+  };
+  const import1337 = async (force = false) => {
+    const text = await pickText(".1337,.txt");
+    if (text === null) return;
+    const { patches: list, errors } = parse1337(text);
+    if (errors.length) log("warn", "patches", `.1337: ${errors.slice(0, 5).join("; ")}${errors.length > 5 ? ` (+${errors.length - 5})` : ""}`);
+    const r = await attempt("patches", apply1337(list, modules, force));
+    if (!r) return;
+    const msg = `.1337: ${r.applied} bytes patched, ${r.already} already in place, ${r.conflicts.length} conflicts${r.missing.length ? `, modules not loaded: ${r.missing.join(", ")}` : ""}`;
+    setReport(msg + (r.conflicts.length ? ` — e.g. ${r.conflicts.slice(0, 3).map((c) => `${c.module}+0x${c.rva.toString(16)} has ${c.found === null ? "??" : c.found.toString(16).padStart(2, "0")}, expected ${c.expected.toString(16).padStart(2, "0")}`).join(", ")}` : ""));
+    log(r.conflicts.length ? "warn" : "info", "patches", msg);
+  };
+  const patchFileOnDisk = async () => {
+    const m = modules.find((x) => x.name === (fileMod || patchedMods[0]));
+    if (!m) return;
+    const r = await attempt("patch file", patchedModuleFile(m, bytes.patches));
+    if (!r) return;
+    const path = await saveBinary(m.name.replace(/(\.[^.]+)?$/, "_patched$1"), r.bytes);
+    const rep = r.report;
+    const msg = `${m.name}: ${rep.applied} bytes written into a copy of ${r.path}${path ? ` → ${path}` : ""}${rep.outside.length ? `; ${rep.outside.length} not in the file (no raw data there)` : ""}${rep.differed.length ? `; ${rep.differed.length} where the file differs from memory (relocated addresses: check them)` : ""}`;
+    setReport(msg);
+    log(rep.differed.length || rep.outside.length ? "warn" : "info", "patches", msg);
   };
 
   /** Writes bytes and records the previous content so the write can be undone. */
@@ -135,6 +179,22 @@ export default function PatchesView() {
               </div>
             ))}
             <div className="faint" style={{ fontSize: 12 }}>A set stores each patch as module + RVA with the bytes it replaces; applying checks those bytes first.</div>
+          </div>
+          <div className="panel-section">
+            <div className="label">x64dbg</div>
+            <div className="row wrap">
+              <button className="btn small" disabled={!bytes.patches.length} onClick={() => void export1337()} title="x64dbg's patch file: >module, then RVA:OLD->NEW per byte">Export .1337</button>
+              <button className="btn small" onClick={() => void import1337(false)} title="apply where the original byte is still there">Import .1337…</button>
+              <button className="btn small" onClick={() => void import1337(true)} title="write even where the original byte differs">Force…</button>
+            </div>
+            <div className="row">
+              <select className="select grow" value={fileMod || patchedMods[0] || ""} onChange={(e) => setFileMod(e.target.value)} disabled={!patchedMods.length}>
+                {patchedMods.length === 0 && <option value="">no patched module</option>}
+                {patchedMods.map((m) => <option key={m}>{m}</option>)}
+              </select>
+              <button className="btn small" disabled={!patchedMods.length} onClick={() => void patchFileOnDisk()} title="write the patches into a copy of the module's file on disk">Patch file…</button>
+            </div>
+            <div className="faint" style={{ fontSize: 12 }}>{bytes.patches.length} patched bytes in {patchedMods.length} module(s). Patch file maps each RVA to its file offset; bytes the loader relocated are reported.</div>
           </div>
           <div className="panel-section">
             <div className="label">Journal</div>

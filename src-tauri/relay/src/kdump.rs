@@ -172,9 +172,12 @@ fn try_minidump(f: &mut File, header: &[u8]) -> Option<DumpInfo> {
             0  => "x86",
             _  => "unknown",
         };
-        let major = parse_u32_le(&si, 4);
-        let minor = parse_u32_le(&si, 8);
-        (arch_str, format!("{major}.{minor}"))
+        // MINIDUMP_SYSTEM_INFO: arch, level, revision (u16 each), processors, product type (u8
+        // each), then MajorVersion at 8, MinorVersion at 12, BuildNumber at 16
+        let major = parse_u32_le(&si, 8);
+        let minor = parse_u32_le(&si, 12);
+        let build = parse_u32_le(&si, 16);
+        (arch_str, if build != 0 { format!("{major}.{minor}.{build}") } else { format!("{major}.{minor}") })
     } else {
         ("unknown", String::new())
     };
@@ -190,10 +193,12 @@ fn try_minidump(f: &mut File, header: &[u8]) -> Option<DumpInfo> {
             let mut mb = [0u8; 108];
             if f.seek(SeekFrom::Start(mod_rva as u64)).is_err() { break; }
             if f.read_exact(&mut mb).is_err() { break; }
+            // MINIDUMP_MODULE: BaseOfImage 0, SizeOfImage 8, CheckSum 12, TimeDateStamp 16,
+            // ModuleNameRva 20
             let base      = parse_u64_le(&mb,  0);
             let size      = parse_u32_le(&mb,  8);
-            let timestamp = parse_u32_le(&mb, 12);
-            let name_rva  = parse_u32_le(&mb, 16);
+            let timestamp = parse_u32_le(&mb, 16);
+            let name_rva  = parse_u32_le(&mb, 20);
             let name = read_minidump_string(f, name_rva);
             let short = name.rsplit(&['\\', '/'][..]).next().unwrap_or(&name).to_string();
             modules.push(ModuleEntry { name: short, base, size, timestamp });
@@ -507,4 +512,80 @@ fn extract_module(dump_path: &Path, base: u64, out: &Path) -> Result<u64, String
 
     std::fs::write(out, &out_buf).map_err(|e| e.to_string())?;
     Ok(image_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A MINIDUMP laid out per the spec (the shape WinDbg, Task Manager and EchoDebug's own
+    /// full-memory dumper write): SystemInfo, a module list and a Memory64 list.
+    fn minidump() -> Vec<u8> {
+        let mut b = vec![0u8; 0x400];
+        let put32 = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |b: &mut Vec<u8>, o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        put32(&mut b, 0, MDMP_SIG);
+        put32(&mut b, 8, 3);
+        put32(&mut b, 12, 0x20);
+        // directory @0x20 (3 entries), SystemInfo @0x60, ModuleList @0xa0, Memory64List @0x200
+        for (i, (t, at, sz)) in [(7u32, 0x60u32, 56u32), (4, 0xa0, 4 + 2 * 108), (9, 0x200, 16 + 2 * 16)].into_iter().enumerate() {
+            put32(&mut b, 0x20 + i * 12, t);
+            put32(&mut b, 0x24 + i * 12, sz);
+            put32(&mut b, 0x28 + i * 12, at);
+        }
+        b[0x60..0x62].copy_from_slice(&9u16.to_le_bytes());
+        put32(&mut b, 0x68, 10);
+        put32(&mut b, 0x6c, 0);
+        put32(&mut b, 0x70, 22631);
+        put32(&mut b, 0xa0, 2);
+        for (i, (base, size, ts, name_rva)) in [(0x1_4000_0000u64, 0x2000u32, 0x5f00_0001u32, 0x300u32), (0x7ffa_0000_0000, 0x1000, 0x6000_0002, 0x340)].into_iter().enumerate() {
+            let m = 0xa4 + i * 108;
+            put64(&mut b, m, base);
+            put32(&mut b, m + 8, size);
+            put32(&mut b, m + 12, 0xdead); // CheckSum
+            put32(&mut b, m + 16, ts);
+            put32(&mut b, m + 20, name_rva);
+        }
+        for (at, name) in [(0x300usize, "C:\\game\\game.exe"), (0x340, "ntdll.dll")] {
+            let w: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+            put32(&mut b, at, w.len() as u32);
+            b[at + 4..at + 4 + w.len()].copy_from_slice(&w);
+        }
+        put64(&mut b, 0x200, 2);
+        put64(&mut b, 0x208, 0x400);
+        put64(&mut b, 0x210, 0x1_4000_0000);
+        put64(&mut b, 0x218, 0x2000);
+        put64(&mut b, 0x220, 0x7ffa_0000_0000);
+        put64(&mut b, 0x228, 0x1000);
+        // the image: MZ, e_lfanew 0x80, PE, SizeOfImage 0x2000
+        let mut img = vec![0u8; 0x2000];
+        img[0..2].copy_from_slice(b"MZ");
+        img[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        img[0x80..0x84].copy_from_slice(b"PE\0\0");
+        img[0x80 + 24 + 56..0x80 + 24 + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        img[0x1000] = 0xc3;
+        b.extend_from_slice(&img);
+        b.extend_from_slice(&[0x90u8; 0x1000]);
+        b
+    }
+
+    #[test]
+    fn minidump_modules_and_memory() {
+        let dir = std::env::temp_dir().join(format!("echodebug-kdump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.dmp");
+        std::fs::write(&path, minidump()).unwrap();
+        let d = open_dump(&path).unwrap();
+        assert_eq!(d.format, "minidump");
+        assert_eq!(d.arch, "x86-64");
+        assert_eq!(d.os_version, "10.0.22631");
+        let names: Vec<(&str, u64, u32, u32)> = d.modules.iter().map(|m| (m.name.as_str(), m.base, m.size, m.timestamp)).collect();
+        assert_eq!(names, vec![("game.exe", 0x1_4000_0000, 0x2000, 0x5f00_0001), ("ntdll.dll", 0x7ffa_0000_0000, 0x1000, 0x6000_0002)]);
+        let out = dir.join("game.exe");
+        assert_eq!(extract_module(&path, 0x1_4000_0000, &out).unwrap(), 0x2000);
+        let img = std::fs::read(&out).unwrap();
+        assert_eq!(&img[..2], b"MZ");
+        assert_eq!(img[0x1000], 0xc3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

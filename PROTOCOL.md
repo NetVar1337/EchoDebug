@@ -122,7 +122,9 @@ status frame's `"debugger"` field says which one this relay has (`"ptrace"`, `"w
 | `dbg_eval` | `expr`, `tid?` | `value`, `unsigned`, `signed`, `symbol` (module+offset), or `string` — x64dbg's command bar |
 | `dbg_format` | `text`, `tid?` | `text` — a log format string rendered against the thread's registers |
 | `dbg_stack` | `count?` (≤ 1024, default 64), `address?` (an expression; default rsp), `tid?` | `rsp`, `rbp`, `entries:[{address, value, offset, kind?, text?, frame?, rsp?, rbp?}]`, `kind` `return` (a frame's return address from the unwinder, or a value that follows a `call`), `code`, `stack` or `string` |
-| `dbg_bp_log` / `dbg_bp_log_clear` | `since?`, `limit?` / – | `entries:[{seq, t, tid, address, hits, text}]`, `next`, `total` — what logging breakpoints printed (5,000 kept, readable after the session) |
+| `dbg_bp_log` / `dbg_bp_log_clear` | `since?`, `limit?` / – | `entries:[{seq, t, tid, address, hits, text, source?}]`, `next`, `total` — what logging breakpoints and traces (`source:"trace"`) printed (5,000 kept, readable after the session) |
+| `dbg_trace_run` | `mode` (`into`\|`over`), `condition?`, `log?`, `log_condition?`, `max_steps?` (default 50,000), `max_ms?` (default 10,000, ≤ 600,000), `tid?` | `steps`, `reason` (`condition`, `breakpoint`, `max_steps`, `time`, `condition_error`, `error`, or the reason of a stop that ended it), `error?`, `logged`, `since` (pass to `dbg_bp_log`), `address`, `regs`, `stop` — x64dbg's Trace into / Trace over: steps the thread (over: a `call` / `rep` instruction runs to the next one on a temporary breakpoint) until the break condition holds at an instruction it reached, a user breakpoint is reached or a limit runs out; each instruction about to execute is logged (log text, when the log condition holds) to the breakpoint log, not as events. `$tracecounter` / `$steps` count the instructions traced. One `dbg_stop` (`reason:"trace"`, `trace_reason`, `steps`, `logged`) at the end |
+| `dbg_hide` | – | `peb`, `changed:[{field, address, old, new}]` — Windows (x64dbg's HideDebugger): clears `PEB.BeingDebugged`, the debug-heap bits of `NtGlobalFlag` and the NT process heap's debug `Flags` / `ForceFlags` (a segment heap is left alone). The ptrace debugger refuses: a tracer shows in `/proc/<pid>/status` |
 
 `dbg_trace_start` and `dbg_api_start` attach the debugger when no session is active (`auto: true`)
 and resume the process; when the last monitor of such a session stops, it detaches (`detached:
@@ -150,7 +152,7 @@ x86-64 only and refuse an AArch64 process at attach, and a breakpoint, execute w
 hook inside an AArch64 module (ARM64EC code in an x64 process), with code `3003` and a detail that
 says so. The emulated debugger (`emu_*`) and lifter are x86-64 only.
 
-Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"step_over"|"step_out"|"run_to"|"signal"|"trap"|"pause"|"exception", "tid", "address", "regs", "hits?", "condition_error?", "slot?", "watch?", "signal?", "code?", "first_chance?", "description?" }`,
+Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"step_over"|"step_out"|"run_to"|"trace"|"signal"|"trap"|"pause"|"exception", "tid", "address", "regs", "hits?", "condition_error?", "slot?", "watch?", "signal?", "code?", "first_chance?", "description?" }`,
 `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`, `{ "event":"dbg_access", "slot", "watch", "kind", "address", "text" }`
 (a new accessing instruction), and on Windows `{ "event":"dbg_exception", "code", "description", … }` (routine first-chance
 exceptions such as C++ throws, passed on without stopping) and `{ "event":"dbg_output", "tid", "text" }` (OutputDebugString).
@@ -190,9 +192,53 @@ Strings compare with `==` / `!=`.
 
 MCP: `find_accesses_start` / `_results` / `_stop` and `api_monitor_start` / `_log` / `_stop` / `_signatures`;
 `debugger_eval`, `debugger_stack` and `debugger_breakpoint_log` (read-only).
+
+### Runtime dumps
+
+The Dump view's Module, Hidden images, Drivers and Full target tabs (and their MCP tools, served by
+the app window) read the target through the attached backend's `read_batch`, so they work the same
+over Echo and the local backend and never open the process:
+
+* **Module / image dumps** (`ui_dump_module`, MCP `dump_module_rebuilt`: `path`, `module` or
+  `address` (+ `size`), `layout` `file`\|`virtual`, `headers` `auto`\|`memory`\|`disk`,
+  `rebuild_imports`, `oep_rva`): 64 KiB reads, a failed one read again page by page (unreadable
+  pages are zero-filled and counted); ImageBase becomes the address the image was read at (its
+  absolute addresses are already relocated for it); the section table is rewritten for the layout
+  (`file`: packed at FileAlignment with trailing zeros trimmed; `virtual`: raw = virtual, FileAlignment
+  = SectionAlignment); debug-directory entries get their file offsets; the certificate table (not in
+  memory) is dropped; the PE checksum is recomputed. `headers: auto` takes the headers from the
+  module's file on disk when the ones in memory are broken (anti-dump). `rebuild_imports` rebuilds the
+  import table from the live IAT (PE32+, virtual layout). Reply: the report (`layout`, `size`,
+  `imageBase`, `entryRva`, `checksum`, `sections:[{name, rva, vsize, rawPtr, rawSize, badPages}]`,
+  `badPages`, `warnings`, `headerSource`, `imports?`).
+* **Hidden images** (`ui_find_hidden_images`, MCP `find_hidden_images`): the first page of every
+  region; regions that start with PE headers (`kind:"pe"`, `listed` when a module covers them) and
+  executable regions outside every module without headers (`kind:"headerless-code"`).
+* **Drivers**: `kernel_modules` (relay, read-only) → `source`, `modules:[{name, path, base, size}]`,
+  `note?`. Windows: `NtQuerySystemInformation(SystemModuleInformation)` after enabling
+  SeDebugPrivilege (Windows 11 24H2+ reports zero bases to non-elevated callers; `note` says so);
+  Linux: `/proc/modules` (listing only: the local backend cannot read kernel memory). A driver is
+  dumped like an image at its base, which needs a backend that can read kernel addresses (Echo reads
+  through the target's page tables); when no page reads, the error says so.
+* **Full target** (`ui_dump_target`, MCP `dump_target_memory`: `path`, `format`
+  `minidump`\|`elf`, `include` `all`\|`writable+images`, `max_region_mib`): every present region,
+  streamed to the file region by region (the app's `append_file_raw` command takes raw chunks), as
+  a full-memory MINIDUMP (SystemInfo, MiscInfo with the pid, an empty thread list, the module list
+  with CodeView records, Memory64List) or an ELF core (an NT_PRSTATUS for one thread, NT_PRPSINFO,
+  one PT_LOAD per region). Default: ELF core for an ELF target, MINIDUMP otherwise. Thread contexts
+  are not included. Reply: `format`, `path`, `regions`, `bytes`, `skipped`, `badPages`, `modules`.
+
+`ui_dump_module` and `ui_dump_target` write files: they are stateful and gated like `dump`.
+
+The Patches view adds x64dbg's patch files: **Export / Import .1337** (`>module`, then one
+`RVA:OLD->NEW` line per byte, the RVA as a 16-digit pointer, as x64dbg's PatchDialog writes it;
+import applies a byte only where the original is still there unless forced, journalled) and
+**Patch file** (the active patches of a module written into a copy of its file on disk at the file
+offset each RVA maps to; bytes that differ between the file and memory, usually relocated
+addresses, and RVAs with no file data are reported).
 The debugger verbs that plant int3s or change execution (`dbg_attach`, `dbg_break`, `dbg_hwbreak`,
-`dbg_set_regs`, `dbg_step`, `dbg_step_over`, `dbg_step_out`, `dbg_run_to`, `dbg_continue`, `dbg_trace_start`,
-`dbg_api_start`) are stateful and gated by
+`dbg_set_regs`, `dbg_step`, `dbg_step_over`, `dbg_step_out`, `dbg_run_to`, `dbg_trace_run`, `dbg_hide`, `dbg_continue`,
+`dbg_trace_start`, `dbg_api_start`) are stateful and gated by
 the ask / read-only policy like `write`; reading results and stopping are not.
 
 ### Threads, call stacks, handles (relay)
