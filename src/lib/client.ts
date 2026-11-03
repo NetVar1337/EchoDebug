@@ -15,6 +15,8 @@ export class EchoError extends Error {
 }
 
 type Pending = { resolve: (f: Frame) => void; reject: (e: Error) => void; type: string; allowFail: boolean };
+/** Rewrites a request's fields before it is sent (e.g. adds the module's `arch`). */
+export type RequestHook = (fields: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
 type Listener = (f: Frame) => void;
 type StateListener = (connected: boolean) => void;
 
@@ -27,6 +29,7 @@ class Client {
   private pending = new Map<number, Pending>();
   private listeners = new Set<Listener>();
   private stateListeners = new Set<StateListener>();
+  private hooks = new Map<string, RequestHook>();
   private retry = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   connected = false;
@@ -100,6 +103,22 @@ class Client {
    * `success:false` (e.g. sig_scan with no hit) — pass allowFail to receive those instead of throwing.
    */
   request<T = Frame>(type: string, fields: Record<string, unknown> = {}, allowFail = false): Promise<T & Frame> {
+    const hook = this.hooks.get(type);
+    if (hook) {
+      return Promise.resolve(hook(fields))
+        .catch(() => fields)
+        .then((f) => this.send0<T>(type, f, allowFail));
+    }
+    return this.send0<T>(type, fields, allowFail);
+  }
+
+  /** Installs (or with null removes) the field rewriter for one request type. */
+  setRequestHook(type: string, hook: RequestHook | null): void {
+    if (hook) this.hooks.set(type, hook);
+    else this.hooks.delete(type);
+  }
+
+  private send0<T>(type: string, fields: Record<string, unknown>, allowFail: boolean): Promise<T & Frame> {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.reject(new EchoError(2000, "relay not connected"));
     const id = this.nextId++;

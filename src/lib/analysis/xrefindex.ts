@@ -4,6 +4,8 @@
 // The byte-pattern finder in xrefs.ts answers "what points at this address";
 // this builds the whole graph in one pass so the UI can list both directions
 // and draw the callers of a function.
+import { a64Refs } from "./a64";
+import { detectArch, type Arch } from "./arch";
 import { isElf } from "./elf";
 import { parsePe, type PeInfo } from "./pe";
 
@@ -27,9 +29,11 @@ export type XrefIndex = {
 
 /**
  * Builds the index. `ranges` are the RVA ranges to scan (normally the
- * executable sections). `base` is only used for the reported addresses.
+ * executable sections). `arch` defaults to what the image's headers say; on
+ * arm64 "rip" marks PC-relative data references (adrp+add/ldr/str, adr, ldr
+ * literal), reported at the adrp.
  */
-export function buildXrefIndex(img: Uint8Array, ranges: readonly { rva: number; size: number }[]): XrefIndex {
+export function buildXrefIndex(img: Uint8Array, ranges: readonly { rva: number; size: number }[], arch?: Arch): XrefIndex {
   const to = new Map<number, Xref[]>();
   const from = new Map<number, Xref[]>();
   const all: Xref[] = [];
@@ -46,6 +50,10 @@ export function buildXrefIndex(img: Uint8Array, ranges: readonly { rva: number; 
     else from.set(x.fromRva, [x]);
   };
 
+  if ((arch ?? detectArch(img)?.arch) === "arm64") {
+    for (const x of a64Refs(img, ranges)) push(x);
+    return { to, from, all };
+  }
   for (const r of ranges) {
     const start = r.rva;
     const end = Math.min(img.length, r.rva + r.size);
