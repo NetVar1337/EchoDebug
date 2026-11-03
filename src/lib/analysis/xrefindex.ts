@@ -7,7 +7,7 @@
 import { a64Refs } from "./a64";
 import { detectArch, type Arch } from "./arch";
 import { isElf } from "./elf";
-import { parsePe, type PeInfo } from "./pe";
+import { parsePe, scanBudget, type PeInfo } from "./pe";
 
 export type XrefKind = "call" | "jmp" | "jcc" | "rip";
 
@@ -54,9 +54,11 @@ export function buildXrefIndex(img: Uint8Array, ranges: readonly { rva: number; 
     for (const x of a64Refs(img, ranges)) push(x);
     return { to, from, all };
   }
+  const take = scanBudget(img.length);
   for (const r of ranges) {
     const start = r.rva;
     const end = Math.min(img.length, r.rva + r.size);
+    if (!take(start, end)) continue;
     for (let i = start; i + 5 <= end; i++) {
       const b = img[i];
       // call rel32 / jmp rel32

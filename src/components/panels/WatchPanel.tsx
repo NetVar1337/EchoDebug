@@ -12,7 +12,8 @@ import { useUi } from "@/store/ui";
 import { useWatch, type WatchEntry } from "@/store/watch";
 import { useGraphs } from "@/store/graphs";
 import { graphTypeOf } from "@/lib/graphs";
-import { CommitInput, IconButton, Panel } from "../ui";
+import { CommitInput, IconButton, Panel, useContextMenu } from "../ui";
+import { accessMenuItems } from "../accessMenu";
 
 const kTypes: ValueType[] = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "ptr", "ascii", "utf16"];
 const kAlertTypes = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "bytes", "string", "wstring"];
@@ -31,14 +32,16 @@ export default function WatchPanel() {
   // conditional alerts live in the Echo agent; fired ones are logged to Output by the conn store
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [al, setAl] = useState({ address: "", type: "i32", cond: "changed", value: "", once: false });
-  const [menu, setMenu] = useState<{ x: number; y: number; e: WatchEntry } | null>(null);
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    window.addEventListener("mousedown", close);
-    window.addEventListener("blur", close);
-    return () => { window.removeEventListener("mousedown", close); window.removeEventListener("blur", close); };
-  }, [menu]);
+  const [openMenu, menu] = useContextMenu();
+  const rowMenu = (ev: React.MouseEvent, e: WatchEntry) => openMenu(ev, [
+    ...accessMenuItems(e.address, kSizes[e.type]),
+    "sep",
+    { label: "Graph this", onClick: () => graph(e) },
+    { label: "Browse memory", onClick: () => ui.goMemory(e.address) },
+    { label: "Disassemble here", onClick: () => ui.goDisasm(e.address) },
+    { label: e.frozen ? "Unfreeze" : "Freeze", onClick: () => void toggleFreeze(e) },
+    { label: "Remove", onClick: () => w.removeWatch(e.id) },
+  ]);
 
   /** Plots the watch in the Value Graphs view. */
   const graph = (e: WatchEntry) => {
@@ -144,7 +147,7 @@ export default function WatchPanel() {
           <thead><tr><th>Address</th><th>Type</th><th>Value</th><th /></tr></thead>
           <tbody>
             {w.watches.map((e) => (
-              <tr key={e.id} onContextMenu={(ev) => { ev.preventDefault(); setMenu({ x: ev.clientX, y: ev.clientY, e }); }}>
+              <tr key={e.id} onContextMenu={(ev) => rowMenu(ev, e)} title="right-click: graph it, find what writes / accesses it">
                 <td title={labelAddr(e.address, modules)}>
                   <CommitInput className="input mono" value={e.label || labelAddr(e.address, modules)} onCommit={(v) => {
                     const a = parseAddress(v, modules);
@@ -167,15 +170,6 @@ export default function WatchPanel() {
             ))}
           </tbody>
         </table>
-        {menu && (
-          <div className="ctx-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(ev) => ev.stopPropagation()}>
-            <button onClick={() => { graph(menu.e); setMenu(null); }}>Graph this</button>
-            <button onClick={() => { ui.goMemory(menu.e.address); setMenu(null); }}>Show in memory</button>
-            <button onClick={() => { ui.goDisasm(menu.e.address); setMenu(null); }}>Disassemble</button>
-            <button onClick={() => { void toggleFreeze(menu.e); setMenu(null); }}>{menu.e.frozen ? "Unfreeze" : "Freeze"}</button>
-            <button onClick={() => { w.removeWatch(menu.e.id); setMenu(null); }}>Remove</button>
-          </div>
-        )}
         {w.watches.length === 0 && <div className="panel-section faint">No watches. Add one above or from the scanner / inspector.</div>}
         <div className="panel-head"><div className="panel-title">Alerts</div></div>
         <div className="panel-section">
@@ -224,6 +218,7 @@ export default function WatchPanel() {
         </table>
         {w.bookmarks.length === 0 && <div className="panel-section faint">No bookmarks.</div>}
       </div>
+      {menu}
     </Panel>
   );
 }

@@ -12,7 +12,8 @@ import { useNames } from "@/store/names";
 import { attempt, log } from "@/store/output";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
-import { CommitInput, IconButton, NeedsAgent, Progress } from "../ui";
+import { CommitInput, IconButton, NeedsAgent, Progress, useContextMenu } from "../ui";
+import { accessMenuItems } from "../accessMenu";
 
 type Region = { base: string; size: number; present: boolean; writable: boolean; executable: boolean };
 const kWindow = 0x800;
@@ -65,7 +66,8 @@ export default function MemoryView() {
   const ui = useUi();
   const modules = useConn((s) => s.modules);
   const names = useNames();
-  const { bookmarks, addBookmark } = useWatch();
+  const { bookmarks, addBookmark, addWatch } = useWatch();
+  const [openMenu, menu] = useContextMenu();
   const base = ui.memoryAt ? toBig(ui.memoryAt) & ~0xfn : null;
   const [data, setData] = useState<Uint8Array | null>(null);
   const prev = useRef<Uint8Array | null>(null);
@@ -201,6 +203,25 @@ export default function MemoryView() {
     }
   };
 
+  /** Right-click on a byte: the selection (up to 8 bytes) when the byte is in it, else that byte. */
+  const cellMenu = (e: React.MouseEvent, a: bigint) => {
+    const keep = inRange(a) && rangeLo !== null && rangeLen >= 1 && rangeLen <= 8;
+    const start = keep ? rangeLo! : a;
+    if (!keep) {
+      setSelEnd(null);
+      ui.select(fmtAddr(a));
+    }
+    const size = keep ? rangeLen : 4;
+    openMenu(e, [
+      ...accessMenuItems(fmtAddr(start), size),
+      "sep",
+      { label: "Add to watchlist", onClick: () => addWatch(fmtAddr(start)) },
+      { label: "Bookmark", onClick: () => addBookmark(fmtAddr(start)) },
+      { label: "Disassemble here", onClick: () => ui.goDisasm(fmtAddr(start)) },
+      { label: "Copy address", onClick: () => void navigator.clipboard?.writeText(fmtAddr(start)).catch(() => undefined) },
+    ]);
+  };
+
   const bookmarked = useMemo(() => new Set(bookmarks.map((b) => toBig(b.address))), [bookmarks]);
   const named = useMemo(() => new Map(names.names.filter((n) => n.name).map((n) => [toBig("0x" + n.address), n.name])), [names.names]);
 
@@ -236,7 +257,7 @@ export default function MemoryView() {
             <IconButton tip="Find previous (Shift+Enter)" onClick={() => void find(-1)} disabled={!findText || finding !== null}><ChevronLeft size={14} /></IconButton>
             <IconButton tip="Find next (Enter)" onClick={() => void find(1)} disabled={!findText || finding !== null}><ChevronRight size={14} /></IconButton>
             {finding !== null && <><span className="faint" style={{ fontSize: 12 }}>{(finding / 1048576).toFixed(0)} MiB…</span><button className="btn small" onClick={() => { findAbort.current.aborted = true; }}>Stop</button></>}
-            <span className="faint" style={{ fontSize: 12 }}>click selects · shift-click extends · double-click edits</span>
+            <span className="faint" style={{ fontSize: 12 }}>click selects · shift-click extends · double-click edits · right-click: find what writes</span>
           </div>
           {finding !== null && <Progress value={0.5} />}
           <div className="split-h" style={{ gridTemplateColumns: showInspect ? "minmax(0, 1fr) 250px" : "minmax(0, 1fr)", flex: 1, minHeight: 0, height: "auto" }}>
@@ -267,7 +288,7 @@ export default function MemoryView() {
                           const nm = named.get(a);
                           return (
                             <span key={c} className="hex-cell" data-zero={b === 0} data-changed={prev.current ? prev.current[off] !== b : false} data-sel={sel === a} data-range={inRange(a) && sel !== a} data-named={Boolean(nm)} title={nm}
-                              onClick={(e) => { if (e.shiftKey && sel !== null) setSelEnd(a); else { setSelEnd(null); ui.select(fmtAddr(a)); } }} onDoubleClick={() => setEdit(off)}>
+                              onClick={(e) => { if (e.shiftKey && sel !== null) setSelEnd(a); else { setSelEnd(null); ui.select(fmtAddr(a)); } }} onDoubleClick={() => setEdit(off)} onContextMenu={(e) => cellMenu(e, a)}>
                               {b.toString(16).padStart(2, "0").toUpperCase()}
                             </span>
                           );
@@ -306,6 +327,7 @@ export default function MemoryView() {
           </div>
         </div>
       </div>
+      {menu}
     </NeedsAgent>
   );
 }

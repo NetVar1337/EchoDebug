@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { mapPeFile } from "./analysis/pe";
 import { readCodeView } from "./analysis/peextra";
-import { protoAt, protoText, symAddr } from "./pdb";
+import { pdbPrototype, protoAt, protoText, symAddr } from "./pdb";
+import { lookupPrototype } from "./analysis/prototypes";
+import { decompile } from "./analysis/decompile";
+import { buildStructure } from "./analysis/structure";
 import { entryId, pdbFunctionAt, pdbFunctions, pdbSymbolAt, useSymbols, type PdbSym } from "@/store/symbols";
 import { useNames } from "@/store/names";
 
@@ -59,6 +62,27 @@ describe("symbol lookups over a loaded PDB", () => {
     expect(protoAt("0x140001000")).toEqual({ name: "entity_score", ret: "int", params: [{ name: "e", type: "Entity*" }, { name: "bonus", type: "int" }] });
     expect(protoText(syms[1])).toBe("void entity_init(Entity* e, unsigned __int64 id)");
     expect(protoText(syms[2])).toBe("int mainCRTStartup(void)");
+  });
+
+  it("is the decompiler's first prototype provider", () => {
+    useSymbols.getState().upsert(entryId(m), {
+      module: m.name,
+      base: m.base,
+      symbols: [...syms, { rva: 0x1080, name: "memcpy", kind: "function", size: 16, ret: "void", params: [{ name: "fmt", type: "char*", size: 8 }, { name: "", type: "...", size: 0 }] }],
+    });
+    expect(pdbPrototype("0x140001000")).toEqual({ name: "entity_score", returns: "int", args: [{ name: "e", type: "Entity*" }, { name: "bonus", type: "int" }] });
+    expect(pdbPrototype("0x140003010")).toBeNull(); // data
+    // asked before the built-in table (which knows memcpy with three arguments)
+    expect(lookupPrototype("0x140001080", "memcpy")).toEqual({ name: "memcpy", returns: "void", args: [{ name: "fmt", type: "char*" }], variadic: true });
+    expect(lookupPrototype("0x150000000", "memcpy")?.args).toHaveLength(3);
+    // the decompiled signature takes its names and types
+    const insns = [
+      { address: "0x140001000", length: 3, text: "mov eax, edx" },
+      { address: "0x140001003", length: 3, text: "add eax, dword ptr [rcx]" },
+      { address: "0x140001006", length: 1, text: "ret" },
+    ];
+    const d = decompile(buildStructure(insns), { abi: "win64", entry: "0x140001000" });
+    expect(d.signature).toBe("int __fastcall entity_score(Entity* e, int bonus)");
   });
 
   it("copies names in bulk as one step without replacing the user's", () => {

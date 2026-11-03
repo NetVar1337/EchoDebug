@@ -252,9 +252,10 @@ mod linux {
 
     type Captured = HashMap<i32, Result<ThreadRegs, String>>;
 
-    /// Stops `tids`, reads their registers, runs `f` while they are still stopped, resumes them.
-    fn with_stopped<R>(relay: &Relay, tids: &[i32], f: impl FnOnce(&Captured, &str) -> R) -> R {
-        if crate::local_dbg::active() {
+    /// Stops `tids` (threads of `pid`), reads their registers, runs `f` while they are still
+    /// stopped, resumes them.
+    fn with_stopped<R>(relay: &Relay, pid: u32, tids: &[i32], f: impl FnOnce(&Captured, &str) -> R) -> R {
+        if crate::local_dbg::active_on(pid) {
             let mut req = Map::new();
             req.insert("type".into(), json!("dbg_all_regs"));
             let r = crate::local_dbg::handle(relay, &req);
@@ -497,7 +498,7 @@ mod linux {
         if !regs_wanted {
             return build(&HashMap::new(), "none");
         }
-        with_stopped(relay, &ids, build)
+        with_stopped(relay, pid, &ids, build)
     }
 
     fn stack(relay: &Relay, req: &Map<String, Value>, pid: u32) -> Value {
@@ -510,7 +511,7 @@ mod linux {
             Err(e) => return failed(e),
         };
         let max = max_frames(req);
-        with_stopped(relay, &[tid], |cap, source| match cap.get(&tid) {
+        with_stopped(relay, pid, &[tid], |cap, source| match cap.get(&tid) {
             Some(Ok(r)) => {
                 let frames = unwind_all(&ctx, &[(tid, r.regs.clone())], max).remove(&tid).unwrap_or_default();
                 json!({ "type": "stack_result", "success": true, "pid": pid, "tid": tid, "registers_from": source,

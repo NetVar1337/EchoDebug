@@ -320,7 +320,7 @@ impl<'a, M: Memory + ?Sized> Unwinder<'a, M> {
                     let ra = self.mem.u64(rsp)?;
                     let mut r = regs.clone();
                     r.rip = ra;
-                    r.set(RSP, rsp + 8);
+                    r.set(RSP, rsp.wrapping_add(8));
                     return Some((r, Method::Leaf, false, false));
                 }
             } else if kind == 2 {
@@ -344,7 +344,7 @@ impl<'a, M: Memory + ?Sized> Unwinder<'a, M> {
             }
         };
         let Some(fde) = parse_fde(mem, fde_addr, &mut self.cies) else { return Cfi::NoInfo };
-        if lookup < fde.pc_begin || lookup >= fde.pc_begin + fde.pc_range {
+        if lookup < fde.pc_begin || lookup >= fde.pc_begin.saturating_add(fde.pc_range) {
             return Cfi::NoInfo;
         }
         let Some(row) = run_cfa(mem, &fde, lookup) else { return Cfi::NoInfo };
@@ -363,11 +363,11 @@ impl<'a, M: Memory + ?Sized> Unwinder<'a, M> {
         let rsp = regs.gpr[RSP]?;
         if let Some(rbp) = regs.gpr[RBP] {
             if rbp >= rsp && rbp - rsp < 16 << 20 && rbp % 8 == 0 {
-                if let (Some(saved), Some(ra)) = (self.mem.u64(rbp), self.mem.u64(rbp + 8)) {
+                if let (Some(saved), Some(ra)) = (self.mem.u64(rbp), self.mem.u64(rbp.wrapping_add(8))) {
                     if self.module_of(ra).is_some() && self.after_call(ra) {
                         let mut r = regs.clone();
                         r.rip = ra;
-                        r.set(RSP, rbp + 16);
+                        r.set(RSP, rbp.wrapping_add(16));
                         r.set(RBP, saved);
                         return Some((r, Method::FramePointer, true, false));
                     }
@@ -385,8 +385,8 @@ impl<'a, M: Memory + ?Sized> Unwinder<'a, M> {
             if !self.mem.read(slot, buf) {
                 // the stack ends at a page boundary: read what is left one qword at a time
                 for i in 0..take {
-                    let Some(v) = self.mem.u64(slot + i as u64 * 8) else { break };
-                    if let Some(r) = self.scan_hit(regs, v, slot + i as u64 * 8) {
+                    let Some(v) = self.mem.u64(slot.wrapping_add(i as u64 * 8)) else { break };
+                    if let Some(r) = self.scan_hit(regs, v, slot.wrapping_add(i as u64 * 8)) {
                         return Some(r);
                     }
                 }
@@ -394,11 +394,11 @@ impl<'a, M: Memory + ?Sized> Unwinder<'a, M> {
             }
             for i in 0..take {
                 let v = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
-                if let Some(r) = self.scan_hit(regs, v, slot + i as u64 * 8) {
+                if let Some(r) = self.scan_hit(regs, v, slot.wrapping_add(i as u64 * 8)) {
                     return Some(r);
                 }
             }
-            slot += take as u64 * 8;
+            slot = slot.wrapping_add(take as u64 * 8);
             done += take;
         }
         None
@@ -410,7 +410,7 @@ impl<'a, M: Memory + ?Sized> Unwinder<'a, M> {
         }
         let mut r = regs.clone();
         r.rip = v;
-        r.set(RSP, at + 8);
+        r.set(RSP, at.wrapping_add(8));
         Some((r, Method::Scan, true, false))
     }
 
@@ -469,21 +469,21 @@ fn load_tables(mem: &(impl Memory + ?Sized), base: u64) -> Tables {
 
 /// (rva, size) of data directory `index` of the PE32+ image at `base`.
 pub fn pe_directory(mem: &(impl Memory + ?Sized), base: u64, index: u32) -> Option<(u32, u32)> {
-    let nt = base + mem.u32(base + 0x3c)? as u64;
+    let nt = base.wrapping_add(mem.u32(base.wrapping_add(0x3c))? as u64);
     if mem.u32(nt)? != 0x4550 {
         return None;
     }
-    let oh = nt + 24;
+    let oh = nt.wrapping_add(24);
     let (dirs, count) = match mem.u16(oh)? {
-        0x20b => (oh + 112, mem.u32(oh + 108)?),
-        0x10b => (oh + 96, mem.u32(oh + 92)?),
+        0x20b => (oh.wrapping_add(112), mem.u32(oh.wrapping_add(108))?),
+        0x10b => (oh.wrapping_add(96), mem.u32(oh.wrapping_add(92))?),
         _ => return None,
     };
     if index >= count.min(16) {
         return None;
     }
-    let rva = mem.u32(dirs + index as u64 * 8)?;
-    let size = mem.u32(dirs + index as u64 * 8 + 4)?;
+    let rva = mem.u32(dirs.wrapping_add(index as u64 * 8))?;
+    let size = mem.u32(dirs.wrapping_add(index as u64 * 8 + 4))?;
     (rva != 0 && size != 0).then_some((rva, size))
 }
 
@@ -491,7 +491,7 @@ pub fn pe_directory(mem: &(impl Memory + ?Sized), base: u64, index: u32) -> Opti
 pub fn read_pdata(mem: &(impl Memory + ?Sized), base: u64) -> Option<Vec<RuntimeFunction>> {
     let (rva, size) = pe_directory(mem, base, 3)?;
     let n = (size as usize / 12).min(MAX_PDATA);
-    let raw = mem.bytes(base + rva as u64, n * 12)?;
+    let raw = mem.bytes(base.wrapping_add(rva as u64), n * 12)?;
     let mut v: Vec<RuntimeFunction> = raw
         .as_chunks::<12>()
         .0
@@ -510,15 +510,15 @@ pub fn read_pdata(mem: &(impl Memory + ?Sized), base: u64) -> Option<Vec<Runtime
 /// Exported functions (rva, name) of the PE image at `base`, sorted by rva.
 pub fn pe_exports(mem: &(impl Memory + ?Sized), base: u64) -> Vec<(u64, String)> {
     let Some((rva, size)) = pe_directory(mem, base, 0) else { return Vec::new() };
-    let d = base + rva as u64;
+    let d = base.wrapping_add(rva as u64);
     let (Some(nfuncs), Some(nnames), Some(funcs), Some(names), Some(ords)) =
-        (mem.u32(d + 20), mem.u32(d + 24), mem.u32(d + 28), mem.u32(d + 32), mem.u32(d + 36))
+        (mem.u32(d.wrapping_add(20)), mem.u32(d.wrapping_add(24)), mem.u32(d.wrapping_add(28)), mem.u32(d.wrapping_add(32)), mem.u32(d.wrapping_add(36)))
     else {
         return Vec::new();
     };
     let nnames = nnames.min(65536) as usize;
     let nfuncs = nfuncs.min(65536);
-    let (Some(name_tab), Some(ord_tab)) = (mem.bytes(base + names as u64, nnames * 4), mem.bytes(base + ords as u64, nnames * 2)) else {
+    let (Some(name_tab), Some(ord_tab)) = (mem.bytes(base.wrapping_add(names as u64), nnames * 4), mem.bytes(base.wrapping_add(ords as u64), nnames * 2)) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -528,11 +528,11 @@ pub fn pe_exports(mem: &(impl Memory + ?Sized), base: u64) -> Vec<(u64, String)>
         if ord >= nfuncs {
             continue;
         }
-        let Some(frva) = mem.u32(base + funcs as u64 + ord as u64 * 4) else { continue };
-        if frva >= rva && frva < rva + size {
+        let Some(frva) = mem.u32(base.wrapping_add(funcs as u64 + ord as u64 * 4)) else { continue };
+        if frva >= rva && (frva as u64) < rva as u64 + size as u64 {
             continue; // forwarder
         }
-        if let Some(name) = read_cstr(mem, base + nrva as u64, 256) {
+        if let Some(name) = read_cstr(mem, base.wrapping_add(nrva as u64), 256) {
             out.push((frva as u64, name));
         }
     }
@@ -553,7 +553,7 @@ pub fn read_cstr(mem: &(impl Memory + ?Sized), addr: u64, max: usize) -> Option<
                     return String::from_utf8(out).ok();
                 }
                 out.push(b);
-                a += 1;
+                a = a.wrapping_add(1);
             }
         }
         if let Some(z) = chunk.iter().position(|&b| b == 0) {
@@ -561,7 +561,7 @@ pub fn read_cstr(mem: &(impl Memory + ?Sized), addr: u64, max: usize) -> Option<
             return String::from_utf8(out).ok();
         }
         out.extend_from_slice(&chunk);
-        a += 64;
+        a = a.wrapping_add(64);
     }
     String::from_utf8(out).ok()
 }
@@ -612,7 +612,7 @@ fn code_slots(op: u8, info: u8) -> usize {
 
 /// Parses the UNWIND_INFO at `base + rva`.
 pub fn parse_unwind_info(mem: &(impl Memory + ?Sized), base: u64, rva: u32) -> Option<UnwindInfo> {
-    let at = base + rva as u64;
+    let at = base.wrapping_add(rva as u64);
     let hdr = mem.bytes(at, 4)?;
     let version = hdr[0] & 7;
     let flags = hdr[0] >> 3;
@@ -620,7 +620,7 @@ pub fn parse_unwind_info(mem: &(impl Memory + ?Sized), base: u64, rva: u32) -> O
         return None;
     }
     let count = hdr[2] as usize;
-    let slots = mem.bytes(at + 4, count * 2)?;
+    let slots = mem.bytes(at.wrapping_add(4), count * 2)?;
     let slot = |i: usize| u16::from_le_bytes([slots[i * 2], slots[i * 2 + 1]]);
     let mut codes = Vec::new();
     let mut i = 0;
@@ -639,7 +639,7 @@ pub fn parse_unwind_info(mem: &(impl Memory + ?Sized), base: u64, rva: u32) -> O
         codes.push(UnwindCode { offset, op, info, operand });
         i += n;
     }
-    let tail = at + 4 + (((count + 1) & !1) * 2) as u64;
+    let tail = at.wrapping_add(4 + (((count + 1) & !1) * 2) as u64);
     let (mut handler, mut handler_data, mut chained) = (None, None, None);
     if flags & UNW_FLAG_CHAININFO != 0 {
         let b = mem.bytes(tail, 12)?;
@@ -650,7 +650,7 @@ pub fn parse_unwind_info(mem: &(impl Memory + ?Sized), base: u64, rva: u32) -> O
         });
     } else if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
         handler = Some(mem.u32(tail)?);
-        handler_data = Some((tail + 4 - base) as u32);
+        handler_data = Some(tail.wrapping_add(4).wrapping_sub(base) as u32);
     }
     Some(UnwindInfo { version, flags, prolog_size: hdr[1], frame_reg: hdr[3] & 0xf, frame_offset: hdr[3] >> 4, codes, handler, handler_data, chained })
 }
@@ -661,7 +661,7 @@ fn resolve_unwind_rva(mem: &(impl Memory + ?Sized), base: u64, mut unwind: u32) 
         if unwind & 1 == 0 {
             return Some(unwind);
         }
-        unwind = mem.u32(base + (unwind & !1) as u64 + 8)?;
+        unwind = mem.u32(base.wrapping_add((unwind & !1) as u64 + 8))?;
     }
     None
 }
@@ -678,7 +678,7 @@ pub fn pe_unwind(mem: &(impl Memory + ?Sized), base: u64, f: RuntimeFunction, pc
         let frame = if sets_fp { regs.gpr[info.frame_reg as usize]?.wrapping_sub(info.frame_offset as u64 * 16) } else { regs.gpr[RSP]? };
         // an epilog only exists in the primary function and only after its prolog; the top frame
         // is the only one that can be inside one (callers sit right after a call)
-        if first && top && prolog_offset >= info.prolog_size as u64 && unwind_epilog(mem, pc, (base + f.begin as u64, base + f.end as u64), &info, regs).is_some() {
+        if first && top && prolog_offset >= info.prolog_size as u64 && unwind_epilog(mem, pc, (base.wrapping_add(f.begin as u64), base.wrapping_add(f.end as u64)), &info, regs).is_some() {
             return Some(());
         }
         for c in &info.codes {
@@ -689,25 +689,25 @@ pub fn pe_unwind(mem: &(impl Memory + ?Sized), base: u64, f: RuntimeFunction, pc
             match c.op {
                 0 => {
                     regs.gpr[c.info as usize] = Some(mem.u64(rsp)?);
-                    regs.set(RSP, rsp + 8);
+                    regs.set(RSP, rsp.wrapping_add(8));
                 }
                 1 => {
                     let n = if c.info == 0 { c.operand as u64 * 8 } else { c.operand as u64 };
-                    regs.set(RSP, rsp + n);
+                    regs.set(RSP, rsp.wrapping_add(n));
                 }
-                2 => regs.set(RSP, rsp + c.info as u64 * 8 + 8),
+                2 => regs.set(RSP, rsp.wrapping_add(c.info as u64 * 8 + 8)),
                 3 => regs.set(RSP, frame),
-                4 => regs.gpr[c.info as usize] = Some(mem.u64(frame + c.operand as u64 * 8)?),
-                5 => regs.gpr[c.info as usize] = Some(mem.u64(frame + c.operand as u64)?),
+                4 => regs.gpr[c.info as usize] = Some(mem.u64(frame.wrapping_add(c.operand as u64 * 8))?),
+                5 => regs.gpr[c.info as usize] = Some(mem.u64(frame.wrapping_add(c.operand as u64))?),
                 // XMM saves (we do not track vector registers) and the v2 epilog descriptors
                 6 | 8 | 9 => {}
                 10 => {
                     let mut sp = rsp;
                     if c.info != 0 {
-                        sp += 8; // error code
+                        sp = sp.wrapping_add(8); // error code
                     }
                     regs.rip = mem.u64(sp)?;
-                    regs.set(RSP, mem.u64(sp + 24)?);
+                    regs.set(RSP, mem.u64(sp.wrapping_add(24))?);
                     machine_frame = true;
                 }
                 _ => return None,
@@ -725,7 +725,7 @@ pub fn pe_unwind(mem: &(impl Memory + ?Sized), base: u64, f: RuntimeFunction, pc
     if !machine_frame {
         let rsp = regs.gpr[RSP]?;
         regs.rip = mem.u64(rsp)?;
-        regs.set(RSP, rsp + 8);
+        regs.set(RSP, rsp.wrapping_add(8));
     }
     Some(())
 }
@@ -781,14 +781,14 @@ fn unwind_epilog(mem: &(impl Memory + ?Sized), pc: u64, func: (u64, u64), info: 
             Some([0xc3, ..]) | Some([0xc2, _, _, ..]) | Some([0xf3, 0xc3, ..]) => break,
             // tail call: jmp rel32 / rel8 to outside the function, or jmp [rip+disp32]
             Some([0xe9, a, b, c, d, ..]) => {
-                let to = (pc + i as u64 + 5).wrapping_add(i32::from_le_bytes([*a, *b, *c, *d]) as i64 as u64);
+                let to = pc.wrapping_add(i as u64 + 5).wrapping_add(i32::from_le_bytes([*a, *b, *c, *d]) as i64 as u64);
                 if to >= func.0 && to < func.1 {
                     return None;
                 }
                 break;
             }
             Some([0xeb, d, ..]) => {
-                let to = (pc + i as u64 + 2).wrapping_add(*d as i8 as i64 as u64);
+                let to = pc.wrapping_add(i as u64 + 2).wrapping_add(*d as i8 as i64 as u64);
                 if to >= func.0 && to < func.1 {
                     return None;
                 }
@@ -801,10 +801,10 @@ fn unwind_epilog(mem: &(impl Memory + ?Sized), pc: u64, func: (u64, u64), info: 
     let mut out = regs.clone();
     for r in pops {
         out.gpr[r] = Some(mem.u64(sp)?);
-        sp += 8;
+        sp = sp.wrapping_add(8);
     }
     out.rip = mem.u64(sp)?;
-    out.set(RSP, sp + 8);
+    out.set(RSP, sp.wrapping_add(8));
     *regs = out;
     Some(())
 }
@@ -833,7 +833,7 @@ fn uleb(mem: &(impl Memory + ?Sized), p: &mut u64) -> Option<u64> {
     let mut shift = 0;
     loop {
         let b = mem.u8(*p)?;
-        *p += 1;
+        *p = p.wrapping_add(1);
         if shift < 64 {
             v |= ((b & 0x7f) as u64) << shift;
         }
@@ -852,7 +852,7 @@ fn sleb(mem: &(impl Memory + ?Sized), p: &mut u64) -> Option<i64> {
     let mut shift = 0;
     loop {
         let b = mem.u8(*p)?;
-        *p += 1;
+        *p = p.wrapping_add(1);
         if shift < 64 {
             v |= ((b & 0x7f) as i64) << shift;
         }
@@ -877,33 +877,33 @@ fn read_encoded(mem: &(impl Memory + ?Sized), p: &mut u64, enc: u8, datarel: u64
     let field = *p;
     let raw = match enc & 0x0f {
         0x00 => {
-            *p += 8;
+            *p = p.wrapping_add(8);
             mem.u64(field)?
         }
         0x01 => uleb(mem, p)?,
         0x02 => {
-            *p += 2;
+            *p = p.wrapping_add(2);
             mem.u16(field)? as u64
         }
         0x03 => {
-            *p += 4;
+            *p = p.wrapping_add(4);
             mem.u32(field)? as u64
         }
         0x04 => {
-            *p += 8;
+            *p = p.wrapping_add(8);
             mem.u64(field)?
         }
         0x09 => sleb(mem, p)? as u64,
         0x0a => {
-            *p += 2;
+            *p = p.wrapping_add(2);
             mem.u16(field)? as i16 as i64 as u64
         }
         0x0b => {
-            *p += 4;
+            *p = p.wrapping_add(4);
             mem.u32(field)? as i32 as i64 as u64
         }
         0x0c => {
-            *p += 8;
+            *p = p.wrapping_add(8);
             mem.u64(field)?
         }
         _ => return None,
@@ -922,21 +922,21 @@ fn read_encoded(mem: &(impl Memory + ?Sized), p: &mut u64, enc: u8, datarel: u64
 
 impl EhFrame {
     fn locate(mem: &(impl Memory + ?Sized), base: u64) -> Option<EhFrame> {
-        if mem.u8(base + 4)? != 2 {
+        if mem.u8(base.wrapping_add(4))? != 2 {
             return None; // ELF64 only
         }
-        let phoff = mem.u64(base + 0x20)?;
-        let phentsize = mem.u16(base + 0x36)? as u64;
-        let phnum = mem.u16(base + 0x38)? as u64;
+        let phoff = mem.u64(base.wrapping_add(0x20))?;
+        let phentsize = mem.u16(base.wrapping_add(0x36))? as u64;
+        let phnum = mem.u16(base.wrapping_add(0x38))? as u64;
         if phentsize < 56 || phnum > 256 {
             return None;
         }
         let mut lowest = u64::MAX;
         let mut eh = None;
         for i in 0..phnum {
-            let ph = base + phoff + i * phentsize;
+            let ph = base.wrapping_add(phoff).wrapping_add(i * phentsize);
             let ty = mem.u32(ph)?;
-            let vaddr = mem.u64(ph + 16)?;
+            let vaddr = mem.u64(ph.wrapping_add(16))?;
             if ty == PT_LOAD {
                 lowest = lowest.min(vaddr);
             } else if ty == PT_GNU_EH_FRAME {
@@ -953,7 +953,7 @@ impl EhFrame {
         if h[0] != 1 {
             return None;
         }
-        let mut p = hdr + 4;
+        let mut p = hdr.wrapping_add(4);
         let eh_frame = read_encoded(mem, &mut p, h[1], hdr)?;
         let count = if h[2] == DW_EH_PE_OMIT { None } else { read_encoded(mem, &mut p, h[2], hdr) };
         let table = match count {
@@ -970,7 +970,7 @@ impl EhFrame {
             let (mut lo, mut hi) = (0u64, n);
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                let loc = self.hdr.wrapping_add(mem.u32(tab + mid * 8)? as i32 as i64 as u64);
+                let loc = self.hdr.wrapping_add(mem.u32(tab.wrapping_add(mid * 8))? as i32 as i64 as u64);
                 if loc <= pc {
                     lo = mid + 1;
                 } else {
@@ -978,7 +978,7 @@ impl EhFrame {
                 }
             }
             let i = lo.checked_sub(1)?;
-            return Some(self.hdr.wrapping_add(mem.u32(tab + i * 8 + 4)? as i32 as i64 as u64));
+            return Some(self.hdr.wrapping_add(mem.u32(tab.wrapping_add(i * 8 + 4))? as i32 as i64 as u64));
         }
         let list = self.linear.get_or_init(|| linear_fdes(mem, self.eh_frame));
         let i = list.partition_point(|e| e.0 <= pc);
@@ -998,14 +998,14 @@ fn linear_fdes(mem: &(impl Memory + ?Sized), start: u64) -> Vec<(u64, u64, u64)>
             break;
         }
         let (body, next) = if len == 0xffff_ffff {
-            let Some(l) = mem.u64(p + 4) else { break };
-            (p + 12, p + 12 + l)
+            let Some(l) = mem.u64(p.wrapping_add(4)) else { break };
+            (p.wrapping_add(12), p.wrapping_add(12).wrapping_add(l))
         } else {
-            (p + 4, p + 4 + len as u64)
+            (p.wrapping_add(4), p.wrapping_add(4 + len as u64))
         };
         if mem.u32(body).is_some_and(|id| id != 0) {
             if let Some(f) = parse_fde(mem, p, &mut cies) {
-                out.push((f.pc_begin, f.pc_begin + f.pc_range, p));
+                out.push((f.pc_begin, f.pc_begin.saturating_add(f.pc_range), p));
             }
         }
         p = next;
@@ -1041,32 +1041,32 @@ fn record(mem: &(impl Memory + ?Sized), p: u64) -> Option<(u64, u64, bool)> {
         return None;
     }
     if len == 0xffff_ffff {
-        let l = mem.u64(p + 4)?;
-        return Some((p + 12, p + 12 + l, true));
+        let l = mem.u64(p.wrapping_add(4))?;
+        return Some((p.wrapping_add(12), p.wrapping_add(12).wrapping_add(l), true));
     }
-    Some((p + 4, p + 4 + len as u64, false))
+    Some((p.wrapping_add(4), p.wrapping_add(4 + len as u64), false))
 }
 
 fn parse_cie(mem: &(impl Memory + ?Sized), at: u64) -> Option<Cie> {
     let (body, end, wide) = record(mem, at)?;
     let mut p = body;
     let id = if wide { mem.u64(p)? } else { mem.u32(p)? as u64 };
-    p += if wide { 8 } else { 4 };
+    p = p.wrapping_add(if wide { 8 } else { 4 });
     if id != 0 {
         return None;
     }
     let version = mem.u8(p)?;
-    p += 1;
+    p = p.wrapping_add(1);
     let aug = read_cstr(mem, p, 16)?;
-    p += aug.len() as u64 + 1;
+    p = p.wrapping_add(aug.len() as u64 + 1);
     if aug.contains("eh") {
-        p += 8;
+        p = p.wrapping_add(8);
     }
     let code_align = uleb(mem, &mut p)?;
     let data_align = sleb(mem, &mut p)?;
     let ra_reg = if version == 1 {
-        p += 1;
-        mem.u8(p - 1)? as u16
+        p = p.wrapping_add(1);
+        mem.u8(p.wrapping_sub(1))? as u16
     } else {
         uleb(mem, &mut p)? as u16
     };
@@ -1074,20 +1074,20 @@ fn parse_cie(mem: &(impl Memory + ?Sized), at: u64) -> Option<Cie> {
     if let Some(rest) = aug.strip_prefix('z') {
         cie.has_aug_data = true;
         let len = uleb(mem, &mut p)?;
-        let data_end = p + len;
+        let data_end = p.wrapping_add(len);
         for c in rest.chars() {
             match c {
                 'R' => {
                     cie.fde_enc = mem.u8(p)?;
-                    p += 1;
+                    p = p.wrapping_add(1);
                 }
                 'L' => {
                     cie.lsda_enc = mem.u8(p)?;
-                    p += 1;
+                    p = p.wrapping_add(1);
                 }
                 'P' => {
                     let enc = mem.u8(p)?;
-                    p += 1;
+                    p = p.wrapping_add(1);
                     read_encoded(mem, &mut p, enc & 0x7f, 0)?; // personality (not needed)
                 }
                 'S' => cie.signal = true,
@@ -1111,13 +1111,13 @@ fn parse_fde(mem: &(impl Memory + ?Sized), at: u64, cies: &mut HashMap<u64, Opti
         return None; // a CIE
     }
     let cie_at = p.checked_sub(ptr)?;
-    p += if wide { 8 } else { 4 };
+    p = p.wrapping_add(if wide { 8 } else { 4 });
     let cie = cies.entry(cie_at).or_insert_with(|| parse_cie(mem, cie_at)).clone()?;
     let pc_begin = read_encoded(mem, &mut p, cie.fde_enc, 0)?;
     let pc_range = read_encoded(mem, &mut p, cie.fde_enc & 0x0f, 0)?;
     if cie.has_aug_data {
         let len = uleb(mem, &mut p)?;
-        p += len;
+        p = p.wrapping_add(len);
     }
     Some(Fde { cie, pc_begin, pc_range, insns: (p, end) })
 }
@@ -1179,7 +1179,7 @@ fn exec_cfa(mem: &(impl Memory + ?Sized), cie: &Cie, (start, end): (u64, u64), r
             return None;
         }
         let op = mem.u8(p)?;
-        p += 1;
+        p = p.wrapping_add(1);
         let advance = |loc: &mut u64, delta: u64| -> bool {
             *loc = loc.wrapping_add(delta.wrapping_mul(cie.code_align));
             *loc > pc
@@ -1192,7 +1192,7 @@ fn exec_cfa(mem: &(impl Memory + ?Sized), cie: &Cie, (start, end): (u64, u64), r
                 continue;
             }
             2 => {
-                let off = uleb(mem, &mut p)? as i64 * cie.data_align;
+                let off = (uleb(mem, &mut p)? as i64).wrapping_mul(cie.data_align);
                 set(row, (op & 0x3f) as u64, Rule::Offset(off));
                 continue;
             }
@@ -1212,28 +1212,28 @@ fn exec_cfa(mem: &(impl Memory + ?Sized), cie: &Cie, (start, end): (u64, u64), r
             }
             0x02 => {
                 let d = mem.u8(p)? as u64;
-                p += 1;
+                p = p.wrapping_add(1);
                 if advance(loc, d) {
                     return Some(());
                 }
             }
             0x03 => {
                 let d = mem.u16(p)? as u64;
-                p += 2;
+                p = p.wrapping_add(2);
                 if advance(loc, d) {
                     return Some(());
                 }
             }
             0x04 => {
                 let d = mem.u32(p)? as u64;
-                p += 4;
+                p = p.wrapping_add(4);
                 if advance(loc, d) {
                     return Some(());
                 }
             }
             0x05 => {
                 let r = uleb(mem, &mut p)?;
-                let off = uleb(mem, &mut p)? as i64 * cie.data_align;
+                let off = (uleb(mem, &mut p)? as i64).wrapping_mul(cie.data_align);
                 set(row, r, Rule::Offset(off));
             }
             0x06 => {
@@ -1279,39 +1279,39 @@ fn exec_cfa(mem: &(impl Memory + ?Sized), cie: &Cie, (start, end): (u64, u64), r
             }
             0x0f => {
                 let len = uleb(mem, &mut p)?;
-                row.cfa = CfaRule::Expr(p, p + len);
-                p += len;
+                row.cfa = CfaRule::Expr(p, p.wrapping_add(len));
+                p = p.wrapping_add(len);
             }
             0x10 | 0x16 => {
                 let r = uleb(mem, &mut p)?;
                 let len = uleb(mem, &mut p)?;
-                set(row, r, if op == 0x10 { Rule::Expr(p, p + len) } else { Rule::ValExpr(p, p + len) });
-                p += len;
+                set(row, r, if op == 0x10 { Rule::Expr(p, p.wrapping_add(len)) } else { Rule::ValExpr(p, p.wrapping_add(len)) });
+                p = p.wrapping_add(len);
             }
             0x11 => {
                 let r = uleb(mem, &mut p)?;
-                let off = sleb(mem, &mut p)? * cie.data_align;
+                let off = sleb(mem, &mut p)?.wrapping_mul(cie.data_align);
                 set(row, r, Rule::Offset(off));
             }
             0x12 => {
                 let r = uleb(mem, &mut p)?;
-                let off = sleb(mem, &mut p)? * cie.data_align;
+                let off = sleb(mem, &mut p)?.wrapping_mul(cie.data_align);
                 row.cfa = CfaRule::RegOffset(r as u16, off);
             }
             0x13 => {
-                let off = sleb(mem, &mut p)? * cie.data_align;
+                let off = sleb(mem, &mut p)?.wrapping_mul(cie.data_align);
                 if let CfaRule::RegOffset(r, _) = row.cfa {
                     row.cfa = CfaRule::RegOffset(r, off);
                 }
             }
             0x14 => {
                 let r = uleb(mem, &mut p)?;
-                let off = uleb(mem, &mut p)? as i64 * cie.data_align;
+                let off = (uleb(mem, &mut p)? as i64).wrapping_mul(cie.data_align);
                 set(row, r, Rule::ValOffset(off));
             }
             0x15 => {
                 let r = uleb(mem, &mut p)?;
-                let off = sleb(mem, &mut p)? * cie.data_align;
+                let off = sleb(mem, &mut p)?.wrapping_mul(cie.data_align);
                 set(row, r, Rule::ValOffset(off));
             }
             // DW_CFA_GNU_args_size
@@ -1321,7 +1321,7 @@ fn exec_cfa(mem: &(impl Memory + ?Sized), cie: &Cie, (start, end): (u64, u64), r
             // DW_CFA_GNU_negative_offset_extended
             0x2f => {
                 let r = uleb(mem, &mut p)?;
-                let off = -(uleb(mem, &mut p)? as i64) * cie.data_align;
+                let off = (uleb(mem, &mut p)? as i64).wrapping_neg().wrapping_mul(cie.data_align);
                 set(row, r, Rule::Offset(off));
             }
             _ => return None,
@@ -1347,11 +1347,11 @@ fn eval_expr(mem: &(impl Memory + ?Sized), (start, end): (u64, u64), regs: &Regs
             return None;
         }
         let op = mem.u8(p)?;
-        p += 1;
+        p = p.wrapping_add(1);
         match op {
             0x03 => {
                 st.push(mem.u64(p)?);
-                p += 8;
+                p = p.wrapping_add(8);
             }
             0x06 => {
                 let a = pop!();
@@ -1359,31 +1359,31 @@ fn eval_expr(mem: &(impl Memory + ?Sized), (start, end): (u64, u64), regs: &Regs
             }
             0x08 => {
                 st.push(mem.u8(p)? as u64);
-                p += 1;
+                p = p.wrapping_add(1);
             }
             0x09 => {
                 st.push(mem.u8(p)? as i8 as i64 as u64);
-                p += 1;
+                p = p.wrapping_add(1);
             }
             0x0a => {
                 st.push(mem.u16(p)? as u64);
-                p += 2;
+                p = p.wrapping_add(2);
             }
             0x0b => {
                 st.push(mem.u16(p)? as i16 as i64 as u64);
-                p += 2;
+                p = p.wrapping_add(2);
             }
             0x0c => {
                 st.push(mem.u32(p)? as u64);
-                p += 4;
+                p = p.wrapping_add(4);
             }
             0x0d => {
                 st.push(mem.u32(p)? as i32 as i64 as u64);
-                p += 4;
+                p = p.wrapping_add(4);
             }
             0x0e | 0x0f => {
                 st.push(mem.u64(p)?);
-                p += 8;
+                p = p.wrapping_add(8);
             }
             0x10 => st.push(uleb(mem, &mut p)?),
             0x11 => st.push(sleb(mem, &mut p)? as u64),
@@ -1394,7 +1394,7 @@ fn eval_expr(mem: &(impl Memory + ?Sized), (start, end): (u64, u64), regs: &Regs
             0x14 => st.push(*st.get(st.len().checked_sub(2)?)?),
             0x15 => {
                 let i = mem.u8(p)? as usize;
-                p += 1;
+                p = p.wrapping_add(1);
                 st.push(*st.get(st.len().checked_sub(i + 1)?)?);
             }
             0x16 => {
@@ -1465,14 +1465,14 @@ fn eval_expr(mem: &(impl Memory + ?Sized), (start, end): (u64, u64), regs: &Regs
             }
             0x28 => {
                 let off = mem.u16(p)? as i16 as i64;
-                p += 2;
+                p = p.wrapping_add(2);
                 if pop!() != 0 {
                     p = p.wrapping_add(off as u64);
                 }
             }
             0x2f => {
                 let off = mem.u16(p)? as i16 as i64;
-                p += 2;
+                p = p.wrapping_add(2);
                 p = p.wrapping_add(off as u64);
             }
             0x30..=0x4f => st.push((op - 0x30) as u64),

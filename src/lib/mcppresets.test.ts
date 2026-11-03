@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import tools from "@/lib/tools.json";
 import { allowedTools, changingTools, kPresets, matchPreset } from "./mcppresets";
-import { isGatedVerb, isReadOnlyVerb, kRawWrites } from "./verbclass";
+import { isGatedVerb, isReadOnlyVerb, kGatedDebugger, kRawWrites } from "./verbclass";
 import { explainFailure, maskToken, rpcBody, snippets, testConnection } from "./mcpconnect";
 import { argsFromForm, type Tool } from "@/components/panels/mcp/ToolRunner";
 import { ago, isLive, type McpSession } from "@/components/panels/mcp/Connections";
@@ -53,6 +53,7 @@ describe("MCP tool profiles", () => {
     const src = readFileSync("src-tauri/relay/src/mcp.rs", "utf8");
     const list = (name: string) => [...(new RegExp(`const ${name}: &\\[&str\\] = &\\[([^\\]]*)\\]`).exec(src)?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(new Set(list("DESTRUCTIVE"))).toEqual(kRawWrites);
+    expect(new Set(list("GATED"))).toEqual(kGatedDebugger);
     for (const v of list("STATEFUL")) expect(isReadOnlyVerb(v), v).toBe(false);
   });
 });

@@ -114,17 +114,24 @@ function cert(b: Uint8Array, n: Der): CertInfo | null {
   };
 }
 
-/** The WIN_CERTIFICATE at the Security directory of a PE file, or null when unsigned. */
-export function certificateTable(file: Uint8Array): { offset: number; size: number } | null {
+/** Offsets of the checksum and of the Security directory entry, or null when the headers are cut short. */
+function peLayout(file: Uint8Array): { checksum: number; secDir: number } | null {
   const dv = new DataView(file.buffer, file.byteOffset, file.byteLength);
   if (file.length < 0x40 || dv.getUint16(0, true) !== 0x5a4d) return null;
-  const nt = dv.getUint32(0x3c, true);
-  const oh = nt + 24;
-  const is64 = dv.getUint16(oh, true) === 0x20b;
-  const dd = oh + (is64 ? 112 : 96);
-  const off = dv.getUint32(dd + 4 * 8, true);
-  const size = dv.getUint32(dd + 4 * 8 + 4, true);
-  return off && size && off + size <= file.length ? { offset: off, size } : null;
+  const oh = dv.getUint32(0x3c, true) + 24;
+  if (oh + 2 > file.length) return null;
+  const secDir = oh + (dv.getUint16(oh, true) === 0x20b ? 112 : 96) + 4 * 8;
+  return secDir + 8 <= file.length ? { checksum: oh + 64, secDir } : null;
+}
+
+/** The WIN_CERTIFICATE at the Security directory of a PE file, or null when unsigned. */
+export function certificateTable(file: Uint8Array): { offset: number; size: number } | null {
+  const l = peLayout(file);
+  if (!l) return null;
+  const dv = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  const off = dv.getUint32(l.secDir, true);
+  const size = dv.getUint32(l.secDir + 4, true);
+  return off && size >= 8 && off + size <= file.length ? { offset: off, size } : null;
 }
 
 export function parseSignature(file: Uint8Array): SignatureInfo | null {
@@ -179,12 +186,9 @@ export function parseSignature(file: Uint8Array): SignatureInfo | null {
  * entry and the certificate table itself (the common layout where the table is last).
  */
 export async function authenticodeHash(file: Uint8Array, algorithm: "sha1" | "sha256" = "sha256"): Promise<string> {
-  const dv = new DataView(file.buffer, file.byteOffset, file.byteLength);
-  const nt = dv.getUint32(0x3c, true);
-  const oh = nt + 24;
-  const is64 = dv.getUint16(oh, true) === 0x20b;
-  const checksum = oh + 64;
-  const secDir = oh + (is64 ? 112 : 96) + 4 * 8;
+  const l = peLayout(file);
+  if (!l) throw new Error("not a PE file (headers cut short)");
+  const { checksum, secDir } = l;
   const t = certificateTable(file);
   const end = t ? t.offset : file.length;
   const parts = [file.subarray(0, checksum), file.subarray(checksum + 4, secDir), file.subarray(secDir + 8, end)];

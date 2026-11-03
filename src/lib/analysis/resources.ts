@@ -1,6 +1,6 @@
 // PE resources from a mapped image: the type/name/language tree, version info, string tables,
 // manifests, dialogs (header + controls) and icons (re-assembled into .ico files).
-import { parsePe, type PeInfo } from "./pe";
+import { parsePe, scanBudget, type PeInfo } from "./pe";
 
 export type ResId = number | string;
 export type ResLeaf = { type: ResId; typeName: string; name: ResId; lang: number; rva: number; size: number; codePage: number };
@@ -10,6 +10,9 @@ const kTypes: Record<number, string> = {
   10: "RCDATA", 11: "MESSAGETABLE", 12: "GROUP_CURSOR", 14: "GROUP_ICON", 16: "VERSION", 17: "DLGINCLUDE", 19: "PLUGPLAY",
   20: "VXD", 21: "ANICURSOR", 22: "ANIICON", 23: "HTML", 24: "MANIFEST",
 };
+
+/** Directory entries resourceTree reads at most (real images hold a few thousand). */
+const kMaxEntries = 200_000;
 
 export function resourceTree(img: Uint8Array, pe?: PeInfo): ResLeaf[] {
   const info = pe ?? parsePe(img);
@@ -27,10 +30,15 @@ export function resourceTree(img: Uint8Array, pe?: PeInfo): ResLeaf[] {
     for (let i = 0; i < n && o + 2 + i * 2 + 1 < img.length; i++) s += String.fromCharCode(dv.getUint16(o + 2 + i * 2, true));
     return s;
   };
+  // A directory is walked once: subdirectory offsets are attacker-controlled and may point back
+  // at the root or at each other, which would otherwise re-walk the tree 4096^depth times.
+  const visited = new Set<number>();
+  let entries = kMaxEntries;
   const walk = (off: number, path: ResId[], depth: number) => {
-    if (depth > 3 || off + 16 > img.length) return;
+    if (depth > 3 || off + 16 > img.length || visited.has(off)) return;
+    visited.add(off);
     const count = dv.getUint16(off + 12, true) + dv.getUint16(off + 14, true);
-    for (let i = 0; i < count && i < 4096; i++) {
+    for (let i = 0; i < count && i < 4096 && entries > 0; i++, entries--) {
       const e = off + 16 + i * 8;
       if (e + 8 > img.length) break;
       const id = name(dv.getUint32(e, true));
@@ -155,11 +163,12 @@ export function parseDialog(data: Uint8Array): DialogInfo | null {
   if (data.length < 18) return null;
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const ex = dv.getUint16(0, true) === 1 && dv.getUint16(2, true) === 0xffff;
+  if (ex && data.length < 26) return null;
   let o = 0;
   const sz = (): string => {
     if (o + 2 > data.length) return "";
     const first = dv.getUint16(o, true);
-    if (first === 0xffff) { const ord = dv.getUint16(o + 2, true); o += 4; return `#${ord}`; }
+    if (first === 0xffff) { const ord = o + 4 <= data.length ? dv.getUint16(o + 2, true) : 0; o += 4; return `#${ord}`; }
     const [s, p] = utf16z(data, o, data.length);
     o = p;
     return s;
@@ -211,19 +220,28 @@ export function parseDialog(data: Uint8Array): DialogInfo | null {
 
 // ---- icons ----------------------------------------------------------------------------------
 
+/** Largest .ico buildIco assembles. */
+const kMaxIco = 16 << 20;
+
 /** Rebuilds a .ico from a GROUP_ICON directory and the ICON resources it names. */
-export function buildIco(group: Uint8Array, icons: Map<number, Uint8Array>): Uint8Array | null {
+export function buildIco(group: Uint8Array, icons: Map<number, Uint8Array>, maxBytes = kMaxIco): Uint8Array | null {
   if (group.length < 6) return null;
   const dv = new DataView(group.buffer, group.byteOffset, group.byteLength);
   const count = dv.getUint16(4, true);
   const entries: { e: Uint8Array; data: Uint8Array }[] = [];
+  // A group names each icon once; a hostile one names the same big icon 65535 times.
+  const used = new Set<number>();
+  let total = 0;
   for (let i = 0; i < count && 6 + i * 14 + 14 <= group.length; i++) {
     const id = dv.getUint16(6 + i * 14 + 12, true);
     const data = icons.get(id);
-    if (data) entries.push({ e: group.subarray(6 + i * 14, 6 + i * 14 + 12), data });
+    if (!data || used.has(id) || total + data.length > maxBytes) continue;
+    used.add(id);
+    total += data.length;
+    entries.push({ e: group.subarray(6 + i * 14, 6 + i * 14 + 12), data });
   }
   if (!entries.length) return null;
-  const size = 6 + entries.length * 16 + entries.reduce((n, x) => n + x.data.length, 0);
+  const size = 6 + entries.length * 16 + total;
   const out = new Uint8Array(size);
   const ov = new DataView(out.buffer);
   ov.setUint16(2, 1, true);
@@ -255,17 +273,31 @@ export function summarizeResources(img: Uint8Array, pe?: PeInfo): ResourceSummar
   const m = of(24)[0];
   const iconData = new Map<number, Uint8Array>();
   for (const l of of(3)) if (typeof l.name === "number") iconData.set(l.name, resourceBytes(img, l));
+  // Leaves of a valid image do not overlap; hostile ones all point at the same image-sized blob,
+  // so the bytes the decoders below read are budgeted (scanBudget is twice the image).
+  const take = scanBudget(img.length);
+  let iconBytes = 2 * img.length + 0x10000;
+  const bytes = (l: ResLeaf): Uint8Array | null => {
+    const b = resourceBytes(img, l);
+    return take(0, b.length) ? b : null;
+  };
   return {
     leaves,
     version: v ? parseVersionInfo(resourceBytes(img, v)) : null,
     manifest: m ? new TextDecoder().decode(resourceBytes(img, m)) : "",
-    strings: of(6).flatMap((l) => (typeof l.name === "number" ? parseStringTable(l.name, resourceBytes(img, l)) : [])),
+    strings: of(6).flatMap((l) => {
+      const b = typeof l.name === "number" ? bytes(l) : null;
+      return b && typeof l.name === "number" ? parseStringTable(l.name, b) : [];
+    }),
     dialogs: of(5).flatMap((l) => {
-      const d = parseDialog(resourceBytes(img, l));
+      const b = bytes(l);
+      const d = b ? parseDialog(b) : null;
       return d ? [{ name: l.name, dialog: d }] : [];
     }),
     icons: of(14).flatMap((l) => {
-      const ico = buildIco(resourceBytes(img, l), iconData);
+      const b = bytes(l);
+      const ico = b ? buildIco(b, iconData, Math.min(kMaxIco, iconBytes)) : null;
+      if (ico) iconBytes -= ico.length;
       return ico ? [{ name: l.name, ico }] : [];
     }),
   };

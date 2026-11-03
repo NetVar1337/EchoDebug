@@ -6,10 +6,18 @@
 
 export type Insn = { address: string; length: number; text: string };
 
-/** `true`/`false` leave a conditional branch, `jump` is an unconditional jmp, `fall` runs into the next block. */
-export type EdgeKind = "true" | "false" | "jump" | "fall";
+/** `true`/`false` leave a conditional branch, `jump` is an unconditional jmp, `fall` runs into the next block, `case` is a switch jump-table entry. */
+export type EdgeKind = "true" | "false" | "jump" | "fall" | "case";
 
-export type CfgEdge = { from: number; to: number; kind: EdgeKind; /** target dominates source: a loop back edge */ back: boolean };
+export type CfgEdge = {
+  from: number;
+  to: number;
+  kind: EdgeKind;
+  /** target dominates source: a loop back edge */
+  back: boolean;
+  /** `case` edges: the jump-table indices that lead here */
+  values?: number[];
+};
 
 export type Block = {
   id: number;
@@ -63,7 +71,7 @@ export function branchOf(text: string): Branch {
  * return. Branches that leave the listing (tail calls) end their block
  * without an edge; indirect jumps do the same.
  */
-export function buildStructure(insns: readonly Insn[]): Cfg {
+export function buildStructure(insns: readonly Insn[], opts: { switches?: ReadonlyMap<bigint, readonly bigint[]> } = {}): Cfg {
   if (insns.length === 0) return { blocks: [], edges: [], loops: [], idom: [] };
   const addrs = insns.map((i) => BigInt(i.address));
   const indexOf = new Map<bigint, number>();
@@ -107,6 +115,19 @@ export function buildStructure(insns: readonly Insn[]): Cfg {
     if (!br) {
       if (next !== undefined) link(b.id, next, "fall");
     } else if (br.kind === "jmp") {
+      const cases = br.target === null ? opts.switches?.get(addrs[lastIdx]) : undefined;
+      if (cases) {
+        // one edge per distinct target, carrying every table index that leads there
+        const byTarget = new Map<number, number[]>();
+        cases.forEach((c, i) => {
+          const t = targetBlock(c);
+          if (t !== undefined) byTarget.set(t, [...(byTarget.get(t) ?? []), i]);
+        });
+        for (const [t, values] of byTarget) {
+          link(b.id, t, "case");
+          edges[edges.length - 1].values = values;
+        }
+      }
       const t = targetBlock(br.target);
       if (t !== undefined) link(b.id, t, "jump");
     } else if (br.kind === "jcc") {
@@ -116,32 +137,68 @@ export function buildStructure(insns: readonly Insn[]): Cfg {
     }
   }
 
-  const idom = dominators(blocks);
-  for (const b of blocks) b.reachable = b.id === 0 || idom[b.id] >= 0;
-  const loops: Loop[] = [];
-  for (const e of edges) {
-    if (!blocks[e.from].reachable || !dominates(idom, e.to, e.from)) continue;
-    e.back = true;
-    let loop = loops.find((l) => l.header === e.to);
-    if (!loop) {
-      loop = { header: e.to, latches: [], body: new Set([e.to]) };
-      loops.push(loop);
-    }
-    loop.latches.push(e.from);
-    // natural loop: everything that reaches the latch without passing the header
-    const stack = [e.from];
-    while (stack.length) {
-      const n = stack.pop()!;
-      if (loop.body.has(n)) continue;
-      loop.body.add(n);
-      stack.push(...blocks[n].pred);
-    }
-  }
-  for (const l of loops) {
+  const info = graphInfo(blocks.length, (n) => blocks[n].succ.map((e) => e.to), (n) => blocks[n].pred);
+  for (const b of blocks) b.reachable = info.reachable[b.id];
+  for (const e of edges) e.back = info.back.has(`${e.from}>${e.to}`);
+  for (const l of info.loops) {
     blocks[l.header].loopHeader = true;
     for (const n of l.body) blocks[n].inLoop = true;
   }
-  return { blocks, edges, loops, idom };
+  return { blocks, edges, loops: info.loops, idom: info.idom };
+}
+
+export type GraphInfo = {
+  /** immediate dominators; -1 for the entry and unreachable nodes */
+  idom: number[];
+  /** immediate post-dominators over a virtual exit; -1 is the exit (or none) */
+  ipdom: number[];
+  loops: Loop[];
+  /** back edges as `from>to` */
+  back: Set<string>;
+  reachable: boolean[];
+};
+
+/**
+ * Dominators, post-dominators and natural loops of any graph given by its
+ * successor and predecessor lists. Used for listings (buildStructure) and for
+ * rebuilt graphs (the decompiler's IR, unflattened functions).
+ */
+export function graphInfo(count: number, succ: (n: number) => number[], pred: (n: number) => number[], entry = 0): GraphInfo {
+  if (count === 0) return { idom: [], ipdom: [], loops: [], back: new Set(), reachable: [] };
+  const idom = idoms(count, entry, succ, pred);
+  idom[entry] = -1;
+  const reachable = Array.from({ length: count }, (_, n) => n === entry || idom[n] >= 0);
+  const loops: Loop[] = [];
+  const back = new Set<string>();
+  for (let from = 0; from < count; from++) {
+    if (!reachable[from]) continue;
+    for (const to of new Set(succ(from))) {
+      if (!dominates(idom, to, from)) continue;
+      back.add(`${from}>${to}`);
+      let loop = loops.find((l) => l.header === to);
+      if (!loop) {
+        loop = { header: to, latches: [], body: new Set([to]) };
+        loops.push(loop);
+      }
+      loop.latches.push(from);
+      // natural loop: everything that reaches the latch without passing the header
+      const stack = [from];
+      while (stack.length) {
+        const n = stack.pop()!;
+        if (loop.body.has(n)) continue;
+        loop.body.add(n);
+        stack.push(...pred(n).filter((p) => reachable[p]));
+      }
+    }
+  }
+  // the virtual exit follows every node without successors
+  const exit = count;
+  const exits: number[] = [];
+  for (let n = 0; n < count; n++) if (succ(n).length === 0) exits.push(n);
+  const revNext = (b: number) => (b === exit ? exits : pred(b));
+  const revPrev = (b: number) => (b === exit ? [] : succ(b).length ? succ(b) : [exit]);
+  const ipdom = idoms(count + 1, exit, revNext, revPrev).slice(0, count).map((d) => (d === exit ? -1 : d));
+  return { idom, ipdom, loops, back, reachable };
 }
 
 /** Reverse postorder of the blocks reachable from `entry` over `next`. */
@@ -196,12 +253,6 @@ function idoms(count: number, entry: number, next: (n: number) => number[], prev
   return idom;
 }
 
-function dominators(blocks: Block[]): number[] {
-  const idom = idoms(blocks.length, 0, (n) => blocks[n].succ.map((e) => e.to), (n) => blocks[n].pred);
-  idom[0] = -1;
-  return idom;
-}
-
 /** Does `a` dominate `b`? (`idom[entry]` is -1.) */
 export function dominates(idom: readonly number[], a: number, b: number): boolean {
   for (let n = b; n >= 0; n = idom[n]) if (n === a) return true;
@@ -213,12 +264,5 @@ export function dominates(idom: readonly number[], a: number, b: number): boolea
  * successors flows into. `-1` means the virtual exit (or no post-dominator).
  */
 export function postDominators(cfg: Cfg): number[] {
-  const n = cfg.blocks.length;
-  const exit = n;
-  const succ = (b: number) => cfg.blocks[b].succ.map((e) => e.to);
-  const exits = cfg.blocks.filter((b) => b.succ.length === 0).map((b) => b.id);
-  // dominators of the reversed graph, rooted at the virtual exit
-  const revNext = (b: number) => (b === exit ? exits : cfg.blocks[b].pred);
-  const revPrev = (b: number) => (b === exit ? [] : succ(b).length ? succ(b) : [exit]);
-  return idoms(n + 1, exit, revNext, revPrev).slice(0, n).map((d) => (d === exit ? -1 : d));
+  return graphInfo(cfg.blocks.length, (b) => cfg.blocks[b].succ.map((e) => e.to), (b) => cfg.blocks[b].pred).ipdom;
 }

@@ -105,6 +105,10 @@ pub fn image_codeview(path: &Path) -> Result<CodeView, String> {
 
 /// Identity of a PDB: (GUID+age key, GUID as text, age).
 pub fn pdb_identity(path: &Path) -> Result<(String, String, u32), String> {
+    pdbinfo::guarded(path, || pdb_identity_unguarded(path))
+}
+
+fn pdb_identity_unguarded(path: &Path) -> Result<(String, String, u32), String> {
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut pdb = pdb::PDB::open(file).map_err(|e| e.to_string())?;
     let info = pdb.pdb_information().map_err(|e| e.to_string())?;
@@ -255,7 +259,12 @@ pub fn uncab(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut cab = cab::Cabinet::new(std::io::Cursor::new(bytes)).map_err(|e| format!("bad cabinet: {e}"))?;
     let name = cab.folder_entries().flat_map(|f| f.file_entries()).next().map(|f| f.name().to_owned()).ok_or("empty cabinet")?;
     let mut out = Vec::new();
-    cab.read_file(&name).map_err(|e| e.to_string())?.read_to_end(&mut out).map_err(|e| format!("cabinet {name}: {e}"))?;
+    // the same 4 GiB bound as a plain download: a small cabinet can expand far beyond its size
+    const LIMIT: u64 = 4 << 30;
+    cab.read_file(&name).map_err(|e| e.to_string())?.take(LIMIT + 1).read_to_end(&mut out).map_err(|e| format!("cabinet {name}: {e}"))?;
+    if out.len() as u64 > LIMIT {
+        return Err(format!("cabinet {name}: expands to more than 4 GiB"));
+    }
     Ok(out)
 }
 

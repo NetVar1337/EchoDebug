@@ -160,7 +160,7 @@ export default function McpPanel() {
             ))}
           </div>
           <div className="faint" style={{ fontSize: 12 }}>
-            {pol.mode === "allow" ? "MCP clients may call every offered tool." : pol.mode === "ask" ? "Calls that change the target (writes, freezes, patch reverts), dumps and real-thread traces wait for your approval." : "Calls that change the target are refused; reads and analyses still work."}
+            {pol.mode === "allow" ? "MCP clients may call every offered tool." : pol.mode === "ask" ? "Calls that change the target (writes, freezes, patch reverts, debugger breakpoints and monitors), dumps and real-thread traces wait for your approval." : "Calls that change the target are refused; reads and analyses still work."}
             {" "}Tool annotations (readOnlyHint/destructiveHint) tell clients the same.
           </div>
           {pol.mode === "ask" && (

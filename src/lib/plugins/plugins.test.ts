@@ -76,6 +76,10 @@ describe("plugin permissions", () => {
     expect(() => checkVerb("p", [], "read")).not.toThrow();
     expect(() => checkVerb("p", [], "ui_strings")).not.toThrow();
     expect(() => checkVerb("p", [], "disassemble")).not.toThrow();
+    // the access finder / API monitor change execution: `write` needed to start them, not to read results
+    expect(() => checkVerb("p", [], "dbg_trace_start")).toThrow(/"write"/);
+    expect(() => checkVerb("p", [], "dbg_api_start")).toThrow(/"write"/);
+    expect(() => checkVerb("p", [], "dbg_api_log")).not.toThrow();
   });
 
   it("write and annotate unlock their calls, raw writes stay closed", async () => {

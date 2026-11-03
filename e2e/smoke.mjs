@@ -172,6 +172,27 @@ await step("debugger stops at a breakpoint and detaches", async () => {
   await until(async () => (await page.locator("button", { hasText: "Attach debugger" }).count()) > 0);
 });
 
+await step("access finder lists the instruction that writes the counter", async () => {
+  await tab("Access Finder");
+  await page.locator('input[placeholder^="address"]').first().fill(`e2e-target+${sym("counter")}`);
+  await page.keyboard.press("Enter");
+  await page.locator("button", { hasText: "Find what writes" }).click();
+  const text = await until(async () => { const t = await page.locator(".access-hits tbody td.ellipsis").allInnerTexts(); return t.length > 0 && t.join("\n"); });
+  expect(/mov|add/.test(text), `writer: ${text}`);
+  await page.locator("button", { hasText: "Stop" }).first().click();
+  await until(async () => (await page.locator(".pill", { hasText: "stopped" }).count()) > 0);
+});
+
+await step("API monitor logs usleep calls with their return value", async () => {
+  await tab("API Monitor");
+  await page.locator("textarea").fill("usleep");
+  await page.locator("button", { hasText: "Start monitor" }).click();
+  const row = await until(async () => { const t = await page.locator(".call-row:not(.head)").allInnerTexts(); return t.find((r) => r.includes("usleep") && !r.includes("…")); });
+  expect(/20000/.test(row), `usleep(20000): ${row}`);
+  await page.locator("button", { hasText: "Stop" }).first().click();
+  await until(async () => (await page.locator("button", { hasText: "Start monitor" }).count()) > 0);
+});
+
 await step("emulated debugger steps classify and runs it to its return", async () => {
   await tab("Emu Debugger");
   await page.locator('input[placeholder="function address · game.exe+0x1234"]').fill(`e2e-target+${sym("classify")}`);

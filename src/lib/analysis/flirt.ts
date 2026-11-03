@@ -277,7 +277,15 @@ function parseModules(r: Reader, version: number): FlirtModule[] {
   return modules;
 }
 
-function parseTree(r: Reader, version: number, root = false): FlirtNode {
+/**
+ * Deepest tree a signature file may hold. Every level covers at least one pattern byte and
+ * patterns are at most 64 bytes, so real trees stay well inside it; a hostile file of nothing but
+ * one-child levels would otherwise recurse until the stack overflows.
+ */
+const kMaxTreeDepth = 80;
+
+function parseTree(r: Reader, version: number, root = false, depth = 0): FlirtNode {
+  if (depth > kMaxTreeDepth) throw new FlirtError("signature tree is nested too deeply");
   let length = 0;
   let pattern: number[] = [];
   if (!root) {
@@ -289,7 +297,7 @@ function parseTree(r: Reader, version: number, root = false): FlirtNode {
   const nodeCount = r.multiple();
   if (nodeCount > 0) {
     const children: FlirtNode[] = [];
-    for (let i = 0; i < nodeCount; i++) children.push(parseTree(r, version));
+    for (let i = 0; i < nodeCount; i++) children.push(parseTree(r, version, false, depth + 1));
     return { pattern, length, children };
   }
   const modules = parseModules(r, version);
@@ -308,7 +316,81 @@ export function parseFlirt(buf: Uint8Array): FlirtSignature {
 /** Decompresses a payload with the given stream format. */
 async function inflate(payload: Uint8Array, format: "deflate" | "deflate-raw"): Promise<Uint8Array> {
   const stream = new Blob([payload as BlobPart]).stream().pipeThrough(new DecompressionStream(format));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  // read chunk by chunk so a decompression bomb stops at kMaxBody instead of filling memory
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > kMaxBody) {
+      await reader.cancel().catch(() => {});
+      throw new FlirtError(`the signature payload inflates to more than ${kMaxBody >> 20} MiB`);
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
+/** Largest decompressed signature body accepted (real ones are a few MiB). */
+const kMaxBody = 128 << 20;
+
+/**
+ * Walks the zstd frames of `p` (headers and block headers only) and checks what decompressing
+ * them would allocate: the declared content size, the window, and an upper bound of the output.
+ * fzstd allocates the declared sizes up front (a 20 byte frame can claim 2 GiB), so a payload over
+ * kMaxBody is refused before it is decompressed.
+ */
+function checkZstd(p: Uint8Array): void {
+  const fail = (why: string): never => { throw new FlirtError(`bad zstd payload: ${why}`); };
+  const u32 = (o: number) => (p[o] | (p[o + 1] << 8) | (p[o + 2] << 16) | (p[o + 3] << 24)) >>> 0;
+  let o = 0;
+  let bound = 0;
+  while (o < p.length) {
+    if (o + 8 > p.length) fail("truncated frame");
+    const magic = u32(o);
+    if ((magic & 0xfffffff0) === 0x184d2a50) { // skippable frame
+      o += 8 + u32(o + 4);
+      continue;
+    }
+    if (magic !== 0xfd2fb528) fail("bad frame magic");
+    const fhd = p[o + 4];
+    const fcf = fhd >> 6, ss = (fhd >> 5) & 1, cc = (fhd >> 2) & 1, df = fhd & 3;
+    let q = o + 5;
+    let window = 0;
+    if (!ss) {
+      const wd = p[q++];
+      const wb = 2 ** (10 + (wd >> 3));
+      window = wb + (wb / 8) * (wd & 7);
+    }
+    q += [0, 1, 2, 4][df];
+    const fsb = fcf ? 1 << fcf : ss;
+    let fss = 0;
+    for (let i = 0; i < fsb; i++) fss += (p[q + i] ?? 0) * 2 ** (8 * i);
+    if (fcf === 1) fss += 256;
+    q += fsb;
+    if (ss) window = fss;
+    if (fss > kMaxBody || window > kMaxBody) fail(`a frame declares ${Math.max(fss, window)} bytes`);
+    for (let last = 0; !last;) {
+      if (q + 3 > p.length) fail("truncated block");
+      const h = p[q] | (p[q + 1] << 8) | (p[q + 2] << 16);
+      last = h & 1;
+      const type = (h >> 1) & 3;
+      const size = h >>> 3;
+      if (type === 3) fail("reserved block type");
+      bound += type === 2 ? Math.min(window || 131072, 131072) : size;
+      q += 3 + (type === 1 ? 1 : size);
+    }
+    o = q + cc * 4;
+    if (bound > kMaxBody) fail(`it would decompress to more than ${kMaxBody >> 20} MiB`);
+  }
 }
 
 const kZstdMagic = [0x28, 0xb5, 0x2f, 0xfd];
@@ -330,7 +412,12 @@ export async function parseFlirtFile(buf: Uint8Array): Promise<FlirtSignature> {
   const payload = buf.subarray(bodyOffset(buf, header));
   let body: Uint8Array;
   if (payload.length >= 4 && kZstdMagic.every((b, i) => payload[i] === b)) {
-    body = zstdDecompress(payload);
+    checkZstd(payload);
+    try {
+      body = zstdDecompress(payload);
+    } catch (e) {
+      throw new FlirtError(`could not decompress the signature payload: ${(e as Error).message}`);
+    }
   } else if ((header.features & kFeatureCompressed) !== 0) {
     body = await decompressPayload(payload);
   } else {
@@ -470,9 +557,12 @@ export function matchFlirt(sig: FlirtSignature, img: Uint8Array, base?: bigint, 
   const scan = ranges ?? [{ rva: 0, size: img.length }];
   const out: FlirtMatch[] = [];
   const seen = new Set<string>();
+  let left = 2 * img.length + 0x10000; // overlapping ranges (section tables) cannot multiply the scan
   for (const range of scan) {
     const end = Math.min(img.length, range.rva + range.size);
-    for (let at = range.rva; at < end; at++) {
+    if (end - range.rva > left) continue;
+    left -= Math.max(0, end - range.rva);
+    for (let at = Math.max(0, range.rva); at < end; at++) {
       const candidates: Candidate[] = [];
       walk(sig.root, img, at, candidates);
       for (const c of candidates) {

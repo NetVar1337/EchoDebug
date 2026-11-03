@@ -189,7 +189,8 @@ export function listExceptionHandlers(img: Uint8Array, pe?: PeInfo, opts: { name
   for (const f of fns) {
     let rva = f.unwind;
     // UnwindData with bit 0 set points at another RUNTIME_FUNCTION whose unwind info is shared
-    if (rva & 1) rva = rva + 8 < img.length ? new DataView(img.buffer, img.byteOffset, img.byteLength).getUint32((rva & ~1) + 8, true) : 0;
+    // (rva - 1, not `rva & ~1`: that goes negative from 2^31; and the u32 read needs rva - 1 + 12)
+    if (rva & 1) rva = rva - 1 + 12 <= img.length ? new DataView(img.buffer, img.byteOffset, img.byteLength).getUint32(rva - 1 + 8, true) : 0;
     const u = parseUnwindInfo(img, rva);
     if (!u) continue;
     if (u.chained) chained++;
