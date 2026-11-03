@@ -1,5 +1,6 @@
 // One WebSocket to the relay's /client endpoint. Native Echo verbs, ext agent verbs and
 // relay-local verbs all travel the same way (see PROTOCOL.md); the relay routes by "type".
+import { auditLog } from "./audit";
 
 export type Frame = { type: string; id?: unknown; [k: string]: unknown };
 
@@ -33,6 +34,8 @@ class Client {
   private retry = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   connected = false;
+  /** recorded in the audit log with every request (set by MCP/script/plugin layers) */
+  clientId = "ui";
 
   connect(port: number, token?: string | null): void {
     this.url = `ws://127.0.0.1:${port}/client${token ? `?token=${encodeURIComponent(token)}` : ""}`;
@@ -122,6 +125,7 @@ class Client {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.reject(new EchoError(2000, "relay not connected"));
     const id = this.nextId++;
+    const started = Date.now();
     return new Promise<T & Frame>((resolve, reject) => {
       const t = setTimeout(() => {
         if (this.pending.delete(id)) reject(new EchoError(2003, `${type} timed out`));
@@ -131,10 +135,12 @@ class Client {
         allowFail,
         resolve: (f) => {
           clearTimeout(t);
+          auditLog.record({ client: this.clientId, verb: type, args: fields, ok: true, ms: Date.now() - started });
           resolve(f as T & Frame);
         },
         reject: (e) => {
           clearTimeout(t);
+          auditLog.record({ client: this.clientId, verb: type, args: fields, ok: false, ms: Date.now() - started, error: e.message });
           reject(e);
         },
       });

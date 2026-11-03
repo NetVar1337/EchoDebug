@@ -17,6 +17,12 @@ export type Manifest = {
   /** ES module, relative to the plugin folder */
   entry: string;
   permissions: Permission[];
+  /**
+   * Optional narrowing of the verb catalog (`*"` globs, e.g. ["read_*", "disassemble"]).
+   * Without it a plugin may call every catalog verb its permissions allow; with it, only the
+   * listed ones. Raw target writes stay refused regardless.
+   */
+  verbs?: string[];
   description?: string;
   author?: string;
 };
@@ -72,10 +78,21 @@ export function validateManifest(raw: unknown): ManifestResult {
       else if (!permissions.includes(p as Permission)) permissions.push(p as Permission);
     }
   }
+  let verbs: string[] | undefined;
+  if (m.verbs !== undefined) {
+    if (!Array.isArray(m.verbs)) errors.push('"verbs" must be an array of glob patterns');
+    else {
+      verbs = [];
+      for (const v of m.verbs) {
+        if (typeof v !== "string" || !v.trim() || v.length > 100 || !/^[A-Za-z0-9_*?]+$/.test(v)) errors.push(`"verbs" entries must be verb globs of letters, digits, '_', '*', '?' (got ${JSON.stringify(v)})`);
+        else if (!verbs.includes(v)) verbs.push(v);
+      }
+    }
+  }
   for (const k of ["description", "author"] as const) {
     if (m[k] !== undefined && typeof m[k] !== "string") errors.push(`"${k}" must be a string`);
   }
-  const known = new Set(["id", "name", "version", "entry", "permissions", "description", "author", "$schema"]);
+  const known = new Set(["id", "name", "version", "entry", "permissions", "verbs", "description", "author", "$schema"]);
   for (const k of Object.keys(m)) if (!known.has(k)) warnings.push(`unknown field "${k}" ignored`);
   if (errors.length) return { ok: false, errors };
   return {
@@ -83,6 +100,7 @@ export function validateManifest(raw: unknown): ManifestResult {
     warnings,
     manifest: {
       id: id!, name: name!, version: version!, entry: entry!, permissions,
+      ...(verbs ? { verbs } : {}),
       description: typeof m.description === "string" ? m.description.slice(0, 500) : undefined,
       author: typeof m.author === "string" ? m.author.slice(0, 120) : undefined,
     },

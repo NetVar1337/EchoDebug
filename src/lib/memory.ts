@@ -1,8 +1,7 @@
-// memory reads on top of Echo's native `read` route
+// memory reads on top of Echo's native `read` / `read_batch` routes
 import { request } from "./client";
+import { readMany } from "./batch";
 import { fmtAddr, hexToBytes, toBig, type Module } from "./hex";
-
-const kChunk = 0x100000; // Echo caps one read at 1 MiB
 
 export async function readBytes(address: bigint, size: number): Promise<Uint8Array | null> {
   const r = await request<{ data: string; success: boolean }>("read", { address: fmtAddr(address), size }, true);
@@ -14,21 +13,26 @@ export async function readU64(address: bigint): Promise<bigint | null> {
   return b && b.length === 8 ? new DataView(b.buffer).getBigUint64(0, true) : null;
 }
 
-/** Read [address, address+size) in 1 MiB chunks; unreadable chunks stay zero. */
+/**
+ * Read [address, address+size). Uses `read_batch` in rounds (Echo caps one entry at 64 KiB, one
+ * plain read at 1 MiB), so a large range costs a handful of WebSocket round trips instead of one
+ * per MiB; unreadable entries stay zero.
+ */
 export async function readRange(address: bigint, size: number, onProgress?: (done: number, total: number) => void): Promise<Uint8Array> {
   const out = new Uint8Array(size);
-  const chunks: number[] = [];
-  for (let off = 0; off < size; off += kChunk) chunks.push(off);
-  let done = 0;
-  const worker = async () => {
-    for (let off = chunks.shift(); off !== undefined; off = chunks.shift()) {
-      const n = Math.min(kChunk, size - off);
-      const b = await readBytes(address + BigInt(off), n).catch(() => null);
-      if (b) out.set(b.subarray(0, n), off);
-      onProgress?.(++done, Math.ceil(size / kChunk));
-    }
-  };
-  await Promise.all([worker(), worker(), worker(), worker()]);
+  const kEntry = 0x10000; // Echo caps one read_batch entry at 64 KiB
+  const kRound = 256; // 16 MiB per round trip
+  const offsets: number[] = [];
+  for (let off = 0; off < size; off += kEntry) offsets.push(off);
+  for (let i = 0; i < offsets.length; i += kRound) {
+    const round = offsets.slice(i, i + kRound);
+    const reads = round.map((off) => ({ address: fmtAddr(address + BigInt(off)), size: Math.min(kEntry, size - off) }));
+    const bufs = await readMany(reads).catch(() => reads.map(() => null));
+    bufs.forEach((b, j) => {
+      if (b) out.set(b.subarray(0, reads[j].size), round[j]);
+    });
+    onProgress?.(Math.min(offsets.length, i + kRound), offsets.length);
+  }
   return out;
 }
 

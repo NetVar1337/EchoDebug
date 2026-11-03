@@ -5,7 +5,9 @@ import { hexDump, type Module } from "@/lib/hex";
 import { hostOs, regenerateToken, relayInfo, type RelayInfo } from "@/lib/tauri";
 import { clearImages } from "@/lib/memory";
 import { clearArchCache, installArchHook } from "@/lib/archlive";
+import { fireRules } from "@/lib/autowire";
 import { log } from "./output";
+import { useRules } from "./rules";
 import pkg from "../../package.json";
 
 export type Target = { pid: number; base: string; peb?: string; name?: string; arch?: string };
@@ -116,6 +118,10 @@ export const useConn = create<ConnStore>((set, get) => ({
         } else if (ev === "freeze_error") log("warn", "freeze", `write failed at ${f.address}`);
         else if (ev === "alert_event") logAlert(f);
         else if (ev === "attached" || ev === "detached") log("info", "agent", ev);
+        // automation rules (#8): alert/page/module/scan events can fire verbs, plugin commands or logs
+        void fireRules(f, useRules.getState().rules).then((rs) => {
+          for (const r of rs) if (!r.ok) log("warn", "automation", `rule '${r.rule}' failed: ${r.error}`);
+        });
         for (const l of eventListeners) l(f);
       }
     });
