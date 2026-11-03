@@ -1,79 +1,48 @@
-import { useEffect, useRef } from "react";
+import { lazy, useEffect, useRef, type ComponentType } from "react";
 import { LayoutGrid, X } from "lucide-react";
 import { useUi, kTabs, type TabId } from "@/store/ui";
-import { Boundary, Panel } from "./ui";
+import { Boundary, Lazy, Panel } from "./ui";
 import ViewsMenu from "./ViewsMenu";
-import DisassemblyView from "./views/DisassemblyView";
-import MemoryView from "./views/MemoryView";
-import StructsView from "./views/StructsView";
-import StringsView from "./views/StringsView";
-import PeView from "./views/PeView";
-import SignaturesView from "./views/SignaturesView";
-import PointersView from "./views/PointersView";
-import EmulatorView from "./views/EmulatorView";
-import EmuDebugView from "./views/EmuDebugView";
-import HooksView from "./views/HooksView";
-import MonitorsView from "./views/MonitorsView";
-import EnginesView from "./views/EnginesView";
-import LifterView from "./views/LifterView";
-import GraphView from "./views/GraphView";
-import DotnetView from "./views/DotnetView";
-import CryptoView from "./views/CryptoView";
-import CavesView from "./views/CavesView";
-import SnapshotsView from "./views/SnapshotsView";
-import BinaryMapView from "./views/BinaryMapView";
-import PatchesView from "./views/PatchesView";
-import TriageView from "./views/TriageView";
-import RttiView from "./views/RttiView";
-import XrefView from "./views/XrefView";
-import AntiDebugView from "./views/AntiDebugView";
-import DebuggerView from "./views/DebuggerView";
-import CfgView from "./views/CfgView";
-import SigToolsView from "./views/SigToolsView";
-import YaraView from "./views/YaraView";
-import BinDiffView from "./views/BinDiffView";
-import UnpackView from "./views/UnpackView";
-import DecryptView from "./views/DecryptView";
-import ScriptView from "./views/ScriptView";
 
-const kViews: Record<TabId, () => React.JSX.Element> = {
-  disassembly: DisassemblyView,
-  memory: MemoryView,
-  structs: StructsView,
-  strings: StringsView,
-  pe: PeView,
-  signatures: SignaturesView,
-  pointers: PointersView,
-  emulator: EmulatorView,
-  emudbg: EmuDebugView,
-  hooks: HooksView,
-  monitors: MonitorsView,
-  engines: EnginesView,
-  lifter: LifterView,
-  graph: GraphView,
-  dotnet: DotnetView,
-  crypto: CryptoView,
-  caves: CavesView,
-  snapshots: SnapshotsView,
-  map: BinaryMapView,
-  patches: PatchesView,
-  triage: TriageView,
-  rtti: RttiView,
-  xrefs: XrefView,
-  antidebug: AntiDebugView,
-  debugger: DebuggerView,
-  cfg: CfgView,
-  sigtools: SigToolsView,
-  yara: YaraView,
-  bindiff: BinDiffView,
-  unpack: UnpackView,
-  decrypt: DecryptView,
-  script: ScriptView,
+// Views load on first open (own chunk each) to keep startup small; add new ones the same way.
+const kViews: Record<TabId, ComponentType> = {
+  disassembly: lazy(() => import("./views/DisassemblyView")),
+  memory: lazy(() => import("./views/MemoryView")),
+  structs: lazy(() => import("./views/StructsView")),
+  strings: lazy(() => import("./views/StringsView")),
+  pe: lazy(() => import("./views/PeView")),
+  signatures: lazy(() => import("./views/SignaturesView")),
+  pointers: lazy(() => import("./views/PointersView")),
+  emulator: lazy(() => import("./views/EmulatorView")),
+  emudbg: lazy(() => import("./views/EmuDebugView")),
+  hooks: lazy(() => import("./views/HooksView")),
+  monitors: lazy(() => import("./views/MonitorsView")),
+  engines: lazy(() => import("./views/EnginesView")),
+  lifter: lazy(() => import("./views/LifterView")),
+  graph: lazy(() => import("./views/GraphView")),
+  dotnet: lazy(() => import("./views/DotnetView")),
+  crypto: lazy(() => import("./views/CryptoView")),
+  caves: lazy(() => import("./views/CavesView")),
+  snapshots: lazy(() => import("./views/SnapshotsView")),
+  map: lazy(() => import("./views/BinaryMapView")),
+  patches: lazy(() => import("./views/PatchesView")),
+  triage: lazy(() => import("./views/TriageView")),
+  rtti: lazy(() => import("./views/RttiView")),
+  xrefs: lazy(() => import("./views/XrefView")),
+  antidebug: lazy(() => import("./views/AntiDebugView")),
+  debugger: lazy(() => import("./views/DebuggerView")),
+  cfg: lazy(() => import("./views/CfgView")),
+  sigtools: lazy(() => import("./views/SigToolsView")),
+  yara: lazy(() => import("./views/YaraView")),
+  bindiff: lazy(() => import("./views/BinDiffView")),
+  unpack: lazy(() => import("./views/UnpackView")),
+  decrypt: lazy(() => import("./views/DecryptView")),
+  script: lazy(() => import("./views/ScriptView")),
 };
 
 export default function WorkspacePanel() {
   const { tab, setTab, openTabs, closeTab, viewsOpen, set } = useUi();
-  const View = kViews[tab] ?? DisassemblyView;
+  const View = kViews[tab] ?? kViews.disassembly;
   const strip = useRef<HTMLDivElement>(null);
   const shown = openTabs.includes(tab) ? openTabs : [...openTabs, tab];
   const label = (t: TabId) => kTabs.find((x) => x.id === t)?.label ?? t;
@@ -117,7 +86,7 @@ export default function WorkspacePanel() {
         {viewsOpen && <ViewsMenu />}
       </div>
       <div className="panel-body" style={{ overflow: "hidden" }}>
-        <Boundary key={tab}><View /></Boundary>
+        <Boundary key={tab}><Lazy><View /></Lazy></Boundary>
       </div>
     </Panel>
   );

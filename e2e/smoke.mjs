@@ -86,8 +86,10 @@ const tab = async (name) => {
   await page.locator(".views-item", { hasText: new RegExp(`^${name}`) }).first().click();
 };
 const attach = async (pid) => {
-  // the active rail button folds the panel away: only click when the process list is not shown
-  if (!(await page.locator('input[placeholder="Filter processes…"]').count())) await page.locator(".rail-button[aria-label=Targets]").click();
+  // the active rail button folds the panel away: only click when Targets is not the shown panel.
+  // Ask the rail, not the panel: the panel loads lazily, so its input can be missing for a moment.
+  const targets = page.locator(".rail-button[aria-label=Targets]");
+  if ((await targets.getAttribute("data-active")) !== "true") await targets.click();
   await page.locator('input[placeholder="Filter processes…"]').fill("e2e-target");
   await page.locator(".panel-header, .panel-head").first().locator("[aria-label=Refresh]").click().catch(() => undefined);
   await until(async () => (await page.locator("tr", { hasText: String(pid) }).count()) > 0);

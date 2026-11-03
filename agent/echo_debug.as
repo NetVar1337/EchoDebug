@@ -3538,7 +3538,7 @@ void h_sig_scan_batch(json_obj@ r, int64 id)
     if (max_hits > SIGB_MAX_HITS) max_hits = SIGB_MAX_HITS;
     uint64 base = module_or_main(mod);
     if (base == 0) { send_error(id, E_FAILED, "module not found", mod); return; }
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     for (uint i = 0; i < pats.length(); i++)
     {
         string p = pats.get_string_at(i);
@@ -3554,11 +3554,11 @@ void h_sig_scan_batch(json_obj@ r, int64 id)
         }
         e.set("count", total);
         e.set("results", hits);
-        out.push(e);
+        out_list.push(e);
     }
     json_obj@ o = ok_reply("sig_scan_batch", id);
     o.set("module_base", hex_addr(base));
-    o.set("results", out);
+    o.set("results", out_list);
     send_json(o);
 }
 
@@ -3615,7 +3615,7 @@ void h_read_fields(json_obj@ r, int64 id)
     if (size == 0 || size > EMU_MAX_BLOB_BYTES) { send_error(id, E_LIMIT, "limit exceeded", "fields must lie within 64 KiB"); return; }
     memory_buffer@ mb = process::read_buffer(a, size);
     if (mb is null) { send_error(id, E_FAILED, "read failed", hex_addr(a)); return; }
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     for (uint i = 0; i < fs.length(); i++)
     {
         json_obj@ f = fs.get_obj_at(i);
@@ -3637,11 +3637,11 @@ void h_read_fields(json_obj@ r, int64 id)
         else if (t == "f64") e.set("value", util::format_string("{}", mb.read_double(off)));
         else if (t == "ptr" || t == "u64") e.set("value", t == "ptr" ? hex_addr(mb.read_uint64(off)) : util::format_string("{}", mb.read_uint64(off)));
         else { bad_args(id, "unknown field type: " + t + " (u8..u64, i8..i64, f32, f64, ptr)"); return; }
-        out.push(e);
+        out_list.push(e);
     }
     json_obj@ o = ok_reply("read_fields", id);
     o.set("address", hex_addr(a));
-    o.set("fields", out);
+    o.set("fields", out_list);
     send_json(o);
 }
 
@@ -3810,16 +3810,16 @@ int str_index(const array<string> &in a, const string &in v)
 
 array<string> split_str(const string &in s, const string &in sep)
 {
-    array<string> out;
+    array<string> out_list;
     uint start = 0;
     for (;;)
     {
         int at = s.findFirst(sep, start);
-        if (at < 0) { out.insertLast(s.substr(start)); break; }
-        out.insertLast(s.substr(start, uint(at) - start));
+        if (at < 0) { out_list.insertLast(s.substr(start)); break; }
+        out_list.insertLast(s.substr(start, uint(at) - start));
         start = uint(at) + sep.length();
     }
-    return out;
+    return out_list;
 }
 
 string chr8(uint8 c)
@@ -4304,7 +4304,7 @@ void h_hash_pages(json_obj@ r, int64 id)
     if (!require_attached(id)) return;
     if (!has_key(r, "ranges") || r.type("ranges") != json_type::array) { bad_args(id, "hash_pages requires 'ranges' ([{address, size}])"); return; }
     json_obj@ ranges = r.get_obj("ranges");
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     uint64 total = 0;
     for (uint i = 0; i < ranges.length(); i++)
     {
@@ -4337,10 +4337,10 @@ void h_hash_pages(json_obj@ r, int64 id)
         e.set("address", hex_addr(a));
         e.set("pages", n / 0x1000);
         e.set("hashes", packed);
-        out.push(e);
+        out_list.push(e);
     }
     json_obj@ o = ok_reply("hash_pages", id);
-    o.set("ranges", out);
+    o.set("ranges", out_list);
     send_json(o);
 }
 
@@ -4519,7 +4519,7 @@ void h_mem_diff(json_obj@ r, int64 id)
     array<uint64> cur;
     array<bool> ok;
     snap_fill(s.base, s.size, cur, ok);
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     uint64 changed = 0;
     uint n = cur.length();
     uint i = 0;
@@ -4530,7 +4530,7 @@ void h_mem_diff(json_obj@ r, int64 id)
         // merge changed qwords separated by at most one unchanged qword
         while (j + 1 < n && (cur[j + 1] != s.q[j + 1] || (j + 2 < n && cur[j + 2] != s.q[j + 2]))) j++;
         changed += uint64(j - i + 1) * 8;
-        if (out.length() < uint(max_ranges))
+        if (out_list.length() < uint(max_ranges))
         {
             json_obj@ e = json_obj();
             e.set("address", hex_addr(s.base + uint64(i) * 8));
@@ -4539,7 +4539,7 @@ void h_mem_diff(json_obj@ r, int64 id)
             for (uint k = i; k <= j && k < i + 4; k++) { oh += bits_hex(s.q[k], 8); nh += bits_hex(cur[k], 8); }
             e.set("old", oh);
             e.set("new", nh);
-            out.push(e);
+            out_list.push(e);
         }
         i = j + 1;
     }
@@ -4547,8 +4547,8 @@ void h_mem_diff(json_obj@ r, int64 id)
     json_obj@ o = ok_reply("mem_diff", id);
     o.set("name", name);
     o.set("changed_bytes", changed);
-    o.set("ranges", out);
-    o.set("truncated", out.length() >= uint(max_ranges));
+    o.set("ranges", out_list);
+    o.set("truncated", out_list.length() >= uint(max_ranges));
     send_json(o);
 }
 
@@ -4626,11 +4626,11 @@ void h_ptr_compare(json_obj@ r, int64 id)
         for (int i = int(keep.length()) - 1; i >= 0; i--)
             if (str_index(ks, keep[uint(i)]) < 0) { keep.removeAt(uint(i)); keep_e.removeAt(uint(i)); }
     }
-    json_obj@ out = json::array();
-    for (uint i = 0; i < keep_e.length(); i++) out.push(keep_e[i]);
+    json_obj@ out_list = json::array();
+    for (uint i = 0; i < keep_e.length(); i++) out_list.push(keep_e[i]);
     json_obj@ o = ok_reply("ptr_compare", id);
-    o.set("common", out);
-    o.set("count", out.length());
+    o.set("common", out_list);
+    o.set("count", out_list.length());
     send_json(o);
 }
 
@@ -4660,9 +4660,9 @@ string msvc_pretty(const string &in raw)
     int end = body.findFirst("@@");
     if (end >= 0) body = body.substr(0, uint(end));
     array<string> parts = split_str(body, "@");
-    string out = "";
-    for (int i = int(parts.length()) - 1; i >= 0; i--) out += (out == "" ? "" : "::") + parts[uint(i)];
-    return out;
+    string out_list = "";
+    for (int i = int(parts.length()) - 1; i >= 0; i--) out_list += (out_list == "" ? "" : "::") + parts[uint(i)];
+    return out_list;
 }
 
 void h_rtti_name(json_obj@ r, int64 id)
@@ -4693,7 +4693,7 @@ void h_find_instances(json_obj@ r, int64 id)
     uint64 t0 = util::tickcount();
     RegionList@ rl = RegionList();
     walk_regions(t0, USER_LO, USER_HI, true, true, WALK_MAX_REGIONS, true, rl);
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     bool trunc = false;
     for (uint ri = 0; ri < rl.base.length() && !trunc; ri++)
     {
@@ -4707,8 +4707,8 @@ void h_find_instances(json_obj@ r, int64 id)
             for (uint64 o = 0; o + 8 <= len; o += 8)
                 if (buf.read_uint64(o) == vt)
                 {
-                    out.push(hex_addr(pos + o));
-                    if (out.length() >= uint(max)) { trunc = true; break; }
+                    out_list.push(hex_addr(pos + o));
+                    if (out_list.length() >= uint(max)) { trunc = true; break; }
                 }
         }
     }
@@ -4716,8 +4716,8 @@ void h_find_instances(json_obj@ r, int64 id)
     json_obj@ o = ok_reply("find_instances", id);
     o.set("vtable", hex_addr(vt));
     o.set("class", msvc_pretty(raw));
-    o.set("count", out.length());
-    o.set("instances", out);
+    o.set("count", out_list.length());
+    o.set("instances", out_list);
     o.set("truncated", trunc);
     send_json(o);
 }
@@ -4747,7 +4747,7 @@ void h_xref_scan(json_obj@ r, int64 id)
     uint64 t0 = util::tickcount();
     RegionList@ rl = RegionList();
     walk_regions(t0, lo, hi, true, false, WALK_MAX_REGIONS, true, rl);
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     bool trunc = false;
     for (uint ri = 0; ri < rl.base.length() && !trunc; ri++)
     {
@@ -4777,7 +4777,7 @@ void h_xref_scan(json_obj@ r, int64 id)
                         json_obj@ e = json_obj();
                         e.set("address", hex_addr(kind == "riprel" ? ip : ip - 1));
                         e.set("kind", kind);
-                        out.push(e);
+                        out_list.push(e);
                         break;
                     }
                 }
@@ -4786,16 +4786,16 @@ void h_xref_scan(json_obj@ r, int64 id)
                     json_obj@ e = json_obj();
                     e.set("address", hex_addr(ip));
                     e.set("kind", "pointer");
-                    out.push(e);
+                    out_list.push(e);
                 }
-                if (out.length() >= uint(max)) { trunc = true; break; }
+                if (out_list.length() >= uint(max)) { trunc = true; break; }
             }
         }
     }
     json_obj@ o = ok_reply("xref_scan", id);
     o.set("target", hex_addr(target));
-    o.set("count", out.length());
-    o.set("results", out);
+    o.set("count", out_list.length());
+    o.set("results", out_list);
     o.set("truncated", trunc);
     send_json(o);
 }
@@ -4991,18 +4991,18 @@ void h_journal(json_obj@ r, int64 id)
     string text;
     file::read(JOURNAL_FILE, text);
     array<string> lines = split_str(text, "\n");
-    json_obj@ out = json::array();
+    json_obj@ out_list = json::array();
     uint start = lines.length() > uint(limit) + 1 ? lines.length() - uint(limit) - 1 : 0;
     for (uint i = start; i < lines.length(); i++)
     {
         if (lines[i] == "") continue;
         string err;
         json_obj@ e = json::parse(lines[i], err);
-        if (e !is null) out.push(e);
+        if (e !is null) out_list.push(e);
     }
     if (clear) file::remove(JOURNAL_FILE);
     json_obj@ o = ok_reply("journal", id);
-    o.set("entries", out);
+    o.set("entries", out_list);
     o.set("cleared", clear);
     send_json(o);
 }

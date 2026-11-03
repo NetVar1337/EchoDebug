@@ -41,6 +41,17 @@ jobs:
           cd "$RUNNER_TEMP/lsp" && git checkout "$LSP_REV" && npm ci --ignore-scripts && npm run compile
       - run: node scripts/lint-agent.mjs "$RUNNER_TEMP/lsp" agent/echo_debug.as
 
+  agent-tests:
+    name: Echo agent (AngelScript tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build test host (fetches the pinned AngelScript SDK)
+        run: |
+          cmake -S tests/agent -B build/agent-tests -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/agent-tests -j
+      - run: ctest --test-dir build/agent-tests --output-on-failure
+
   relay:
     name: Relay (cargo test + clippy)
     runs-on: ubuntu-latest
