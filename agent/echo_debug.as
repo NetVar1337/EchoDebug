@@ -191,7 +191,7 @@ array<uint> g_emu_mem_pending;   // indexes of writes whose new value is read be
 
 // Cooperative cancel for long jobs (scans, pointer scans, emulation): set by the 'cancel' verb or
 // the in-Echo panel, cleared when the next job is claimed.
-atomic_bool@ g_cancel = create_atomic_bool(false);
+bool g_cancel = false;   // set by h_cancel / ui_cancel, polled by jobs (a plain flag, like g_par_stop)
 uint64 g_emu_max = 0;
 
 // g_pow2[e + 1074] == 2^e, used to decode IEEE-754 bits without a reinterpret cast.
@@ -1071,7 +1071,7 @@ bool claim_job(const string &in kind, int64 id, JobParams@ p, uint &out seq)
         g_job_seq++;
         g_job_t0 = util::tickcount();
         @g_job_params = p;
-        g_cancel.store(false);
+        g_cancel = false;
     }
     seq = g_job_seq;
     g_state_mx.unlock();
@@ -1094,7 +1094,7 @@ bool job_busy()
     return b;
 }
 
-bool time_up(uint64 t0) { return g_cancel.load() || util::tickcount() - t0 > JOB_TIME_LIMIT_MS; }
+bool time_up(uint64 t0) { return g_cancel || util::tickcount() - t0 > JOB_TIME_LIMIT_MS; }
 
 ScanState@ get_scan()
 {
@@ -1562,7 +1562,7 @@ void h_freeze(json_obj@ r, int64 id)
         {
             // one journal event per enable: old = pre-freeze bytes when captured, else previous data
             FreezeEntry@ e = idx >= 0 ? g_freeze[uint(idx)] : g_freeze[g_freeze.length() - 1];
-            patched_ev = new_event("patched");
+            @patched_ev = new_event("patched");
             patched_ev.set("address", hex_addr(addr));
             patched_ev.set("old", e.has_original ? hex_of(e.original, 0, e.original.length())
                                                  : hex_of(e.data, 0, e.data.length()));
@@ -2749,7 +2749,7 @@ string uc_error_name(int e)
 bool emu_hook(uint64 h, uint64 address, uint32 size)
 {
     g_emu_count++;
-    if (g_cancel.load()) { uc::stop(h); return false; }
+    if (g_cancel) { uc::stop(h); return false; }
     if ((g_emu_count & 0x3FFFF) == 0) send_progress("emulate", g_emu_count, g_emu_max);
     if (!emux_code(h, g_emu_x, address, size)) return true;   // a stand-in returned to the caller
     if (g_emu_trace_on && g_emu_trace.length() < g_emu_trace_limit) g_emu_trace.insertLast(address);
@@ -3151,7 +3151,7 @@ int u64_index(const array<uint64> &in a, uint64 v)
 
 bool emud_hook(uint64 h, uint64 address, uint32 size)
 {
-    if (g_cancel.load()) { uc::stop(h); return false; }
+    if (g_cancel) { uc::stop(h); return false; }
     int bp = u64_index(g_emud_bps, address);
     if (g_emud_skip_on && address == g_emud_skip) { g_emud_skip_on = false; }
     else if (bp >= 0 && emud_cond_true(h, uint(bp) < g_emud_conds.length() ? g_emud_conds[uint(bp)] : ""))
@@ -3422,7 +3422,7 @@ void h_emu_go(json_obj@ r, int64 id, bool step)
     json_obj@ stop;
     if (g_emud_hit_on) { @stop = emud_stop("breakpoint"); stop.set("address", hex_addr(g_emud_hit)); uc::reg_write64(g_emud, x86_reg::rip, g_emud_hit); }
     else if (g_emud_wp_hit_on) { @stop = emud_stop("watchpoint"); stop.set("hit", g_emud_wp_hit); uc::reg_write64(g_emud, x86_reg::rip, g_emud_last); }
-    else if (g_cancel.load()) @stop = emud_stop("cancelled");
+    else if (g_cancel) @stop = emud_stop("cancelled");
     else if (now == EMUD_RET) @stop = emud_stop("returned");
     else if (res != uc::error::ok)
     {
@@ -3580,7 +3580,7 @@ void h_disasm_function(json_obj@ r, int64 id)
     {
         json_obj@ x = json_obj();
         x.set("address", hex_addr(a + off));
-        x.set("length", insns[i].length);
+        x.set("length", uint(insns[i].length));
         x.set("bytes", hex_of(b, off, insns[i].length));
         x.set("text", insns[i].text);
         arr.push(x);
@@ -3675,8 +3675,8 @@ class EmuExtras
     uint api_count;
     uint64 heap_next;
     bool layers;
-    hash_set_uint64@ written;   // pages written during the run
-    hash_set_uint64@ entered;   // written pages that later executed (one layer each)
+    hash_map@ written;   // pages written during the run (page -> "")
+    hash_map@ entered;   // written pages that later executed (one layer each)
     json_obj@ layer_out;
     bool zero_unmapped;
     json_obj@ faults;
@@ -3687,7 +3687,7 @@ class EmuExtras
         regs_on = false; regs_limit = 0; stubs = false; api_count = 0; heap_next = EMUX_HEAP;
         layers = false; zero_unmapped = false; fault_count = 0; blank = false;
         @reg_trace = json::array(); @api_calls = json::array(); @layer_out = json::array(); @faults = json::array();
-        @stub_at = create_hash_map(); @written = create_hash_set_uint64(); @entered = create_hash_set_uint64();
+        @stub_at = create_hash_map(); @written = create_hash_map(); @entered = create_hash_map();
         prev.resize(16);
     }
 }
@@ -3993,7 +3993,7 @@ bool emux_code(uint64 h, EmuExtras@ x, uint64 address, uint32 size)
         uint64 page = address & ~uint64(0xFFF);
         if (x.written.contains(page) && !x.entered.contains(page))
         {
-            x.entered.insert(page);
+            x.entered.set_string(page, "");
             if (x.layer_out.length() < EMUX_MAX_LAYERS)
             {
                 json_obj@ l = json_obj();
@@ -4007,7 +4007,7 @@ bool emux_code(uint64 h, EmuExtras@ x, uint64 address, uint32 size)
         array<bool> writes;
         emux_mem_ops(h, address, size, eas, sizes, writes);
         for (uint i = 0; i < eas.length(); i++)
-            if (writes[i]) { x.written.insert(eas[i] & ~uint64(0xFFF)); x.written.insert((eas[i] + sizes[i] - 1) & ~uint64(0xFFF)); }
+            if (writes[i]) { x.written.set_string(eas[i] & ~uint64(0xFFF), ""); x.written.set_string((eas[i] + sizes[i] - 1) & ~uint64(0xFFF), ""); }
     }
     if (x.regs_on && x.reg_trace.length() < x.regs_limit)
     {
@@ -4831,7 +4831,7 @@ void par_scan_shard(uint k)
         uint64 re = g_par_rl.base[ri] + g_par_rl.size[ri];
         for (uint64 pos = g_par_rl.base[ri]; pos < re; pos += CHUNK)
         {
-            if (g_par_stop || time_up(g_par_t0) || g_cancel.load()) { st.truncated = true; return; }
+            if (g_par_stop || time_up(g_par_t0) || g_cancel) { st.truncated = true; return; }
             uint64 core = umin(CHUNK, re - pos);
             uint64 want = umin(CHUNK + w - 1, re - pos);
             g_par_mx.lock();
@@ -4908,7 +4908,7 @@ bool par_scan_new(int64 id, ScanSpec@ s, RegionList@ rl, ScanState@ st, string &
             else st.prev.insertLast(p.prev[i]);
         }
     }
-    if (trunc && note == "") note = g_cancel.load() ? "cancelled" : "candidate cap or time limit reached";
+    if (trunc && note == "") note = g_cancel ? "cancelled" : "candidate cap or time limit reached";
     st.truncated = trunc;
     g_par_out.resize(0);
     return true;
@@ -5071,7 +5071,7 @@ void h_cancel(json_obj@ r, int64 id)
     g_state_mx.lock_shared();
     string job = g_job;
     g_state_mx.unlock_shared();
-    if (job != "") g_cancel.store(true);
+    if (job != "") g_cancel = true;
     json_obj@ o = ok_reply("cancel", id);
     o.set("job", job);
     o.set("cancelling", job != "");
@@ -5126,7 +5126,7 @@ void sync_menu()
 
 void ui_cancel()
 {
-    g_cancel.store(true);
+    g_cancel = true;
     alert::show_tag("EchoDebug: cancelling the running job", TAG, 255, 200, 80);
 }
 

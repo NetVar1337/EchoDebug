@@ -69,17 +69,6 @@ void create_thread(int tps, thread_callback@ cb)
     if (tps == 0 && cb !is null) cb();   // one-shot job threads run inline; ticking threads never start
 }
 
-// Single-threaded host: a plain flag is enough.
-class atomic_bool
-{
-    bool v;
-    atomic_bool(bool init) { v = init; }
-    bool load() const { return v; }
-    void store(bool x) { v = x; }
-}
-
-atomic_bool@ create_atomic_bool(bool init) { return atomic_bool(init); }
-
 // ---------------------------------------------------------------------------------------------
 // Hash containers (linear lists: the tests only hold a handful of keys)
 // ---------------------------------------------------------------------------------------------
@@ -107,14 +96,6 @@ class hash_map
 
 hash_map@ create_hash_map() { return hash_map(); }
 
-class hash_set_uint64
-{
-    array<uint64> keys;
-    bool contains(uint64 k) const { for (uint i = 0; i < keys.length(); i++) if (keys[i] == k) return true; return false; }
-    void insert(uint64 k) { if (!contains(k)) keys.insertLast(k); }
-}
-
-hash_set_uint64@ create_hash_set_uint64() { return hash_set_uint64(); }
 
 class mutex
 {
@@ -731,7 +712,6 @@ class json_obj
     void set(string k, double v) { put(k, jdbl(v)); }
     void set(string k, int v) { put(k, jint(v)); }
     void set(string k, uint v) { put(k, juint(v)); }
-    void set(string k, uint8 v) { put(k, juint(v)); }
     void set(string k, int64 v) { put(k, jint(v)); }
     void set(string k, uint64 v) { put(k, juint(v)); }
     void set(string k, bool v) { put(k, jbool(v)); }
