@@ -29,11 +29,11 @@ export async function genInput(fns: readonly LiveFunction[], onProgress?: (done:
   for (const f of fns) {
     if (signal?.aborted) break;
     const size = Math.min(Math.max(f.size, 1), 0x4000);
-    const r = await request<{ results: { address: string; length: number; bytes: string; text: string }[] }>("disassemble", { address: f.address, size }, true).catch(() => null);
+    const r = await request<{ results: { address: string; length: number; bytes: string; text: string }[]; arch?: string }>("disassemble", { address: f.address, size }, true).catch(() => null);
     const lines = r?.results ?? [];
     if (lines.length) {
       const bytes = hexToBytes(lines.map((l) => l.bytes).join(""));
-      const variable = lines.flatMap((l) => insnPattern(l.bytes, l.text).map((b) => b === null));
+      const variable = lines.flatMap((l) => insnPattern(l.bytes, l.text, r?.arch).map((b) => b === null));
       out.push({ name: f.name, bytes, variable });
     }
     onProgress?.(++done);

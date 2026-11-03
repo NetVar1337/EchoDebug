@@ -58,9 +58,9 @@ on each release carries signed `linux-x86_64-deb` and `linux-x86_64-appimage` en
 
 On Linux the Echo agent is unavailable (it runs inside Echo's Discord overlay on Windows), so the
 relay serves a **local `/proc` backend** itself: attach by pid/name from Targets, then memory,
-modules, region map, AoB/string scans, disassembly (iced-x86), ELF symbols, the value scanner, pointer
+modules, region map, AoB/string scans, disassembly (iced-x86, or yaxpeax-arm for AArch64 modules), ELF symbols, the value scanner, pointer
 chains and pointer scans, freeze and watch, export lookup, the dynamic loader's module list
-(`r_debug`/`link_map`), **Unicorn emulation** against the live image, **Itanium C++ RTTI**, an **ELF
+(`r_debug`/`link_map`), **Unicorn emulation** (x86-64 and AArch64) against the live image, **Itanium C++ RTTI**, an **ELF
 browser**, and a **ptrace debugger** (int3 and DR0-DR3 hardware breakpoints, step, continue,
 registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 `kernel.yama.ptrace_scope=0`).
@@ -104,6 +104,7 @@ registers) all work against the local process (`/proc/<pid>/mem`: same user, or
 | Anti-debug | The places a module tries to find out whether it is analysed: INT 2D, the red-pill descriptor reads, VMCALL, PEB/TEB reads, timing checks, the debugger-detection APIs and the debugger window names in the strings |
 | Emulator | Unicorn emulation against the live process image (the process is never modified): registers, instruction trace linked to the disassembly, a **memory log** of every read and write (address, size, value before and after), and a **decrypt oracle** that feeds a buffer into a routine and reads the result back; register-change traces with a step slider, xmm/ymm registers and the regions mapped during the run |
 | Debugger (Linux) | ptrace: attach every thread, int3 and hardware (DR0-DR3) breakpoints, step, continue, pause, registers with editing, breakpoint bytes hidden from reads |
+| ARM64 | AArch64 modules (Linux arm64 ELF, Windows-on-ARM PE) next to x86-64, which stays the default: the architecture comes from the PE Machine field (`0xAA64`; ARM64EC/ARM64X hybrids recognised by their CHPE metadata) or ELF `e_machine` (183) and shows as an **ARM64** badge on modules and in the disassembly; `disassemble` takes `arch` and the relay decodes AArch64 itself (pure-Rust `yaxpeax-arm`, absolute branch targets, `adrp`+`add`/`ldr` resolved inline) on every backend; the CFG, call graph and xrefs follow b/bl/br/blr/ret, b.cond, cbz/cbnz and tbz/tbnz and resolve `adrp`+`add`/`ldr`/`str`, `adr` and literal loads; function starts from ARM64 `.pdata` (packed and `.xdata` unwind data) and ELF symbols; the signature maker wildcards branch, `adrp`/`adr` and paired immediates; the **Emulator** runs AArch64 on the Linux local backend (x0-x30, sp, pc, nzcv, v0-v31). Not for ARM64: a debugger backend, the lifter and pseudocode, the x86 assembler |
 | Script | Async JavaScript against an `ed` API (verbs, memory, journaled writes, names, disassembly, every app analysis), saved scripts |
 | MCP server | `http://127.0.0.1:47110/mcp` (Streamable HTTP JSON-RPC 2.0, batch supported, token-protected), the backend tools plus **`ui_*` tools served by the app window** (PE details, strings, xrefs, CFG, assembler, YARA, FLIRT, IL, struct guessing, binary diff, unpacking, batch decryption, …) and tools that read and set your names and comments, list and revert journalled patches and list saved signatures, 16 prompts, 4 resources, server-sent notifications (`GET /mcp`) and progress streaming; the **MCP Server** panel shows the endpoint, connect command, tool catalog with a live call tester, prompt/resource lists and a real-time `tools/call` log |
 | Watch streaming | The agent samples watched addresses at 10 Hz and broadcasts `watch_event` (old/new hex) — MCP clients get push-style updates without polling `read` |
