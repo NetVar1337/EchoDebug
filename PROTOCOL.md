@@ -74,15 +74,53 @@ plus the Linux-only verbs below. Only `reopen_socket` and the conditional alerts
 |---|---|---|
 | `itanium_classes` | `module?` | `classes:[{name, mangled, typeinfo, vtable (first virtual slot), slots, bases}]` from `_ZTI*`/`_ZTV*` symbols |
 | `module_file` | `module`, `offset?`, `size?` (≤ 1 MiB) | `path`, `base`, `file_size`, `data` (hex) — the module's file on disk, for the ELF browser |
-| `dbg_attach` | `pid?` (default: attached process) | `pid`, `threads`, `state:"stopped"` — PTRACE_SEIZE of every thread (+TRACECLONE), all-stop |
-| `dbg_detach` | – | – (breakpoints and DR7 restored first; `detach` also ends the session) |
-| `dbg_status` | – | `active`, `state` (`running`\|`stopped`), `focus`, `threads`, `breakpoints`, `hardware`, `last` |
-| `dbg_break` | `address`, `enabled?` | `breakpoints` — int3, written through `/proc/<pid>/mem` |
+
+### Debugger (`dbg_*`)
+
+The relay's native debugger serves the same `dbg_*` verbs, replies and events on two backends; the
+status frame's `"debugger"` field says which one this relay has (`"ptrace"`, `"windows"` or null):
+
+- **ptrace** (Linux local backend, routed like the other local ext verbs): `PTRACE_SEIZE` of every
+  thread (+TRACECLONE), all-stop; int3s written through `/proc/<pid>/mem`.
+- **Win32** (Windows builds, `windbg.rs`): an optional backend next to Echo (which has no debugger
+  API) for an x64 process on this machine. `dbg_*` verbs never go to the Echo agent; the target is
+  `pid` or, by default, the process Echo is attached to. `DebugActiveProcess` with
+  `DebugSetProcessKillOnExit(FALSE)`; one thread runs `WaitForDebugEvent` / `ContinueDebugEvent`
+  (all threads are frozen while an event is held); int3s via `WriteProcessMemory` (+
+  `FlushInstructionCache`), stepped over with the trap flag while the other threads are suspended;
+  DR0-DR3/DR7 through `SetThreadContext` on every thread (new threads get them on CREATE_THREAD);
+  pause with `DebugBreakProcess`. 32-bit (WOW64) processes are refused. Detach restores bytes and
+  debug registers, drains late breakpoint events and calls `DebugActiveProcessStop`. While it has
+  int3s planted in the process Echo reads, `read` / `read_batch` replies show the original bytes and
+  a `disassemble` reply that decoded one is redone from the debugger's memory.
+  `ECHODEBUG_NATIVE_DEBUGGER=0` turns it off.
+
+| verb | request | reply |
+|---|---|---|
+| `dbg_attach` | `pid?` (default: attached process) | `pid`, `threads`, `state:"stopped"`, `backend` |
+| `dbg_detach` | – | – (breakpoints and DR7 restored first; on Linux `detach` also ends the session) |
+| `dbg_status` | – | `active`, `backend`, `state` (`running`\|`stopped`), `focus`, `threads:[{tid, state, rip?}]`, `breakpoints`, `hardware:[{slot, address, kind, len, trace}]`, `last`, `auto`, `api_hooks`, `traces` |
+| `dbg_break` | `address`, `enabled?` | `breakpoints` — int3 |
 | `dbg_hwbreak` | `slot` (0-3), `address`, `kind` (`exec`\|`write`\|`rw`), `len` (1/2/4/8), `enabled?` | status — DR0-DR3/DR7 on every thread |
 | `dbg_continue` / `dbg_pause` | – | `state` (steps over a breakpoint under rip first) |
 | `dbg_step` | `tid?` | `tid`, `from`, `address`, `regs`. A thread blocked in a system call only finishes the step when the call returns: the step is cancelled with an explanation instead of hanging |
-| `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base) |
+| `dbg_regs` / `dbg_set_regs` | `tid?`, `regs?` (`{"rax":"0x1",…}`) | `regs` (rax…r15, rip, eflags, fs_base, gs_base; the Win32 backend reports 0 for the segment bases) |
 | `dbg_all_regs` | – | `threads:[{tid, regs}]`, `was_running` (stops the session for the read if it was running, then resumes) |
+| `dbg_disasm` | `address`, `size` | like `disassemble`, read through the debugger with planted int3s hidden |
+| `dbg_trace_start` | `address`, `size?` (1-8, default 4), `kind` (`write`\|`access`), `slot?`, `pid?` | `slot`, `watch:{address, len}` (the aligned 1/2/4/8-byte range covering the request), `auto` — "find what writes / accesses": a data watchpoint on a free debug register; hits are recorded on the thread that trapped and the process keeps running |
+| `dbg_trace_results` | `slot?` | `traces:[{slot, address, size, kind, watch, active, total, started, hits:[{address, length, text, count, tid, regs, first, last}]}]` — the accessing instruction is the one that ends at the trap address (data breakpoints trap after the access), chosen by decoding the bytes before it and preferring a memory operand that touches the range. Readable after the trace stopped |
+| `dbg_trace_stop` | `slot?` (default: all) | `traces`, `detached?` |
+| `dbg_api_start` | `functions: ["module!name" \| "name" \| "0xaddr=label" \| {name, address}]` (1-64), `pid?` | `hooked:[{name, address}]`, `unresolved:[{name, error}]`, `hooks`, `auto` — an int3 on each entry; each call plants a temporary int3 on its return address. Windows resolves exports from the PE export table in memory (forwarders followed), Linux from ELF symbols; `name` alone searches every module |
+| `dbg_api_log` | `since?` (seq), `limit?` (≤ 10000), `filter?` | `entries:[{seq, t, tid, function, address, caller, args:[{name, value, text}], ret, ret_text, returned}]`, `next`, `total`, `dropped`, `pending_returns`, `hooks:[{address, name, hits}]`, `active` |
+| `dbg_api_stop` / `dbg_api_clear` | – | `calls` / – (the log stays until cleared; 20,000 calls are kept) |
+| `dbg_api_signatures` | – | `abi` (`win64`\|`sysv`), `signatures:[{name, args:[{name, type}], ret}]` |
+
+`dbg_trace_start` and `dbg_api_start` attach the debugger when no session is active (`auto: true`)
+and resume the process; when the last monitor of such a session stops, it detaches (`detached:
+true`). Arguments follow the platform ABI at function entry (Win64: rcx, rdx, r8, r9, then
+`[rsp+0x28]`…; SysV: rdi, rsi, rdx, rcx, r8, r9, then `[rsp+8]`…); functions outside the table show
+four raw argument registers. A thread passing a hooked function while another one single-steps over
+its int3 is not logged.
 
 **Architectures.** x86-64 is the default. `disassemble`, `disasm_function` and `disasm_bytes` take
 `arch` (`"x86_64"` | `"arm64"`, aliases `aarch64`, `x64`, …). The lines keep their shape
@@ -97,11 +135,21 @@ attach target, and `emulate` with `arch:"arm64"` (or a start address inside an A
 Unicorn's AArch64 CPU: `regs` takes/returns `x0`…`x30` (`fp`, `lr` accepted), `sp`, `pc`, `nzcv`,
 `tpidr_el0`; `v` (`{"v0":"<32 hex>"}`) or `simd:true` adds `v0`…`v31` to the reply; `x30` starts at
 `end` so a `ret` ends the run; `mem_log` entries and `faults` carry `pc` instead of `rip`; `stubs`,
-`layers`, `trace_regs` and `xmm` are x86-64 only and refused. There is no ARM64 debugger backend
-(`dbg_*` is x86-64 ptrace), and the emulated debugger (`emu_*`) and lifter are x86-64 only.
+`layers`, `trace_regs` and `xmm` are x86-64 only and refused. There is no ARM64 debugger backend:
+the native debuggers (`dbg_*`, ptrace and Win32, with the access finder and the API monitor) are
+x86-64 only and refuse an AArch64 process at attach, and a breakpoint, execute watchpoint or API
+hook inside an AArch64 module (ARM64EC code in an x64 process), with code `3003` and a detail that
+says so. The emulated debugger (`emu_*`) and lifter are x86-64 only.
 
-Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause", "tid", "address", "regs", "slot?", "watch?", "signal?" }`
-and `{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`.
+Debugger events: `{ "type":"event", "event":"dbg_stop", "reason":"breakpoint"|"hardware"|"step"|"signal"|"trap"|"pause"|"exception", "tid", "address", "regs", "slot?", "watch?", "signal?", "code?", "first_chance?", "description?" }`,
+`{ "type":"event", "event":"dbg_exit", "pid", "code?"|"signal?" }`, `{ "event":"dbg_access", "slot", "watch", "kind", "address", "text" }`
+(a new accessing instruction), and on Windows `{ "event":"dbg_exception", "code", "description", … }` (routine first-chance
+exceptions such as C++ throws, passed on without stopping) and `{ "event":"dbg_output", "tid", "text" }` (OutputDebugString).
+
+MCP: `find_accesses_start` / `_results` / `_stop` and `api_monitor_start` / `_log` / `_stop` / `_signatures`.
+The debugger verbs that plant int3s or change execution (`dbg_attach`, `dbg_break`, `dbg_hwbreak`,
+`dbg_set_regs`, `dbg_step`, `dbg_continue`, `dbg_trace_start`, `dbg_api_start`) are stateful and gated by
+the ask / read-only policy like `write`; reading results and stopping are not.
 
 ### Threads, call stacks, handles (relay)
 

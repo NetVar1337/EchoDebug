@@ -707,7 +707,7 @@ fn native_string_scan(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     json!({ "type": "string_scan_result", "success": found, "results": list, "text": text })
 }
 
-fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
+pub(crate) fn native_disassemble(mem: &impl MemIo, req: &Map<String, Value>) -> Value {
     let Some(addr) = arg_addr(req, "address") else {
         return json!({ "type": "error", "code": 1002, "message": "invalid or missing arguments", "detail": "disassemble requires 'address'" });
     };

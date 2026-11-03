@@ -348,6 +348,11 @@ mod tests {
         let names: Vec<String> = allowed_tools().into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"read_memory".to_owned()));
         assert!(!names.iter().any(|n| n == "write_memory" || n == "freeze_value" || n == "dump_module" || n == "revert_patch" || n == "set_name"));
+        // the native debugger's tools, read-only ones included (they need a debug session)
+        for verb in ["dbg_trace_start", "dbg_trace_results", "dbg_trace_stop", "dbg_api_start", "dbg_api_log", "dbg_api_stop", "dbg_api_signatures", "dbg_all_regs"] {
+            assert!(!assistant_tool_allowed(verb), "{verb} must not be offered to the assistant");
+        }
+        assert!(!names.iter().any(|n| n.starts_with("find_accesses_") || n.starts_with("api_monitor_")), "{names:?}");
     }
 
     #[test]
