@@ -64,6 +64,7 @@ export default function CommandPalette() {
     );
     out.push(
       { id: "goto", label: "Go to address", group: "Navigate", hint: "Ctrl+G", run: () => ui.set({ gotoOpen: true }) },
+      { id: "search", label: "Search everything (names, comments, bookmarks, signatures, types, exports, strings)", group: "Navigate", hint: "Ctrl+Shift+F", run: () => ui.set({ searchOpen: true }) },
       { id: "disasm", label: "Disassemble selection", group: "Navigate", run: () => ui.selected && ui.goDisasm(ui.selected) },
       { id: "memory", label: "Show selection in memory", group: "Navigate", run: () => ui.selected && ui.goMemory(ui.selected) },
       { id: "struct", label: "Show selection in struct view", group: "Navigate", run: () => ui.selected && ui.goStruct(ui.selected) },

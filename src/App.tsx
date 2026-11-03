@@ -1,6 +1,7 @@
 import { lazy, useEffect, useRef } from "react";
 import ActivityRail from "@/components/ActivityRail";
 import CommandPalette from "@/components/CommandPalette";
+import SearchDialog from "@/components/SearchDialog";
 import GotoDialog from "@/components/GotoDialog";
 import InspectorPanel from "@/components/InspectorPanel";
 import OutputPanel from "@/components/OutputPanel";
@@ -23,6 +24,7 @@ import { startProvider } from "@/lib/provider";
 import { startMcpPolicy } from "@/store/mcp";
 import { startMonitors } from "@/store/monitors";
 import { startGraphs } from "@/store/graphs";
+import { startSearchCaches } from "@/lib/searchsources";
 import ApprovalDialog from "@/components/ApprovalDialog";
 import { redo, undo } from "@/lib/history";
 import { startProjects } from "@/lib/projects";
@@ -61,6 +63,7 @@ export default function App() {
     startMcpPolicy();
     startMonitors();
     startGraphs();
+    startSearchCaches();
     startProjects();
     startWorkspace();
     startAutoPatches();
@@ -94,6 +97,11 @@ export default function App() {
       if (mod && e.shiftKey && e.key.toLowerCase() === "p") {
         e.preventDefault();
         useUi.getState().set({ paletteOpen: !useUi.getState().paletteOpen });
+        return;
+      }
+      if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        useUi.getState().set({ searchOpen: !useUi.getState().searchOpen, paletteOpen: false });
         return;
       }
       if (mod && e.key.toLowerCase() === "g") {
@@ -199,6 +207,7 @@ export default function App() {
       {ui.settingsOpen && <Boundary><Lazy><SettingsModal /></Lazy></Boundary>}
       {ui.gotoOpen && <GotoDialog />}
       {ui.paletteOpen && <CommandPalette />}
+      {ui.searchOpen && <SearchDialog />}
       <ApprovalDialog />
       {ui.shortcutsOpen && <ShortcutsDialog />}
       <Toasts />

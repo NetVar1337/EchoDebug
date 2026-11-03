@@ -77,6 +77,10 @@ type UiStore = {
   settingsOpen: boolean;
   gotoOpen: boolean;
   paletteOpen: boolean;
+  /** Ctrl+Shift+F search-everything dialog */
+  searchOpen: boolean;
+  /** struct type the Structs view should open (set by search, cleared by the view) */
+  structType: string | null;
   sessionExportOpen: boolean;
   sessionImportOpen: boolean;
   theme: Theme;
@@ -138,6 +142,8 @@ export const useUi = create<UiStore>()(
       settingsOpen: false,
       gotoOpen: false,
       paletteOpen: false,
+      searchOpen: false,
+      structType: null,
       sessionExportOpen: false,
       sessionImportOpen: false,
       theme: "obsidian",

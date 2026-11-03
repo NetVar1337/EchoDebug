@@ -41,6 +41,14 @@ export default function StructsView() {
   const size = lay.length ? lay[lay.length - 1].offset + lay[lay.length - 1].size : 0;
   const base = ui.structAt;
 
+  // search everything → a struct type: open it here
+  useEffect(() => {
+    const t = ui.structType ? catalog.types.find((x) => x.id === ui.structType) : undefined;
+    if (!ui.structType) return;
+    ui.set({ structType: null });
+    if (t) { setActiveId(t.id); setCls(t); }
+  }, [ui.structType]);
+
   // Undo/redo changes the catalog: pick that up in the editor.
   const stored = catalog.types.find((t) => t.id === activeId);
   useEffect(() => {
