@@ -5,7 +5,10 @@
 // GObjects is the static FUObjectArray: { int32 ObjFirstGCIndex, ObjLastNonGCIndex,
 // MaxObjectsNotConsideredByGC; bool OpenForDisregardForGC; FChunkedFixedUObjectArray ObjObjects
 // { FUObjectItem** Objects; FUObjectItem* PreAllocated; int32 Max, Num, MaxChunks, NumChunks } }.
-// Both are found by shape in the module image, then confirmed through live memory.
+// Both are found by shape in the module image, then confirmed through live memory, or by the
+// documented AOB patterns below (kUnrealSigs), or typed in.
+// Legacy GNames (UE4.22 and older) is a chunked TNameEntryArray of FNameEntry pointers, 16384 per
+// chunk; each entry holds its index (bit 0 = wide) and then the NUL-terminated name (LegacyNames).
 //
 // Field offsets (UObject, UStruct, FField, FProperty) follow the stock UE 4.25–5.x layout and can
 // be overridden per game (Offsets).
@@ -86,9 +89,59 @@ export function findObjectArrays(img: Uint8Array, base: bigint, ranges: { rva: n
   return out;
 }
 
+/** Documented AOB patterns; each resolves a RIP-relative operand at `disp` of a `len`-byte instruction. */
+export const kUnrealSigs = [
+  { id: "pool", label: "FNamePool (UE4.23+): lea rcx, NamePoolData; call FNamePool ctor; mov byte [inited], 1", pattern: "48 8D 0D ? ? ? ? E8 ? ? ? ? C6 05 ? ? ? ? 01", disp: 3, len: 7, adjust: 0, deref: false },
+  { id: "legacy", label: "GNames (≤UE4.22): mov rax, [GNames]; test rax, rax; jnz", pattern: "48 8B 05 ? ? ? ? 48 85 C0 75 ? B9 ? ? 00 00", disp: 3, len: 7, adjust: 0, deref: true },
+  { id: "objects", label: "GUObjectArray: mov rax, [ObjObjects.Objects]; mov rcx, [rax+rcx*8]; lea rax, [rcx+rdx*8]", pattern: "48 8B 05 ? ? ? ? 48 8B 0C C8 48 8D 04 D1", disp: 3, len: 7, adjust: 0x10, deref: false },
+] as const;
+export type UnrealSig = (typeof kUnrealSigs)[number];
+
+/** Target of a RIP-relative instruction at `hit`, given the 4 displacement bytes. */
+export function ripTarget(hit: bigint, disp: Uint8Array, len: number): bigint {
+  return hit + BigInt(len) + BigInt(new DataView(disp.buffer, disp.byteOffset, 4).getInt32(0, true));
+}
+
 // ---- names -----------------------------------------------------------------------------------
 
-export class NamePool {
+/** Anything that turns an FName into text: the FNamePool (4.23+) or legacy GNames (≤4.22). */
+export type Names = {
+  readonly mem: Mem;
+  readonly address: bigint;
+  init(): Promise<boolean>;
+  name(comparisonIndex: number, number?: number): Promise<string>;
+};
+
+/** FNameEntry header { bIsWide:1, LowercaseProbeHash:5, Len:10 }. */
+export function decodeNameHeader(h: number): { wide: boolean; len: number } {
+  return { wide: (h & 1) === 1, len: h >> 6 };
+}
+
+/** The string of an FNamePool entry (header + chars); null when the buffer is short or the entry broken. */
+export function decodePoolEntry(b: Uint8Array): string | null {
+  if (b.length < 2) return null;
+  const { wide, len } = decodeNameHeader(le(b).getUint16(0, true));
+  if (len === 0 || 2 + len * (wide ? 2 : 1) > b.length) return null;
+  return wide ? new TextDecoder("utf-16le").decode(b.subarray(2, 2 + len * 2)) : String.fromCharCode(...b.subarray(2, 2 + len));
+}
+
+/** A legacy FNameEntry: wide flag in bit 0 of its index, then the NUL-terminated name at `nameOffset`. */
+export function decodeLegacyEntry(b: Uint8Array, nameOffset = 0x10): string | null {
+  if (b.length < nameOffset + 1) return null;
+  const wide = (le(b).getInt32(0, true) & 1) === 1;
+  let s = "";
+  for (let i = nameOffset; i + (wide ? 1 : 0) < b.length; i += wide ? 2 : 1) {
+    const c = wide ? le(b).getUint16(i, true) : b[i];
+    if (c === 0) return s;
+    s += String.fromCharCode(c);
+  }
+  return s || null;
+}
+
+/** FName display form: Number is stored +1, so 0 means no suffix. */
+export const fnameString = (base: string, number: number) => (number > 0 ? `${base}_${number - 1}` : base);
+
+export class NamePool implements Names {
   private blocks: bigint[] = [];
   private cache = new Map<number, string>();
   constructor(readonly mem: Mem, readonly address: bigint) {}
@@ -113,9 +166,7 @@ export class NamePool {
     const at = block + BigInt((idx & 0xffff) * 2);
     const h = await this.mem.read(at, 2);
     if (!h) return null;
-    const header = le(h).getUint16(0, true);
-    const wide = (header & 1) === 1;
-    const len = header >> 6;
+    const { wide, len } = decodeNameHeader(le(h).getUint16(0, true));
     if (len === 0 || len > 1024) return null;
     const raw = await this.mem.read(at + 2n, wide ? len * 2 : len);
     if (!raw) return null;
@@ -126,8 +177,39 @@ export class NamePool {
 
   /** FName → text ("Name" or "Name_<Number-1>"). */
   async name(comparisonIndex: number, number = 0): Promise<string> {
-    const s = (await this.entry(comparisonIndex)) ?? `name#${comparisonIndex}`;
-    return number > 0 ? `${s}_${number - 1}` : s;
+    return fnameString((await this.entry(comparisonIndex)) ?? `name#${comparisonIndex}`, number);
+  }
+}
+
+/** Legacy GNames (UE4.22 and older): TNameEntryArray, `perChunk` FNameEntry pointers per chunk. */
+export class LegacyNames implements Names {
+  private cache = new Map<number, string>();
+  constructor(readonly mem: Mem, readonly address: bigint, readonly perChunk = 16384, readonly nameOffset = 0x10) {}
+
+  /** True when entry 0 is "None". */
+  async init(): Promise<boolean> {
+    return (await this.entry(0).catch(() => null)) === "None";
+  }
+
+  private async entry(idx: number): Promise<string | null> {
+    const hit = this.cache.get(idx);
+    if (hit !== undefined) return hit;
+    if (idx < 0) return null;
+    const c = await this.mem.read(this.address + BigInt(Math.floor(idx / this.perChunk) * 8), 8);
+    const chunk = c ? le(c).getBigUint64(0, true) : 0n;
+    if (!chunk) return null;
+    const e = await this.mem.read(chunk + BigInt((idx % this.perChunk) * 8), 8);
+    const entry = e ? le(e).getBigUint64(0, true) : 0n;
+    if (!entry) return null;
+    // names are short; a page-crossing long read can fail where a shorter one succeeds
+    const b = (await this.mem.read(entry, this.nameOffset + 0x100)) ?? (await this.mem.read(entry, this.nameOffset + 0x40));
+    const s = b ? decodeLegacyEntry(b, this.nameOffset) : null;
+    if (s !== null) this.cache.set(idx, s);
+    return s;
+  }
+
+  async name(comparisonIndex: number, number = 0): Promise<string> {
+    return fnameString((await this.entry(comparisonIndex)) ?? `name#${comparisonIndex}`, number);
   }
 }
 
@@ -165,6 +247,49 @@ export class ObjectArray {
     }
     return out;
   }
+
+  /** Non-null object pointers of items [start, start+count), with their index. */
+  async range(start: number, count: number): Promise<{ index: number; address: bigint }[]> {
+    const end = Math.min(this.num, start + count);
+    const out: { index: number; address: bigint }[] = [];
+    for (let i = Math.max(0, start); i < end;) {
+      const c = Math.floor(i / kChunkItems);
+      const n = Math.min(end, (c + 1) * kChunkItems) - i;
+      const b = this.chunks[c] ? await this.mem.read(this.chunks[c] + BigInt((i % kChunkItems) * this.off.itemSize), n * this.off.itemSize) : null;
+      for (let k = 0; b && k < n; k++) {
+        const p = le(b).getBigUint64(k * this.off.itemSize, true);
+        if (p) out.push({ index: i + k, address: p });
+      }
+      i += n;
+    }
+    return out;
+  }
+}
+
+/**
+ * One page of GUObjectArray, [start, start+count): each live object with its name and class name,
+ * without dumping the whole array first. Free slots are skipped, so a page can hold fewer rows.
+ */
+export async function listObjects(names: Names, objs: ObjectArray, start: number, count: number): Promise<UObjectInfo[]> {
+  const off = objs.off;
+  const ptrs = await objs.range(start, count);
+  const heads = await readAll(objs.mem, ptrs.map((x) => ({ address: x.address, size: off.objOuter + 8 })));
+  const out: UObjectInfo[] = [];
+  for (const [k, x] of ptrs.entries()) {
+    const h = heads[k];
+    if (!h) continue;
+    const dv = le(h);
+    out.push({ index: x.index, address: x.address, classAddr: dv.getBigUint64(off.objClass, true), outer: dv.getBigUint64(off.objOuter, true), name: await names.name(dv.getInt32(off.objName, true), dv.getInt32(off.objName + 4, true)), className: "" });
+  }
+  const classes = [...new Set(out.map((o) => o.classAddr).filter((c) => c))];
+  const ch = await readAll(objs.mem, classes.map((c) => ({ address: c + BigInt(off.objName), size: 8 })));
+  const clsName = new Map<bigint, string>();
+  for (const [k, c] of classes.entries()) {
+    const b = ch[k];
+    if (b) clsName.set(c, await names.name(le(b).getInt32(0, true), le(b).getInt32(4, true)));
+  }
+  for (const o of out) o.className = clsName.get(o.classAddr) ?? "?";
+  return out;
 }
 
 async function readAll(mem: Mem, reads: { address: bigint; size: number }[]): Promise<(Uint8Array | null)[]> {
@@ -175,7 +300,7 @@ async function readAll(mem: Mem, reads: { address: bigint; size: number }[]): Pr
 export type ObjectDump = { objects: UObjectInfo[]; byAddress: Map<bigint, UObjectInfo> };
 
 /** Every live object with its name and class name. */
-export async function dumpObjects(names: NamePool, objs: ObjectArray, onProgress?: (done: number, total: number) => void, limit?: number): Promise<ObjectDump> {
+export async function dumpObjects(names: Names, objs: ObjectArray, onProgress?: (done: number, total: number) => void, limit?: number): Promise<ObjectDump> {
   const off = objs.off;
   const ptrs = await objs.pointers(limit);
   const live = ptrs.map((p, i) => ({ p, i })).filter((x) => x.p !== 0n);
@@ -225,7 +350,7 @@ function cppName(name: string, kind: "class" | "struct", isActor: boolean): stri
 }
 
 /** Walks a UClass / UScriptStruct and its FProperty chain. */
-export async function readStruct(mem: Mem, names: NamePool, d: ObjectDump, o: UObjectInfo, off: Offsets = kDefaultOffsets): Promise<SdkStruct | null> {
+export async function readStruct(mem: Mem, names: Names, d: ObjectDump, o: UObjectInfo, off: Offsets = kDefaultOffsets): Promise<SdkStruct | null> {
   const s = await mem.read(o.address, off.structSize + 4);
   if (!s) return null;
   const dv = le(s);
@@ -267,12 +392,12 @@ export async function readStruct(mem: Mem, names: NamePool, d: ObjectDump, o: UO
   };
 }
 
-async function fieldClassName(mem: Mem, names: NamePool, cls: bigint): Promise<string> {
+async function fieldClassName(mem: Mem, names: Names, cls: bigint): Promise<string> {
   const b = cls ? await mem.read(cls, 8) : null; // FFieldClass starts with its FName
   return b ? names.name(le(b).getInt32(0, true), le(b).getInt32(4, true)) : "?";
 }
 
-async function typeOf(mem: Mem, names: NamePool, d: ObjectDump, cls: string, inner: bigint, size: number, off: Offsets, depth = 0): Promise<string> {
+async function typeOf(mem: Mem, names: Names, d: ObjectDump, cls: string, inner: bigint, size: number, off: Offsets, depth = 0): Promise<string> {
   if (kScalar[cls]) return kScalar[cls];
   const obj = d.byAddress.get(inner);
   switch (cls) {
