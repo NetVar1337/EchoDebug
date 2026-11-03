@@ -27,6 +27,9 @@ export default function ModulesPanel() {
               <button className="btn small" onClick={() => ui.goModule(sel, "strings")}>Strings</button>
               <button className="btn small" onClick={() => { ui.set({ module: sel }); const m = modules.find((x) => x.name === sel); if (m) ui.goDisasm(m.base); }}>Functions</button>
               <button className="btn small" onClick={() => { const m = modules.find((x) => x.name === sel); if (m) ui.goMemory(m.base); }}>Memory</button>
+              <button className="btn small" onClick={() => { ui.set({ module: sel }); ui.setTab("crypto"); }}>Crypto</button>
+              <button className="btn small" onClick={() => { ui.set({ module: sel }); ui.setTab("caves"); }}>Caves</button>
+              <button className="btn small" onClick={() => { ui.set({ module: sel }); ui.setTab("dotnet"); }}>.NET</button>
               <button className="btn small" onClick={() => void dump(sel)}>Dump</button>
             </div>
           )}
@@ -37,8 +40,8 @@ export default function ModulesPanel() {
             <thead><tr><th>Name</th><th>Base</th><th>Size</th></tr></thead>
             <tbody>
               {shown.map((m) => (
-                <tr key={m.base} data-selected={sel === m.name} onClick={() => { setSel(m.name); ui.select(m.base); }} onDoubleClick={() => ui.goModule(m.name, "pe")}>
-                  <td title={m.name}>{m.name}</td>
+                <tr key={m.base} data-selected={sel === m.name || ui.module === m.name} onClick={() => { setSel(m.name); ui.select(m.base); }} onDoubleClick={() => ui.goModule(m.name, "pe")}>
+                  <td title={m.name}>{m.name}{ui.module === m.name && <span className="pill accent" style={{ marginLeft: 6 }}>focused</span>}</td>
                   <td className="mono dim">{m.base.replace(/^0x/, "").toUpperCase()}</td>
                   <td className="mono faint">{(m.size / 1024).toFixed(0)}K</td>
                 </tr>

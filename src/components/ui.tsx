@@ -1,7 +1,8 @@
 // shared primitives: panel chrome, tabs, empty states, small inputs
 import { Component, type ReactNode, useEffect, useState } from "react";
-import { PlugZap } from "lucide-react";
+import { Check, Copy, PlugZap } from "lucide-react";
 import { useConn } from "@/store/conn";
+import AttachPrompt from "./AttachPrompt";
 
 export function Panel({ title, actions, children, className = "" }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string }) {
   return (
@@ -42,18 +43,18 @@ export function Empty({ icon, title, hint }: { icon?: ReactNode; title: string; 
   );
 }
 
-/** Renders children only when the native memory server is up; otherwise the setup hint. */
+/** Renders children only when a memory backend is up (Echo server on Windows, /proc on Linux). */
 export function NeedsAgent({ children, ext = false }: { children: ReactNode; ext?: boolean }) {
-  const { relay, agent, ext: extUp } = useConn();
+  const { relay, agent, backend, ext: extUp, os } = useConn();
   if (!relay) return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="Relay not reachable." hint="The EchoDebug relay is not running. Restart the app or check the port in Settings." />;
-  if (!agent) return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="Echo memory server not connected." hint="Load echo_debug.as in Echo, then attach to a process from the Targets panel." />;
-  if (ext && !extUp) return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="EchoDebug agent not connected." hint="This view needs the echo_debug.as agent (write / scan / emulate verbs). Load it in Echo." />;
+  if (!agent && backend !== "local") return <AttachPrompt />;
+  if (ext && !extUp && backend !== "local") return <Empty icon={<PlugZap size={26} strokeWidth={1.5} />} title="EchoDebug agent not connected." hint={os === "linux" ? "This feature needs the Windows Echo agent (write / freeze / emulate / pointer scan). The local Linux backend covers read, modules, sig/string scan, disassembly, scanner and writes." : "This view needs the echo_debug.as agent (write / scan / emulate verbs). Load it in Echo."} />;
   return <>{children}</>;
 }
 
-export function IconButton({ tip, onClick, children, disabled }: { tip: string; onClick: () => void; children: ReactNode; disabled?: boolean }) {
+export function IconButton({ tip, onClick, children, disabled }: { tip: string; onClick: (e: React.MouseEvent<HTMLButtonElement>) => void; children: ReactNode; disabled?: boolean }) {
   return (
-    <button className="icon-button" title={tip} aria-label={tip} onClick={onClick} disabled={disabled}>
+    <button className="icon-button" data-tip={tip} aria-label={tip} onClick={onClick} disabled={disabled}>
       {children}
     </button>
   );
@@ -87,6 +88,24 @@ export function Progress({ value }: { value: number }) {
 
 export async function copy(text: string): Promise<void> {
   await navigator.clipboard.writeText(text).catch(() => undefined);
+}
+
+export function useCopy(): [string | null, (text: string) => void] {
+  const [copied, setCopied] = useState<string | null>(null);
+  return [copied, (text) => {
+    void navigator.clipboard?.writeText(text).catch(() => undefined);
+    setCopied(text);
+    setTimeout(() => setCopied((c) => (c === text ? null : c)), 1200);
+  }];
+}
+
+export function CopyChip({ text, copied, onCopy }: { text: string; copied: string | null; onCopy: (t: string) => void }) {
+  return (
+    <button className="mono selectable chip" data-copied={copied === text} onClick={() => onCopy(text)} title="Copy">
+      <span className="ellipsis">{text}</span>
+      {copied === text ? <Check size={11} /> : <Copy size={11} />}
+    </button>
+  );
 }
 
 /** Keeps one broken view from blanking the whole window. */

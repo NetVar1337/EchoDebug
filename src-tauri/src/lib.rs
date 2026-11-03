@@ -11,12 +11,15 @@ const AGENT_PORT_LINE: &str = "const int RELAY_PORT = 47110;";
 struct RelayState {
     port: u16,
     error: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Serialize)]
 struct RelayInfo {
     port: u16,
     error: Option<String>,
+    /// bearer token for /client and /mcp (None when ECHODEBUG_AUTH=0)
+    token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -52,11 +55,21 @@ fn relay_info(state: tauri::State<'_, RelayState>) -> RelayInfo {
     RelayInfo {
         port: state.port,
         error: state.error.clone(),
+        token: state.token.clone(),
     }
+}
+
+/// Host OS ("windows", "linux", "macos", …) so the UI can gate Windows-only Echo features.
+#[tauri::command]
+fn host_os() -> String {
+    std::env::consts::OS.to_string()
 }
 
 #[tauri::command]
 fn install_agent(state: tauri::State<'_, RelayState>) -> Result<InstallResult, String> {
+    if std::env::consts::OS != "windows" {
+        return Err("the Echo agent (AngelScript) only runs inside Echo on Windows; on Linux the relay serves a local /proc backend".to_owned());
+    }
     install(state.port)
 }
 
@@ -65,25 +78,70 @@ fn scripts_dir() -> Result<String, String> {
     scripts_path().map(|p| p.display().to_string())
 }
 
+/// Writes a session export next to the user's documents; the frontend picks the file
+/// with the dialog plugin and passes the chosen path back.
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    fs::write(&p, contents).map_err(|e| format!("write {}: {e}", p.display()))?;
+    Ok(p.display().to_string())
+}
+
+/// Writes a binary file the user picked (rebuilt images, dumps).
+#[tauri::command]
+fn write_binary_file(path: String, contents: Vec<u8>) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    fs::write(&p, contents).map_err(|e| format!("write {}: {e}", p.display()))?;
+    Ok(p.display().to_string())
+}
+
+/// Reads a session file the user picked.
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path))
+}
+
+/// Reads a binary file the user picked (FLIRT signature databases).
+#[tauri::command]
+fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
+    fs::read(&path).map_err(|e| format!("read {}: {e}", path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let mut port = std::env::var("ECHODEBUG_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(DEFAULT_PORT);
             let version = app.package_info().version.to_string();
+            // Every /client and /mcp request must carry this token (see relay/src/auth.rs).
+            let token = match echo_debug_relay::auth::default_token() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("relay token unavailable ({e}); using a per-run token");
+                    echo_debug_relay::auth::new_token().ok()
+                }
+            };
+            let relay_token = token.clone();
             // A busy port must not kill the app: the UI shows the error from relay_info.
             let error = match echo_debug_relay::bind(port) {
                 Ok(listener) => {
                     port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) =
-                            echo_debug_relay::run(listener, Relay::new(version, DEFAULT_TIMEOUT))
+                            echo_debug_relay::run(listener, Relay::new(version, DEFAULT_TIMEOUT).with_token(relay_token))
                                 .await
                         {
                             eprintln!("relay stopped: {e}");
@@ -96,18 +154,28 @@ pub fn run() {
             if let Some(e) = &error {
                 eprintln!("{e}");
             }
-            // The agent ships inside the app, so app updates also update the agent.
-            match install(port) {
-                Ok(r) => eprintln!("agent at {} (updated: {})", r.path, r.changed),
-                Err(e) => eprintln!("agent install failed: {e}"),
+            // The agent ships inside the app, so app updates also update the agent. Windows only:
+            // on Linux the relay serves the local /proc backend instead.
+            if std::env::consts::OS == "windows" {
+                match install(port) {
+                    Ok(r) => eprintln!("agent at {} (updated: {})", r.path, r.changed),
+                    Err(e) => eprintln!("agent install failed: {e}"),
+                }
+            } else {
+                eprintln!("host os '{}': skipping Echo agent install (Windows-only); local /proc backend active", std::env::consts::OS);
             }
-            app.manage(RelayState { port, error });
+            app.manage(RelayState { port, error, token });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             relay_info,
+            host_os,
             install_agent,
-            scripts_dir
+            scripts_dir,
+            write_text_file,
+            write_binary_file,
+            read_text_file,
+            read_binary_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

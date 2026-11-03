@@ -14,6 +14,8 @@ type WatchStore = {
   removeWatch: (id: string) => void;
   addBookmark: (address: string, label?: string) => void;
   removeBookmark: (id: string) => void;
+  /** replaces the whole list, used by the session importer */
+  setWatches: (watches: WatchEntry[], bookmarks: Bookmark[]) => void;
 };
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -30,6 +32,7 @@ export const useWatch = create<WatchStore>()(
       addBookmark: (address, label = "") =>
         set((s) => (s.bookmarks.some((b) => b.address === address) ? s : { bookmarks: [...s.bookmarks, { id: uid(), address, label }] })),
       removeBookmark: (id) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.id !== id) })),
+      setWatches: (watches, bookmarks) => set({ watches, bookmarks }),
     }),
     { name: "echodebug.watch" },
   ),

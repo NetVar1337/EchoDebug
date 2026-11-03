@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { request } from "@/lib/client";
-import { hexToBytes, labelAddr } from "@/lib/hex";
+import { bytesToHex, fmtAddr, hexToBytes, labelAddr, parseAddress } from "@/lib/hex";
+import { readManyChunked } from "@/lib/batch";
+import { saveText } from "@/lib/save";
+import { floatScanFields, groupMatches, groupSpan, keep, kNumSize, parseGroup, type Compare, type FloatMode, type GroupMember, type NumType } from "@/lib/analysis/scancmp";
 import { decode, type ValueType } from "@/lib/analysis/values";
 import { useConn } from "@/store/conn";
 import { attempt, log } from "@/store/output";
@@ -8,7 +11,7 @@ import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { NeedsAgent, Panel, Progress, Tabs } from "./ui";
 
-type Mode = "value" | "aob" | "string";
+type Mode = "value" | "group" | "aob" | "string";
 type ScanType = "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "bytes" | "string" | "wstring";
 type Hit = { address: string; value: string; previous?: string };
 
@@ -57,6 +60,13 @@ function HitTable({ hits, type }: { hits: Hit[]; type?: ScanType }) {
   );
 }
 
+type LocalHit = { address: string; value: string };
+type ScanFile = { format: "echodebug.scan"; version: 1; type: ScanType; savedAt: string; entries: LocalHit[] };
+/** Below this many candidates the app narrows the list itself (undo, save, load). */
+const kLocalMax = 50_000;
+const kAligns = [["natural", 0], ["1", 1], ["2", 2], ["4", 4], ["8", 8]] as const;
+const isNum = (t: ScanType) => !["bytes", "string", "wstring"].includes(t);
+
 function ValueScan() {
   const progress = useConn((s) => s.progress);
   const [type, setType] = useState<ScanType>("i32");
@@ -64,33 +74,137 @@ function ValueScan() {
   const [value, setValue] = useState("");
   const [value2, setValue2] = useState("");
   const [module, setModule] = useState("");
+  const [rangeLo, setRangeLo] = useState("");
+  const [rangeHi, setRangeHi] = useState("");
   const [writable, setWritable] = useState(true);
+  const [align, setAlign] = useState(0);
+  const [floatMode, setFloatMode] = useState<FloatMode>("rounded");
+  const [eps, setEps] = useState("0.0001");
   const [count, setCount] = useState<number | null>(null);
   const [hits, setHits] = useState<Hit[]>([]);
   const [offset, setOffset] = useState(0);
   const [busy, setBusy] = useState(false);
+  // client-side candidate list + undo history (only when small enough)
+  const [local, setLocal] = useState<LocalHit[] | null>(null);
+  const [history, setHistory] = useState<LocalHit[][]>([]);
+  const [pulled, setPulled] = useState(0);
+  const modules = useConn((s) => s.modules);
 
+  const showLocal = (list: LocalHit[], off = 0) => {
+    setCount(list.length);
+    setOffset(off);
+    setHits(list.slice(off, off + kPage));
+  };
   const page = async (off: number) => {
+    if (local) return showLocal(local, off);
     const r = await attempt("scan", request<{ count: number; results: Hit[] }>("scan_results", { offset: off, limit: kPage }));
     if (r) { setHits(r.results); setCount(r.count); setOffset(off); }
   };
+  /** Pulls the agent's whole candidate list into the app once it is small. */
+  const pullLocal = async (n: number) => {
+    const all: LocalHit[] = [];
+    for (let off = 0; off < n; off += 2000) {
+      const r = await request<{ results: Hit[] }>("scan_results", { offset: off, limit: 2000 }).catch(() => null);
+      if (!r) return null;
+      all.push(...r.results.map((h) => ({ address: h.address, value: h.value })));
+      setPulled(all.length);
+    }
+    return all;
+  };
+  const valueFields = (): Record<string, unknown> => {
+    if ((type === "f32" || type === "f64") && compare === "exact") return floatScanFields(value, floatMode, Number(eps) || 0.0001);
+    const f: Record<string, unknown> = { compare, value, value2 };
+    if (type === "f32" || type === "f64") f.float_epsilon = Number(eps) || 0.0001;
+    return f;
+  };
   const run = async (verb: "scan_new" | "scan_next") => {
+    if (verb === "scan_next" && local) return runLocal();
     setBusy(true);
-    const fields: Record<string, unknown> = { compare, value, value2 };
-    if (verb === "scan_new") Object.assign(fields, { value_type: type, writable_only: writable, ...(module ? { module } : {}) });
+    const fields = valueFields();
+    if (verb === "scan_new") {
+      Object.assign(fields, { value_type: type, writable_only: writable, ...(align ? { alignment: align } : {}) });
+      if (module === "__range") {
+        const lo = parseAddress(rangeLo, modules);
+        const hi = parseAddress(rangeHi, modules);
+        if (lo === null || hi === null || hi <= lo) { setBusy(false); return log("warn", "scan", "enter a start and end address for the range"); }
+        Object.assign(fields, { start: fmtAddr(lo), end: fmtAddr(hi) });
+      } else if (module) fields.module = module;
+    }
     const r = await attempt("scan", request<{ count: number }>(verb, fields));
-    setBusy(false);
     if (r) {
       log("info", "scan", `${verb === "scan_new" ? "first" : "next"} scan: ${r.count} results`);
-      await page(0);
+      if (r.count <= kLocalMax && isNum(type)) {
+        const list = await pullLocal(r.count);
+        if (list) {
+          setLocal(list);
+          setHistory([]);
+          showLocal(list);
+          log("info", "scan", `${list.length} candidates held in the app: next scans run here, with undo and save`);
+        } else await page(0);
+      } else await page(0);
+    }
+    setBusy(false);
+  };
+  const runLocal = async () => {
+    if (!local) return;
+    setBusy(true);
+    const t = type as NumType;
+    const size = kNumSize[t];
+    const fields = valueFields();
+    const cmp = String(fields.compare) as Compare;
+    const cur = await readManyChunked(local.map((h) => ({ address: h.address, size })), 1024, setPulled);
+    const next: LocalHit[] = [];
+    local.forEach((h, i) => {
+      const b = cur[i];
+      if (!b) return;
+      if (keep(t, cmp, b, hexToBytes(h.value), String(fields.value ?? ""), String(fields.value2 ?? ""), Number(fields.float_epsilon ?? eps) || 0.0001)) next.push({ address: h.address, value: bytesToHex(b) });
+    });
+    setHistory((hs) => [...hs.slice(-31), local]);
+    setLocal(next);
+    showLocal(next);
+    setBusy(false);
+    log("info", "scan", `next scan (in app): ${next.length} results`);
+  };
+  const undo = () => {
+    const prevList = history[history.length - 1];
+    if (!prevList) return;
+    setHistory(history.slice(0, -1));
+    setLocal(prevList);
+    showLocal(prevList);
+    log("info", "scan", `undo: back to ${prevList.length} results`);
+  };
+  const save = async () => {
+    if (!local) return;
+    const f: ScanFile = { format: "echodebug.scan", version: 1, type, savedAt: new Date().toISOString(), entries: local };
+    await saveText(`scan-${type}-${local.length}.json`, JSON.stringify(f));
+  };
+  const load = async () => {
+    const input = Object.assign(document.createElement("input"), { type: "file", accept: ".json,application/json" });
+    const { promise, resolve } = Promise.withResolvers<File | null>();
+    input.onchange = () => resolve(input.files?.[0] ?? null);
+    input.click();
+    const file = await promise;
+    if (!file) return;
+    try {
+      const f = JSON.parse(await file.text()) as ScanFile;
+      if (f.format !== "echodebug.scan" || !Array.isArray(f.entries)) throw new Error("not an EchoDebug scan file");
+      setType(f.type);
+      setLocal(f.entries);
+      setHistory([]);
+      setCompare("unchanged");
+      showLocal(f.entries);
+      log("info", "scan", `loaded ${f.entries.length} candidates (${f.type}); the next scan compares against the saved values`);
+    } catch (e) {
+      log("error", "scan", String(e instanceof Error ? e.message : e));
     }
   };
   const reset = async () => {
     await attempt("scan", request("scan_clear"));
-    setCount(null); setHits([]); setCompare("exact");
+    setCount(null); setHits([]); setCompare("exact"); setLocal(null); setHistory([]);
   };
   const started = count !== null;
   const needsValue = !["unknown", "changed", "unchanged", "increased", "decreased"].includes(compare);
+  const isFloat = type === "f32" || type === "f64";
   return (
     <>
       <div className="panel-section">
@@ -104,19 +218,51 @@ function ValueScan() {
             {compare === "between" && <input className="input mono grow" placeholder="to" value={value2} onChange={(e) => setValue2(e.target.value)} />}
           </div>
         )}
-        {!started && (
+        {isFloat && (
           <div className="row">
-            <ModuleSelect value={module} onChange={setModule} />
-            <label className="row" style={{ fontSize: 12 }}><input type="checkbox" checked={writable} onChange={(e) => setWritable(e.target.checked)} />writable</label>
+            <select className="select grow" value={floatMode} onChange={(e) => setFloatMode(e.target.value as FloatMode)} title="how an exact float value matches">
+              <option value="rounded">rounded (1.5 ≈ 1.45…1.55)</option>
+              <option value="truncated">truncated (1.5 ≈ 1.50…1.59)</option>
+              <option value="epsilon">within ± epsilon</option>
+            </select>
+            {floatMode === "epsilon" && <input className="input mono" style={{ width: 80 }} value={eps} onChange={(e) => setEps(e.target.value)} title="epsilon" />}
           </div>
+        )}
+        {!started && (
+          <>
+            <div className="row">
+              <select className="select grow" value={module} onChange={(e) => setModule(e.target.value)}>
+                <option value="">{"<all memory>"}</option>
+                <option value="__range">{"<address range…>"}</option>
+                {modules.map((m) => <option key={m.base} value={m.name}>{m.name}</option>)}
+              </select>
+              <label className="row" style={{ fontSize: 12 }}><input type="checkbox" checked={writable} onChange={(e) => setWritable(e.target.checked)} />writable</label>
+            </div>
+            {module === "__range" && (
+              <div className="row">
+                <input className="input mono grow" placeholder="start" value={rangeLo} onChange={(e) => setRangeLo(e.target.value)} />
+                <input className="input mono grow" placeholder="end" value={rangeHi} onChange={(e) => setRangeHi(e.target.value)} />
+              </div>
+            )}
+            <div className="row">
+              <span className="faint" style={{ fontSize: 12 }}>alignment</span>
+              <select className="select" value={align} onChange={(e) => setAlign(Number(e.target.value))} title="fast scan: only addresses divisible by this">{kAligns.map(([l, v]) => <option key={l} value={v}>{l}</option>)}</select>
+            </div>
+          </>
         )}
         <div className="row">
           {!started ? <button className="btn primary" disabled={busy} onClick={() => void run("scan_new")}>First scan</button> : <button className="btn primary" disabled={busy} onClick={() => void run("scan_next")}>Next scan</button>}
+          <button className="btn" disabled={busy || !local || history.length === 0} onClick={undo} title="restore the candidates before the last next scan">Undo</button>
           <button className="btn" disabled={busy || !started} onClick={() => void reset()}>Reset</button>
           <span className="grow" />
-          {count !== null && <span className="faint">{count.toLocaleString()} results</span>}
+          {count !== null && <span className="faint" title={local ? "held in the app" : "held by the agent"}>{count.toLocaleString()} results{local ? " · in app" : ""}</span>}
         </div>
-        {busy && progress && <Progress value={progress.done / Math.max(1, progress.total)} />}
+        <div className="row">
+          <button className="btn small" disabled={!local} onClick={() => void save()}>Save results…</button>
+          <button className="btn small" disabled={busy} onClick={() => void load()}>Load…</button>
+          <span className="faint" style={{ fontSize: 11 }}>{local ? "" : `undo/save once ≤ ${kLocalMax.toLocaleString()} results`}</span>
+        </div>
+        {busy && (local ? <Progress value={pulled / Math.max(1, local.length)} /> : progress && <Progress value={progress.done / Math.max(1, progress.total)} />)}
       </div>
       <div className="panel-body"><HitTable hits={hits} type={type} /></div>
       {count !== null && count > kPage && (
@@ -126,6 +272,66 @@ function ValueScan() {
           <button className="btn small" disabled={offset + kPage >= count} onClick={() => void page(offset + kPage)}>Next</button>
         </div>
       )}
+    </>
+  );
+}
+
+/** Several values at fixed offsets: scan the anchor, then check the others in the app. */
+function GroupScan() {
+  const modules = useConn((s) => s.modules);
+  const [spec, setSpec] = useState("i32:100; +4 f32:1.5");
+  const [module, setModule] = useState("");
+  const [hits, setHits] = useState<Hit[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const run = async () => {
+    let g: GroupMember[];
+    try { g = parseGroup(spec); } catch (e) { return log("warn", "group", String(e instanceof Error ? e.message : e)); }
+    setBusy(true);
+    setHits([]);
+    const a = g[0];
+    const fields: Record<string, unknown> = { value_type: a.type, compare: "exact", value: a.value, writable_only: true, ...(module ? { module } : {}) };
+    if (a.type === "f32" || a.type === "f64") Object.assign(fields, floatScanFields(a.value!, "rounded"));
+    const r = await attempt("group", request<{ count: number }>("scan_new", fields));
+    if (!r) return setBusy(false);
+    if (r.count > 200_000) {
+      setBusy(false);
+      setNote(`${r.count.toLocaleString()} anchors: make the first member more specific or restrict to a module`);
+      return;
+    }
+    const anchors: string[] = [];
+    for (let off = 0; off < r.count; off += 2000) {
+      const p = await request<{ results: Hit[] }>("scan_results", { offset: off, limit: 2000 }).catch(() => null);
+      if (!p) break;
+      anchors.push(...p.results.map((h) => h.address));
+    }
+    const span = groupSpan(g);
+    const bytes = await readManyChunked(anchors.map((x) => ({ address: x, size: span })));
+    const out: Hit[] = [];
+    anchors.forEach((x, i) => {
+      const b = bytes[i];
+      if (b && groupMatches(g, b)) out.push({ address: x, value: bytesToHex(b) });
+    });
+    setHits(out.slice(0, 5000));
+    setNote(`${anchors.length.toLocaleString()} anchors → ${out.length.toLocaleString()} groups (${span} bytes each)`);
+    log("info", "group", `group scan: ${out.length} matches`);
+    setBusy(false);
+  };
+  return (
+    <>
+      <div className="panel-section">
+        <input className="input mono" value={spec} onChange={(e) => setSpec(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void run()} placeholder="i32:100; +4 f32:1.5; +8 i32:*" />
+        <div className="faint" style={{ fontSize: 11 }}>members: <span className="mono">[+offset] type:value</span>, <span className="mono">*</span> = any; offsets default to right after the previous member</div>
+        <div className="row">
+          <select className="select grow" value={module} onChange={(e) => setModule(e.target.value)}>
+            <option value="">{"<all memory>"}</option>
+            {modules.map((m) => <option key={m.base} value={m.name}>{m.name}</option>)}
+          </select>
+          <button className="btn primary" disabled={busy} onClick={() => void run()}>Scan</button>
+        </div>
+        <span className="faint" style={{ fontSize: 12 }}>{note}</span>
+      </div>
+      <div className="panel-body"><HitTable hits={hits} type="bytes" /></div>
     </>
   );
 }
@@ -170,9 +376,9 @@ export default function ScannerPanel() {
   const [mode, setMode] = useState<Mode>("value");
   return (
     <Panel>
-      <Tabs tabs={[{ id: "value", label: "Value scan" }, { id: "aob", label: "AOB" }, { id: "string", label: "String" }]} active={mode} onSelect={setMode} />
-      <NeedsAgent ext={mode === "value"}>
-        {mode === "value" ? <ValueScan /> : <PatternScan key={mode} mode={mode} />}
+      <Tabs tabs={[{ id: "value", label: "Value scan" }, { id: "group", label: "Group" }, { id: "aob", label: "AOB" }, { id: "string", label: "String" }]} active={mode} onSelect={setMode} />
+      <NeedsAgent ext={mode === "value" || mode === "group"}>
+        {mode === "value" ? <ValueScan /> : mode === "group" ? <GroupScan /> : <PatternScan key={mode} mode={mode} />}
       </NeedsAgent>
     </Panel>
   );

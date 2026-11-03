@@ -31,8 +31,8 @@ class Client {
   private timer: ReturnType<typeof setTimeout> | null = null;
   connected = false;
 
-  connect(port: number): void {
-    this.url = `ws://127.0.0.1:${port}/client`;
+  connect(port: number, token?: string | null): void {
+    this.url = `ws://127.0.0.1:${port}/client${token ? `?token=${encodeURIComponent(token)}` : ""}`;
     this.open();
   }
 
@@ -116,6 +116,12 @@ class Client {
       });
       ws.send(JSON.stringify({ ...fields, type, id }));
     });
+  }
+
+  /** Fire-and-forget frame (provider replies); dropped when the socket is down. */
+  send(frame: Record<string, unknown>): void {
+    const ws = this.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
   }
 
   on(l: Listener): () => void {
