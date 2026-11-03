@@ -20,6 +20,7 @@ import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { CommitInput, IconButton, NeedsAgent, Progress } from "../ui";
 import VList from "../VList";
+import { addressMenu } from "../AddressMenu";
 
 type Fn = { address: string; size: number; source?: "echo" | "pdata" | "both" };
 export type Line = { address: string; length: number; bytes: string; text: string };
@@ -360,7 +361,7 @@ export default function DisassemblyView() {
             const f = shown[i];
             const user = names.nameOf(f.address);
             return (
-              <div className="fn-row" data-selected={i === fnIndex} onClick={() => go(f.address)} title={f.source === "pdata" ? "from the exception directory (.pdata)" : undefined}>
+              <div className="fn-row" data-selected={i === fnIndex} onClick={() => go(f.address)} onContextMenu={addressMenu(f.address)} title={f.source === "pdata" ? "from the exception directory (.pdata)" : undefined}>
                 <span className={user ? "accent" : undefined}>{user || `sub_${showAddr(f.address).replace(/^0+/, "")}`}</span>
                 <span className="faint">{f.source === "pdata" ? "·" : ""}{f.size}</span>
               </div>
@@ -412,7 +413,7 @@ export default function DisassemblyView() {
               const cmt = names.commentOf(l.address);
               const nm = names.nameOf(l.address);
               return (
-                <div className="insn-row" data-selected={ui.selected === l.address} data-match={listingMatches.has(l.address)} onClick={() => ui.select(l.address)}>
+                <div className="insn-row" data-selected={ui.selected === l.address} data-match={listingMatches.has(l.address)} onClick={() => ui.select(l.address)} onContextMenu={addressMenu(l.address)}>
                   <span className="insn-va">{showAddr(l.address)}</span>
                   <span className="insn-bytes">{l.bytes.replace(/(..)/g, "$1 ").trim()}</span>
                   <InsnText text={l.text} notes={notesFor(l)} onGo={go} />

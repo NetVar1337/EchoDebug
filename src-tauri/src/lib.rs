@@ -6,6 +6,8 @@ use echo_debug_relay::{auth, Relay, DEFAULT_PORT, DEFAULT_TIMEOUT};
 use serde::Serialize;
 use tauri::Manager;
 
+mod plugins;
+
 const AGENT_SOURCE: &str = include_str!("../../agent/echo_debug.as");
 const AGENT_PORT_LINE: &str = "const int RELAY_PORT = 47110;";
 
@@ -195,7 +197,10 @@ pub fn run() {
             write_text_file,
             write_binary_file,
             read_text_file,
-            read_binary_file
+            read_binary_file,
+            plugins::plugins_dir,
+            plugins::list_plugins,
+            plugins::read_plugin_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running EchoDebug");

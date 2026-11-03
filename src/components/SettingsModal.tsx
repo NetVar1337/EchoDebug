@@ -9,6 +9,7 @@ import { useUpdate } from "@/store/update";
 import { installAgent, isTauri, openScriptsFolder } from "@/lib/tauri";
 import { isWindowsOs } from "@/lib/tauri";
 import { CopyChip, IconButton, useCopy } from "./ui";
+import PluginsSettings from "./PluginsSettings";
 
 const kAccents = ["", "#2eb8a6", "#88c0d0", "#f26b38", "#a78bfa", "#f472b6", "#facc15"];
 const kThemes: { id: Theme; label: string }[] = [
@@ -107,6 +108,10 @@ export default function SettingsModal() {
             <Row label="Panel sizes" hint="Splitter positions are remembered between runs.">
               <button className="btn" onClick={() => { ui.set({ layout: {} }); for (const v of ["--left-w", "--scan-w", "--bottom-h", "--right-w"]) document.querySelector<HTMLElement>(".app")?.style.removeProperty(v); }}>Reset layout</button>
             </Row>
+          </Section>
+
+          <Section title="Plugins">
+            <PluginsSettings />
           </Section>
 
           <Section title="Updates">

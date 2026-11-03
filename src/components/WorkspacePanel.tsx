@@ -38,6 +38,7 @@ const kViews: Record<TabId, ComponentType> = {
   unpack: lazy(() => import("./views/UnpackView")),
   decrypt: lazy(() => import("./views/DecryptView")),
   script: lazy(() => import("./views/ScriptView")),
+  plugins: lazy(() => import("./views/PluginsView")),
 };
 
 export default function WorkspacePanel() {

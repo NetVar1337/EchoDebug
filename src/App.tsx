@@ -23,6 +23,8 @@ import { startProvider } from "@/lib/provider";
 import { startMcpPolicy } from "@/store/mcp";
 import { startMonitors } from "@/store/monitors";
 import { startSync } from "@/store/sync";
+import { startPlugins } from "@/store/plugins";
+import AddressMenu from "@/components/AddressMenu";
 import ApprovalDialog from "@/components/ApprovalDialog";
 import { redo, undo } from "@/lib/history";
 import { startProjects } from "@/lib/projects";
@@ -62,6 +64,7 @@ export default function App() {
     startMcpPolicy();
     startMonitors();
     startSync();
+    if (isTauri()) startPlugins();
     startProjects();
     startWorkspace();
     startAutoPatches();
@@ -203,6 +206,7 @@ export default function App() {
       <ApprovalDialog />
       {ui.shortcutsOpen && <ShortcutsDialog />}
       <Toasts />
+      <AddressMenu />
     </div>
   );
 }
