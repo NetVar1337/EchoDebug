@@ -14,8 +14,8 @@ jobs:
     name: Frontend (typecheck, tests, build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -31,8 +31,8 @@ jobs:
     env:
       LSP_REV: 700a15c05d4ed85559e4a40205f9260822c3b18f
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Build echo-angelscript-lsp (pinned, the lint imports its internals)
@@ -45,7 +45,7 @@ jobs:
     name: Relay (cargo test + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -54,15 +54,36 @@ jobs:
           workspaces: src-tauri
       - run: cargo test -p echo-debug-relay
         working-directory: src-tauri
-      - run: cargo clippy -p echo-debug-relay -- -D warnings
+      - run: cargo clippy -p echo-debug-relay --all-targets -- -D warnings
         working-directory: src-tauri
+
+  e2e:
+    name: End-to-end UI (Linux local backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # the relay attaches to a process it did not start: allow ptrace / /proc/<pid>/mem across the session
+      - run: sudo sysctl -w kernel.yama.ptrace_scope=0
+      - run: npm ci
+      - run: cargo build -p echo-debug-relay --bin echodebug-relay
+        working-directory: src-tauri
+      - run: npm i --no-save playwright@1.63.0 && npx playwright install --with-deps chromium
+      - run: npm run test:e2e
 
   app:
     name: Windows app (cargo check)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -79,8 +100,8 @@ jobs:
     name: Linux app (cargo check)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm

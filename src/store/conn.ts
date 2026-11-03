@@ -3,7 +3,6 @@ import { create } from "zustand";
 import { client, request, type Frame } from "@/lib/client";
 import { type Module } from "@/lib/hex";
 import { hostOs, regenerateToken, relayInfo, type RelayInfo } from "@/lib/tauri";
-import { handleUiCall } from "@/lib/uiBridge";
 import { clearImages } from "@/lib/memory";
 import { log } from "./output";
 import pkg from "../../package.json";
@@ -13,12 +12,20 @@ export type Progress = { job: string; done: number; total: number } | null;
 
 type ConnStore = {
   port: number;
-  /** bearer token for /mcp and /client (shown in the MCP connect command) */
+  /** relay bearer token, shown in the MCP panel's connect command */
   token: string;
   relay: boolean;
   relayError: string;
   agent: boolean;
   ext: boolean;
+  /** this or another app window serves the ui_* MCP verbs */
+  provider: boolean;
+  /** the relay can attach on its own (Linux local backend) */
+  localAvailable: boolean;
+  /** memory verbs work: Echo's memory server, or the local backend */
+  mem: boolean;
+  /** agent verbs work: the Echo agent, or the local backend */
+  extOk: boolean;
   extVersion: string;
   appVersion: string;
   /** "echo" (Windows memory server), "local" (Linux /proc backend) or "none" */
@@ -66,6 +73,10 @@ export const useConn = create<ConnStore>((set, get) => ({
   relayError: "",
   agent: false,
   ext: false,
+  provider: false,
+  localAvailable: false,
+  mem: false,
+  extOk: false,
   extVersion: "",
   appVersion: pkg.version,
   backend: "none",
@@ -86,15 +97,11 @@ export const useConn = create<ConnStore>((set, get) => ({
     client.onState((up) => {
       set({ relay: up });
       log(up ? "info" : "warn", "relay", up ? `connected to 127.0.0.1:${info.port}` : "relay disconnected, retrying");
-      if (up) {
-        void get().refreshStatus();
-        // this socket serves the MCP annotation tools (names, comments, patches) from our stores
-        void request("ui_register").catch((e) => log("warn", "mcp", `ui_register: ${String(e)}`));
-      } else set({ agent: false, ext: false });
+      if (up) void get().refreshStatus();
+      else set({ agent: false, ext: false });
     });
     client.on((f) => {
       if (f.type === "status") applyStatus(f);
-      else if (f.type === "ui_call") void handleUiCall(f);
       else if (f.type === "event") {
         const ev = String(f.event ?? "");
         if (ev === "progress") set({ progress: { job: String(f.job), done: Number(f.done), total: Number(f.total) } });
@@ -107,7 +114,7 @@ export const useConn = create<ConnStore>((set, get) => ({
         for (const l of eventListeners) l(f);
       }
     });
-    client.connect(info.port, info.token ?? "");
+    client.connect(info.port, info.token);
   },
 
   refreshStatus: async () => {
@@ -119,7 +126,7 @@ export const useConn = create<ConnStore>((set, get) => ({
   },
 
   refreshModules: async () => {
-    if (!get().agent) return set({ modules: [] });
+    if (!get().agent && get().backend !== "local") return set({ modules: [] });
     try {
       const r = await request<{ modules: Module[] }>("modules");
       set({ modules: [...r.modules].sort((a, b) => a.name.localeCompare(b.name)) });
@@ -155,7 +162,7 @@ function applyStatus(f: Frame): void {
   const backend = String(f.backend ?? (agent ? "echo" : "none"));
   const target = targetFrom(f) ?? (agent || backend === "local" ? s.target : null);
   const changed = agent !== s.agent || target?.pid !== s.target?.pid;
-  useConn.setState({ agent, ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
+  useConn.setState({ agent, mem: agent || backend === "local", extOk: Boolean(f.ext) || backend === "local", provider: Boolean(f.provider), localAvailable: Boolean(f.local_available), ext: Boolean(f.ext), extVersion: String(f.ext_version ?? ""), backend, target });
   if (changed) {
     clearImages();
     void s.refreshModules();

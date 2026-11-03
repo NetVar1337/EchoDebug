@@ -14,21 +14,16 @@ use tower::ServiceExt;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-const TOKEN: &str = "test-token";
-
 async fn start() -> (SocketAddr, Relay) {
-    let relay = Relay::new("1.2.3", Duration::from_secs(5))
-        .with_local_backend(false)
-        .with_token(Some(TOKEN.into()));
+    let relay = Relay::new("1.2.3", Duration::from_secs(5)).with_local_backend(false);
     let listener = bind(0).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(run(listener, relay.clone()));
     (addr, relay)
 }
 
-/// `/client` needs the token (as `?token=`, like the browser UI); upstream routes ignore it.
 async fn connect(addr: SocketAddr, path: &str) -> Ws {
-    connect_async(format!("ws://{addr}{path}?token={TOKEN}")).await.unwrap().0
+    connect_async(format!("ws://{addr}{path}")).await.unwrap().0
 }
 
 async fn send(ws: &mut Ws, v: Value) {
@@ -208,7 +203,7 @@ async fn ext_events_broadcast_and_status_tracks_hello_and_attach() {
 async fn origin_checks() {
     let (addr, _) = start().await;
     let reject = |path: &str, origin: &str| {
-        let mut req = format!("ws://{addr}{path}?token={TOKEN}").into_client_request().unwrap();
+        let mut req = format!("ws://{addr}{path}").into_client_request().unwrap();
         req.headers_mut().insert("origin", origin.parse().unwrap());
         async move {
             match connect_async(req).await {
@@ -237,14 +232,7 @@ async fn origin_checks() {
 }
 
 async fn mcp(relay: &Relay, body: Value, origin: Option<&str>) -> (StatusCode, Value) {
-    mcp_auth(relay, body, origin, Some(&format!("Bearer {TOKEN}"))).await
-}
-
-async fn mcp_auth(relay: &Relay, body: Value, origin: Option<&str>, auth: Option<&str>) -> (StatusCode, Value) {
     let mut req = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
-    if let Some(a) = auth {
-        req = req.header(header::AUTHORIZATION, a);
-    }
     if let Some(o) = origin {
         req = req.header(header::ORIGIN, o);
     }
@@ -424,7 +412,7 @@ async fn hello_attached_without_agent_pokes_reopen_socket() {
     assert_eq!(st["agent"], false);
 
     // not poked when the native server is connected, or when not attached
-    let mut agent = connect(addr, "/agent").await;
+    let _agent = connect(addr, "/agent").await;
     let _ = recv_until(&mut client, |v| v["type"] == "status" && v["agent"] == true).await;
     send(
         &mut ext,
@@ -456,13 +444,13 @@ async fn mcp_prompts_resources_and_call_log() {
 
     // initialize advertises tools + prompts + resources
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }), None).await;
-    assert_eq!(r["result"]["capabilities"], json!({ "tools": {}, "prompts": {}, "resources": {} }));
+    assert_eq!(r["result"]["capabilities"], json!({ "tools": { "listChanged": false }, "prompts": {}, "resources": { "subscribe": true }, "logging": {}, "completions": {} }));
     assert!(r["result"]["instructions"].as_str().unwrap().contains("attach"));
 
     // prompts/list + prompts/get with argument substitution
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/list" }), None).await;
     let names: Vec<&str> = r["result"]["prompts"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-    for want in ["explain_function", "find_pattern", "find_string", "pointer_path", "scan_value", "triage_module"] {
+    for want in ["explain_function", "find_pattern", "find_string", "pointer_path", "scan_value", "triage_module", "find_vtable", "make_signature", "diff_snapshots", "unpack_module", "decrypt_strings", "find_value_references", "rebuild_class", "update_signatures_after_patch"] {
         assert!(names.contains(&want), "missing prompt {want}");
     }
     let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": { "name": "explain_function", "arguments": { "address": "0x140001000" } } }), None).await;
@@ -535,7 +523,7 @@ async fn local_backend_serves_verbs_without_upstream() {
     send(&mut client, json!({ "type": "modules", "id": 3 })).await;
     let r = recv_until(&mut client, |v| v["id"] == 3).await;
     assert_eq!(r["type"], "modules_result");
-    assert!(r["modules"].as_array().unwrap().len() > 0, "own process has modules: {r}");
+    assert!(!r["modules"].as_array().unwrap().is_empty(), "own process has modules: {r}");
 
     // status reports the local backend
     send(&mut client, json!({ "type": "status", "id": 4 })).await;
@@ -545,128 +533,287 @@ async fn local_backend_serves_verbs_without_upstream() {
 }
 
 #[tokio::test]
-async fn token_required_on_mcp_and_client() {
-    let (addr, relay) = start().await;
-    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
-
-    let (s, _) = mcp_auth(&relay, ping.clone(), None, None).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "no token");
-    let (s, _) = mcp_auth(&relay, ping.clone(), None, Some("Bearer wrong-token")).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong token");
-    let (s, _) = mcp_auth(&relay, ping.clone(), None, Some(TOKEN)).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "missing Bearer scheme");
-    let (s, r) = mcp_auth(&relay, ping.clone(), None, Some(&format!("Bearer {TOKEN}"))).await;
-    assert_eq!((s, &r["result"]), (StatusCode::OK, &json!({})), "right token");
-    // Origin check still applies with a valid token.
-    let (s, _) = mcp(&relay, ping.clone(), Some("https://evil.example")).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-
-    let status = |url: String, auth: Option<&'static str>| async move {
-        let mut req = url.into_client_request().unwrap();
-        if let Some(a) = auth {
-            req.headers_mut().insert("authorization", a.parse().unwrap());
-        }
-        match connect_async(req).await {
-            Err(WsError::Http(resp)) => resp.status(),
-            Ok(_) => StatusCode::SWITCHING_PROTOCOLS,
-            Err(e) => panic!("{e}"),
-        }
-    };
-    assert_eq!(status(format!("ws://{addr}/client"), None).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(status(format!("ws://{addr}/client?token=nope"), None).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(status(format!("ws://{addr}/client?token={TOKEN}"), None).await, StatusCode::SWITCHING_PROTOCOLS);
-    assert_eq!(status(format!("ws://{addr}/client"), Some("Bearer test-token")).await, StatusCode::SWITCHING_PROTOCOLS);
-    // Echo's upstream routes stay token-free (the agent script dials a fixed URL).
-    assert_eq!(status(format!("ws://{addr}/agent"), None).await, StatusCode::SWITCHING_PROTOCOLS);
-
-    // Regeneration takes effect immediately.
-    relay.set_token(Some("rotated".into()));
-    let (s, _) = mcp(&relay, ping.clone(), None).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "old token rejected after rotation");
-    let (s, _) = mcp_auth(&relay, ping, None, Some("Bearer rotated")).await;
-    assert_eq!(s, StatusCode::OK);
-}
-
-fn tool_call(id: u64, name: &str, args: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } })
-}
-
-fn tool_text(r: &Value) -> String {
-    r["result"]["content"][0]["text"].as_str().unwrap().to_owned()
-}
-
-#[tokio::test]
-async fn ui_tools_forward_to_registered_ui() {
-    let (addr, relay) = start().await;
-
-    // No UI registered: clear error, not a hang.
-    let (_, r) = mcp(&relay, tool_call(1, "list_names", json!({})), None).await;
-    assert_eq!(r["result"]["isError"], true);
-    assert!(tool_text(&r).contains("2005") && tool_text(&r).contains("UI not connected"), "{r}");
-
-    // A plain /client (script) does not receive UI calls; the registered one does.
-    let mut ui = connect(addr, "/client").await;
-    send(&mut ui, json!({ "type": "ui_register", "id": 1 })).await;
-    let reg = recv_until(&mut ui, |v| v["type"] == "ui_register_result").await;
-    assert_eq!((reg["id"].as_u64(), reg["success"].as_bool()), (Some(1), Some(true)));
-
-    let fake_ui = tokio::spawn(async move {
-        let call = recv_until(&mut ui, |v| v["type"] == "ui_call").await;
-        assert_eq!(call["verb"], "set_name");
-        assert_eq!(call["args"], json!({ "address": "0x140001000", "name": "main" }));
-        assert!(call["call_id"].is_u64());
-        send(&mut ui, json!({ "type": "ui_reply", "call_id": call["call_id"], "result": { "address": "0x140001000", "name": "main" } })).await;
-
-        let call = recv_until(&mut ui, |v| v["type"] == "ui_call").await;
-        assert_eq!(call["verb"], "revert_patch");
-        send(&mut ui, json!({ "type": "ui_reply", "call_id": call["call_id"], "error": "no patch with id zz" })).await;
-        ui
-    });
-    let (_, r) = mcp(&relay, tool_call(2, "set_name", json!({ "address": "0x140001000", "name": "main" })), None).await;
-    assert_eq!(r["result"]["isError"], false, "{r}");
-    let body: Value = serde_json::from_str(&tool_text(&r)).unwrap();
-    assert_eq!(body, json!({ "success": true, "address": "0x140001000", "name": "main" }));
-
-    let (_, r) = mcp(&relay, tool_call(3, "revert_patch", json!({ "patch_id": "zz" })), None).await;
-    assert_eq!(r["result"]["isError"], true);
-    assert!(tool_text(&r).contains("no patch with id zz"), "{r}");
-
-    // The UI goes away: calls fail fast again.
-    let ui = fake_ui.await.unwrap();
-    drop(ui);
-    let mut gone = false;
-    for _ in 0..50 {
-        let (_, r) = mcp(&relay, tool_call(4, "list_patches", json!({})), None).await;
-        if tool_text(&r).contains("2005") {
-            gone = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(gone, "UI unregistered on disconnect");
-}
-
-#[tokio::test]
-async fn ui_call_times_out_and_fails_on_disconnect() {
-    let relay = Relay::new("1.2.3", Duration::from_millis(300)).with_local_backend(false);
+async fn token_guards_client_and_mcp() {
+    let relay = Relay::new("1.2.3", Duration::from_secs(5))
+        .with_local_backend(false)
+        .with_token(Some("s3cret-token-0123456789abcdef0123".into()));
     let listener = bind(0).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(run(listener, relay.clone()));
-    let mut ui = connect(addr, "/client").await;
-    send(&mut ui, json!({ "type": "ui_register", "id": 1 })).await;
-    recv_until(&mut ui, |v| v["type"] == "ui_register_result").await;
 
-    // UI never answers → 2003.
-    let (_, r) = mcp(&relay, tool_call(1, "list_comments", json!({})), None).await;
-    assert!(tool_text(&r).contains("2003"), "{r}");
+    match connect_async(format!("ws://{addr}/client")).await {
+        Err(WsError::Http(resp)) => assert_eq!(resp.status(), StatusCode::UNAUTHORIZED),
+        other => panic!("expected 401, got {:?}", other.map(|_| ())),
+    }
+    let mut ok = connect(addr, "/client?token=s3cret-token-0123456789abcdef0123").await;
+    let s = recv_until(&mut ok, |v| v["type"] == "status").await;
+    assert_eq!(s["provider"], false);
+    // upstream endpoints stay open (Echo cannot send headers)
+    let _agent = connect(addr, "/agent").await;
 
-    // UI drops while a call is in flight → 2004.
-    let call = tokio::spawn({
-        let relay = relay.clone();
-        async move { mcp(&relay, tool_call(2, "list_names", json!({})), None).await }
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    let (s, _) = mcp(&relay, ping.clone(), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let resp = router(relay.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer s3cret-token-0123456789abcdef0123")
+                .body(Body::from(ping.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = router(relay.clone())
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::AUTHORIZATION, "Bearer wrong")
+                .body(Body::from(ping.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // regeneration (the app's set_token) takes effect immediately; open sockets stay up
+    relay.set_token(Some("rotated-token-0123456789abcdef01234".into()));
+    let post = |auth: &'static str| {
+        router(relay.clone()).oneshot(
+            Request::post("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, auth)
+                .body(Body::from(ping.to_string()))
+                .unwrap(),
+        )
+    };
+    assert_eq!(post("Bearer s3cret-token-0123456789abcdef0123").await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(post("Bearer rotated-token-0123456789abcdef01234").await.unwrap().status(), StatusCode::OK);
+    send(&mut ok, json!({ "type": "status", "id": 2 })).await;
+    assert_eq!(recv_until(&mut ok, |v| v["id"] == 2).await["type"], "status_result");
+}
+
+#[tokio::test]
+async fn provider_serves_ui_verbs() {
+    let (addr, relay) = start().await;
+    // no app window: clear error
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "ui_pe_info", "arguments": {} } }), None).await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("app window"));
+
+    let mut app = connect(addr, "/client").await;
+    send(&mut app, json!({ "type": "provide", "id": 9, "verbs": ["ui_pe_info"] })).await;
+    recv_until(&mut app, |v| v["type"] == "provide_result" && v["id"] == 9).await;
+
+    let relay2 = relay.clone();
+    let call = tokio::spawn(async move {
+        mcp(&relay2, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "ui_pe_info", "arguments": { "module": "game.exe" } } }), None).await
     });
-    recv_until(&mut ui, |v| v["type"] == "ui_call" && v["verb"] == "list_names").await;
-    drop(ui);
+    let req = recv_until(&mut app, |v| v["type"] == "provider_call").await;
+    assert_eq!(req["verb"], "ui_pe_info");
+    assert_eq!(req["args"]["module"], "game.exe");
+    send(&mut app, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_pe_info", "result": { "is64": true } })).await;
     let (_, r) = call.await.unwrap();
-    assert!(tool_text(&r).contains("2004"), "{r}");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["is64"], true);
+
+    // provider errors come back as tool errors; a closed window fails in-flight calls
+    let relay3 = relay.clone();
+    let call = tokio::spawn(async move {
+        mcp(&relay3, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "ui_strings", "arguments": {} } }), None).await
+    });
+    let req = recv_until(&mut app, |v| v["type"] == "provider_call").await;
+    send(&mut app, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_strings", "error": "no modules" })).await;
+    let (_, r) = call.await.unwrap();
+    assert_eq!(r["result"]["isError"], true);
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("no modules"));
+}
+
+#[tokio::test]
+async fn mcp_event_stream_and_progress() {
+    let (addr, relay) = start().await;
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }), None).await;
+    assert_eq!(r["result"]["capabilities"]["resources"]["subscribe"], true);
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/subscribe", "params": { "uri": "echodebug://status" } }), None).await;
+    assert_eq!(r["result"], json!({}));
+
+    // GET /mcp as SSE: an upstream connecting produces resources/updated
+    let resp = router(relay.clone())
+        .oneshot(Request::get("/mcp").header(header::ACCEPT, "text/event-stream").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let _ext = connect(addr, "/ext").await;
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next()).await.unwrap().unwrap().unwrap();
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(text.contains("notifications/resources/updated"), "{text}");
+
+    // tools/call with a progressToken over SSE: progress events, then the result
+    let mut ext = connect(addr, "/ext").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let relay2 = relay.clone();
+    let streamed = tokio::spawn(async move {
+        let msg = json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "value_scan_clear", "arguments": {}, "_meta": { "progressToken": "p1" } } });
+        let resp = router(relay2)
+            .oneshot(Request::post("/mcp").header(header::ACCEPT, "application/json, text/event-stream").body(Body::from(msg.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        String::from_utf8_lossy(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).into_owned()
+    });
+    let req = recv_until(&mut ext, |v| v["type"] == "scan_clear").await;
+    send(&mut ext, json!({ "type": "event", "event": "progress", "job": "scan_new", "done": 1, "total": 2 })).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    send(&mut ext, json!({ "type": "scan_clear_result", "id": req["id"], "success": true })).await;
+    let text = streamed.await.unwrap();
+    assert!(text.contains("notifications/progress") && text.contains("\"p1\""), "{text}");
+    assert!(text.contains("\"id\":5"), "{text}");
+}
+
+#[tokio::test]
+async fn mcp_policy_annotations_templates_completion() {
+    let (addr, relay) = start().await;
+    // annotations + outputSchema on every tool
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let w = tools.iter().find(|t| t["name"] == "write_memory").unwrap();
+    assert_eq!(w["annotations"]["destructiveHint"], true, "{w}");
+    let rd = tools.iter().find(|t| t["name"] == "read_memory").unwrap();
+    assert_eq!(rd["annotations"]["readOnlyHint"], true);
+    assert_eq!(rd["outputSchema"]["type"], "object");
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {} }), None).await;
+    assert!(r["result"]["capabilities"]["completions"].is_object());
+
+    // read-only policy refuses writes without reaching any upstream
+    let mut c = connect(addr, "/client").await;
+    send(&mut c, json!({ "type": "mcp_policy", "id": 5, "mode": "readonly" })).await;
+    let p = recv_until(&mut c, |v| v["id"] == 5).await;
+    assert_eq!(p["mode"], "readonly", "{p}");
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "write_memory", "arguments": { "address": "0x1000", "data": "90" } } }), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("read-only"), "{r}");
+    assert_eq!(r["result"]["structuredContent"]["code"], 4003);
+    send(&mut c, json!({ "type": "mcp_policy", "id": 6, "mode": "nonsense" })).await;
+    assert_eq!(recv_until(&mut c, |v| v["id"] == 6).await["type"], "error");
+
+    // deny list
+    send(&mut c, json!({ "type": "mcp_policy", "id": 7, "mode": "allow", "deny": ["ui_pe_info"] })).await;
+    recv_until(&mut c, |v| v["id"] == 7).await;
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "ui_pe_info", "arguments": {} } }), None).await;
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("deny list"), "{r}");
+
+    // ask: no window → refused; with a window that approves → forwarded
+    send(&mut c, json!({ "type": "mcp_policy", "id": 8, "mode": "ask", "deny": [] })).await;
+    recv_until(&mut c, |v| v["id"] == 8).await;
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": { "name": "write_memory", "arguments": { "address": "0x1000", "data": "90" } } }), None).await;
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("approval"), "{r}");
+    send(&mut c, json!({ "type": "provide", "id": 9, "verbs": ["ui_approve", "ui_names", "ui_pe_info"] })).await;
+    recv_until(&mut c, |v| v["id"] == 9).await;
+    let relay2 = relay.clone();
+    let call = tokio::spawn(async move {
+        mcp(&relay2, json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": { "name": "write_memory", "arguments": { "address": "0x1000", "data": "90" } } }), None).await
+    });
+    let ask = recv_until(&mut c, |v| v["type"] == "provider_call").await;
+    assert_eq!(ask["verb"], "ui_approve");
+    assert_eq!(ask["args"]["tool"], "write_memory");
+    send(&mut c, json!({ "type": "provider_reply", "call": ask["call"], "verb": "ui_approve", "result": { "approved": false } })).await;
+    let (_, r) = call.await.unwrap();
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("denied"), "{r}");
+    // read-only tools are not asked about
+    let relay3 = relay.clone();
+    let call = tokio::spawn(async move {
+        mcp(&relay3, json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "ui_pe_info", "arguments": {} } }), None).await
+    });
+    let req = recv_until(&mut c, |v| v["type"] == "provider_call").await;
+    assert_eq!(req["verb"], "ui_pe_info");
+    send(&mut c, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_pe_info", "result": { "is64": true } })).await;
+    let (_, r) = call.await.unwrap();
+    assert_eq!(r["result"]["structuredContent"]["is64"], true, "{r}");
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 8, "method": "resources/read", "params": { "uri": "echodebug://mcp/log" } }), None).await;
+    let log: Value = serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    let outcomes: Vec<&str> = log["entries"].as_array().unwrap().iter().map(|e| e["outcome"].as_str().unwrap()).collect();
+    assert_eq!(outcomes, ["denied", "denied", "denied", "denied", "ok"]);
+
+    // resource templates route to provider verbs
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 9, "method": "resources/templates/list" }), None).await;
+    assert!(r["result"]["resourceTemplates"].as_array().unwrap().len() >= 5);
+    let relay4 = relay.clone();
+    let read = tokio::spawn(async move {
+        mcp(&relay4, json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/read", "params": { "uri": "echodebug://module/game.exe/pe" } }), None).await
+    });
+    let req = recv_until(&mut c, |v| v["type"] == "provider_call").await;
+    assert_eq!((req["verb"].as_str(), req["args"]["module"].as_str()), (Some("ui_pe_info"), Some("game.exe")));
+    send(&mut c, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_pe_info", "result": { "machine": "x64" } })).await;
+    let (_, r) = read.await.unwrap();
+    assert!(r["result"]["contents"][0]["text"].as_str().unwrap().contains("x64"), "{r}");
+
+    // completion: value types locally, names from the window
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 11, "method": "completion/complete", "params": { "ref": { "type": "ref/prompt", "name": "scan_value" }, "argument": { "name": "value_type", "value": "f" } } }), None).await;
+    assert_eq!(r["result"]["completion"]["values"], json!(["f32", "f64"]), "{r}");
+    let relay5 = relay.clone();
+    let comp = tokio::spawn(async move {
+        mcp(&relay5, json!({ "jsonrpc": "2.0", "id": 12, "method": "completion/complete", "params": { "ref": { "type": "ref/prompt", "name": "explain_function" }, "argument": { "name": "address", "value": "dec" } } }), None).await
+    });
+    let req = recv_until(&mut c, |v| v["type"] == "provider_call").await;
+    assert_eq!(req["verb"], "ui_names");
+    send(&mut c, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_names", "result": { "names": [{ "name": "decrypt_string" }, { "name": "main" }] } })).await;
+    let (_, r) = comp.await.unwrap();
+    assert_eq!(r["result"]["completion"]["values"], json!(["decrypt_string"]), "{r}");
+}
+
+#[tokio::test]
+async fn annotation_tools_go_through_provider_and_policy() {
+    let (addr, relay) = start().await;
+    let call = |id: u64, name: &str, args: Value| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": args } });
+    let text = |r: &Value| r["result"]["content"][0]["text"].as_str().unwrap().to_owned();
+
+    // annotations: listing is read-only, naming changes EchoDebug state, revert writes the target
+    let (_, r) = mcp(&relay, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), None).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("missing tool {n}")).clone();
+    for n in ["list_names", "list_comments", "list_patches", "list_signatures"] {
+        assert_eq!(tool(n)["annotations"]["readOnlyHint"], true, "{n}");
+    }
+    assert_eq!(tool("set_name")["annotations"]["readOnlyHint"], false);
+    assert_eq!(tool("set_name")["annotations"]["destructiveHint"], false);
+    assert_eq!(tool("set_comment")["annotations"]["readOnlyHint"], false);
+    assert_eq!(tool("revert_patch")["annotations"]["destructiveHint"], true);
+
+    // no app window: the provider error, not a hang
+    let (_, r) = mcp(&relay, call(2, "list_names", json!({})), None).await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(text(&r).contains("app window"), "{r}");
+
+    // the window serves them as ui_* provider verbs
+    let mut app = connect(addr, "/client").await;
+    send(&mut app, json!({ "type": "provide", "id": 9, "verbs": ["ui_set_name", "ui_revert_patch", "ui_approve"] })).await;
+    recv_until(&mut app, |v| v["type"] == "provide_result" && v["id"] == 9).await;
+    let relay2 = relay.clone();
+    let pending = tokio::spawn(async move { mcp(&relay2, call(3, "set_name", json!({ "address": "0x140001000", "name": "main" })), None).await });
+    let req = recv_until(&mut app, |v| v["type"] == "provider_call").await;
+    assert_eq!(req["verb"], "ui_set_name");
+    assert_eq!((req["args"]["address"].as_str(), req["args"]["name"].as_str()), (Some("0x140001000"), Some("main")));
+    send(&mut app, json!({ "type": "provider_reply", "call": req["call"], "verb": "ui_set_name", "result": { "address": "0x140001000", "name": "main" } })).await;
+    let (_, r) = pending.await.unwrap();
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(r["result"]["structuredContent"]["name"], "main");
+
+    // read-only policy: revert_patch is refused before reaching the window; naming still works
+    send(&mut app, json!({ "type": "mcp_policy", "id": 10, "mode": "readonly" })).await;
+    recv_until(&mut app, |v| v["id"] == 10).await;
+    let (_, r) = mcp(&relay, call(4, "revert_patch", json!({ "patch_id": "p1" })), None).await;
+    assert!(text(&r).contains("read-only"), "{r}");
+
+    // ask policy: the window is asked first, and a refusal stops the revert
+    send(&mut app, json!({ "type": "mcp_policy", "id": 11, "mode": "ask" })).await;
+    recv_until(&mut app, |v| v["id"] == 11).await;
+    let relay3 = relay.clone();
+    let pending = tokio::spawn(async move { mcp(&relay3, call(5, "revert_patch", json!({ "patch_id": "p1" })), None).await });
+    let ask = recv_until(&mut app, |v| v["type"] == "provider_call").await;
+    assert_eq!((ask["verb"].as_str(), ask["args"]["tool"].as_str()), (Some("ui_approve"), Some("revert_patch")));
+    send(&mut app, json!({ "type": "provider_reply", "call": ask["call"], "verb": "ui_approve", "result": { "approved": false } })).await;
+    let (_, r) = pending.await.unwrap();
+    assert!(text(&r).contains("denied"), "{r}");
 }

@@ -1,3 +1,4 @@
+import { useProjects } from "@/lib/projects";
 import type { ReactNode } from "react";
 import { Check, X } from "lucide-react";
 import { mcpAddCommand, useConn } from "@/store/conn";
@@ -17,6 +18,7 @@ const kThemes: { id: Theme; label: string }[] = [
 ];
 
 export default function SettingsModal() {
+  const projects = useProjects();
   const ui = useUi();
   const conn = useConn();
   const upd = useUpdate();
@@ -70,7 +72,7 @@ export default function SettingsModal() {
             <Row label="Add to Claude Code" hint="Includes this install's bearer token; /mcp rejects requests without it.">
               <CopyChip text={mcpAddCommand(conn.port, conn.token)} copied={copied} onCopy={copy} />
             </Row>
-            {isTauri() && (
+            {isTauri() && conn.token && (
               <Row label="MCP token" hint="Regenerating locks out MCP clients until they are re-added with the new command.">
                 <button className="btn" onClick={() => void attempt("token", conn.regenerateToken())}>Regenerate token</button>
               </Row>
@@ -87,6 +89,24 @@ export default function SettingsModal() {
                 The Echo agent is Windows-only. On <span className="mono">{conn.os}</span> the relay serves a local <span className="mono">/proc</span> backend — attach from the Targets panel.
               </div>
             )}
+          </Section>
+
+          <Section title="Workspace">
+            <Row label="Reattach on start" hint={ui.lastTarget ? `Attach to ${ui.lastTarget} again when the app starts, if it is running.` : "Attach to the last target again when the app starts."}>
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={ui.reattach} onChange={(e) => ui.set({ reattach: e.target.checked })} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Module projects" hint="Save names, comments and bookmarks per module build (by RVA) and restore them on the next attach.">
+              <label className="switch">
+                <input type="checkbox" role="switch" checked={projects.enabled} onChange={(e) => projects.setEnabled(e.target.checked)} />
+                <span />
+              </label>
+            </Row>
+            <Row label="Panel sizes" hint="Splitter positions are remembered between runs.">
+              <button className="btn" onClick={() => { ui.set({ layout: {} }); for (const v of ["--left-w", "--scan-w", "--bottom-h", "--right-w"]) document.querySelector<HTMLElement>(".app")?.style.removeProperty(v); }}>Reset layout</button>
+            </Row>
           </Section>
 
           <Section title="Updates">

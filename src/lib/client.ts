@@ -31,21 +31,14 @@ class Client {
   private timer: ReturnType<typeof setTimeout> | null = null;
   connected = false;
 
-  /** `token` is the relay's bearer token; browsers can't set WebSocket headers, so it goes in the query. */
-  connect(port: number, token = ""): void {
-    this.url = `ws://127.0.0.1:${port}/client`;
-    this.setToken(token);
+  connect(port: number, token?: string | null): void {
+    this.url = `ws://127.0.0.1:${port}/client${token ? `?token=${encodeURIComponent(token)}` : ""}`;
     this.open();
   }
 
-  /** Used for the next (re)connect; the open socket stays authorized. */
-  setToken(token: string): void {
+  /** Token for the next (re)connect after a regeneration; the open socket stays authorized. */
+  setToken(token: string | null): void {
     this.url = this.url.split("?")[0] + (token ? `?token=${encodeURIComponent(token)}` : "");
-  }
-
-  /** Fire-and-forget frame (replies to relay-initiated `ui_call`s). */
-  send(frame: Record<string, unknown>): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(frame));
   }
 
   private open(): void {
@@ -128,6 +121,12 @@ class Client {
       });
       ws.send(JSON.stringify({ ...fields, type, id }));
     });
+  }
+
+  /** Fire-and-forget frame (provider replies); dropped when the socket is down. */
+  send(frame: Record<string, unknown>): void {
+    const ws = this.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
   }
 
   on(l: Listener): () => void {
