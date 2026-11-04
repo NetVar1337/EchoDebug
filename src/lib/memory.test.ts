@@ -28,10 +28,23 @@ describe("readRange batching (#37)", () => {
   });
 
   it("splits bigger ranges into multiple rounds", async () => {
-    await readRange(0n, 20 * 1024 * 1024); // 320 entries -> rounds of 256 + 64
-    expect(readBatch).toHaveBeenCalledTimes(2);
+    await readRange(0n, 20 * 1024 * 1024); // 320 entries -> rounds of 128 + 128 + 64
+    expect(readBatch).toHaveBeenCalledTimes(3);
     const second = readBatch.mock.calls[1][1] as { reads: unknown[] };
-    expect(second.reads).toHaveLength(64);
+    expect(second.reads).toHaveLength(128);
+  });
+
+  it("retries a failed round at half size instead of zero-filling it", async () => {
+    let calls = 0;
+    readBatch.mockImplementation(async (_t: string, fields: { reads: { address: string; size: number }[] }) => {
+      calls++;
+      if (calls === 1 && fields.reads.length === 128) throw new Error("verb 'read_batch' exceeded its relay time budget");
+      return { results: fields.reads.map((r) => ({ success: true, address: r.address, data: "cd" })) };
+    });
+    const out = await readRange(0n, 8 * 1024 * 1024); // one 128-entry round, fails, retried as 64+64
+    expect(out[0]).toBe(0xcd);
+    expect(out[0x7f0000]).toBe(0xcd); // first byte of the last 64 KiB entry
+    expect(calls).toBe(3);
   });
 
   it("zero-fills failed entries and keeps going", async () => {

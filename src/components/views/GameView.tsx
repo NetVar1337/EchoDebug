@@ -7,7 +7,7 @@
 // per module so a build change is flagged and canaries show what moved.
 import { useEffect, useState } from "react";
 import { fmtAddr, toBig, type Module } from "@/lib/hex";
-import { loadImage, readBytes } from "@/lib/memory";
+import { loadImage, readRange } from "@/lib/memory";
 import { readMany } from "@/lib/batch";
 import { parsePe } from "@/lib/analysis/pe";
 import { enumerateLiveNetvars, findEntityList, findViewMatrix, clusterAndConfirm, collectImageEntries, collectMemberNames, offsetMap, type ApexTable, type EntityListHit } from "@/lib/analysis/engines/apex";
@@ -58,7 +58,7 @@ export default function GameView() {
   }, [main?.name, main?.size]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const buildChanged = prevScan !== null && scan !== null && prevScan.build !== scan.build;
-  const read = (addr: bigint, size: number) => readBytes(addr, size);
+  const read = (addr: bigint, size: number) => readRange(addr, size);
   const batch = (reads: { addr: bigint; size: number }[]) => readMany(reads.map((r) => ({ address: fmtAddr(r.addr), size: r.size })));
 
   const runScan = async (what: "netvars" | "entitylist" | "viewmatrix" | "all") => {

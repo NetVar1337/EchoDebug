@@ -651,7 +651,7 @@ provide("ui_game_scan", async (args) => {
   const { m, img } = await moduleImage(args);
   const pe = parsePe(img);
   const base = toBig(m.base);
-  const read = (addr: bigint, size: number) => readBytes(addr, size);
+  const read = (addr: bigint, size: number) => readRange(addr, size);
   const batch: (reads: { addr: bigint; size: number }[]) => Promise<(Uint8Array | null)[]> = (reads) =>
     readMany(reads.map((r) => ({ address: fmtAddr(r.addr), size: r.size })));
   const wsects = pe.sections.filter((s) => s.w && !s.x && s.vsize > 0).map((s) => ({ addr: base + BigInt(s.rva), size: s.vsize }));
