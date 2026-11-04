@@ -253,6 +253,9 @@ pub fn output_schema(verb: &str) -> Value {
 
 /// `resource_link` content for a successful call: the resource that shows the same thing (memory,
 /// disassembly, a module's PE view) or the file it wrote.
+/// How many PE resource links a `list_modules` result carries.
+pub const MODULE_LINKS: usize = 3;
+
 pub fn resource_links(verb: &str, args: &Map<String, Value>, reply: &Value) -> Vec<Value> {
     let link = |uri: String, name: String, description: &str| json!({ "type": "resource_link", "uri": uri, "name": name, "description": description, "mimeType": "application/json" });
     let addr = args.get("address").and_then(Value::as_str).filter(|a| !a.is_empty());
@@ -262,12 +265,13 @@ pub fn resource_links(verb: &str, args: &Map<String, Value>, reply: &Value) -> V
             _ => vec![],
         },
         "disassemble" | "disasm_function" => addr.map(|a| vec![link(format!("echodebug://disasm/{}", percent_encode(a)), format!("disassembly {a}"), "the function at this address")]).unwrap_or_default(),
+        // one link per module costs ~40 tokens each: only the first few (the main image first)
         "modules" => reply["modules"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|m| m["name"].as_str())
-            .take(16)
+            .take(MODULE_LINKS)
             .map(|n| link(format!("echodebug://module/{}/pe", percent_encode(n)), format!("{n} PE"), "headers, sections, imports, exports (EchoDebug window)"))
             .collect(),
         "dump" => reply["path"]

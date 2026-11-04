@@ -819,4 +819,11 @@ watching (`watch_add`, `watch_remove`, `list_watched`), alerts (`alert_add`,
 `alert_remove`, `alert_list`),
 dumping (`dump_module`) and socket housekeeping (`reopen_native_socket`).
 
+`batch` (verb `mcp_batch`, handled in the relay) runs up to 32 read-only tool calls concurrently and
+returns `{count, failed, results:[{tool, ok, result | error}]}` in call order. Each call is checked
+against the policy and logged as its own call. Calls that change state or the target, or that the
+policy would ask about, are refused inside a batch. `list_modules` takes an optional `filter`
+(case-insensitive substring of the name), which the relay applies. Tool results carry compact JSON
+text, and a `list_modules` result links at most 3 module resources.
+
 Because the relay routes by verb, an MCP client gets exactly the same behaviour as the desktop UI.

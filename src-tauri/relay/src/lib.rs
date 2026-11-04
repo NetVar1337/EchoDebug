@@ -1049,7 +1049,7 @@ fn prompt_messages(prompt: &Value, args: &Value) -> Value {
         "find_pattern" => vec![text("pattern",
             "Find every occurrence of the IDA pattern {{pattern}} (module: {{module}}) with signature scanning, then disassemble 64 bytes around each hit and report what each site does.")],
         "find_string" => vec![text("text",
-            "Find the string \"{{text}}\" (module: {{module}}) with string scanning, then find code references to each hit (scan for the little-endian address bytes) and disassemble those sites. Report what reads the string.")],
+            "Find the string \"{{text}}\" (module: {{module}}) with string scanning, then find code and data references to each hit with `xref_scan` (pointers true), putting the scans in one `batch`, and disassemble those sites. Report what reads the string.")],
         "pointer_path" => vec![text("target",
             "Find static pointer chains that reach {{target}}: run a pointer scan with max_depth {{max_depth}} (default 3), take the first module-rooted result, verify it with the chain resolver, and report module+offset and the offsets array.")],
         "scan_value" => vec![text("value",
