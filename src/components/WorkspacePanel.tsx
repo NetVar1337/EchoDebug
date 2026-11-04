@@ -21,6 +21,7 @@ const kViews: Record<TabId, ComponentType> = {
   hooks: lazy(() => import("./views/HooksView")),
   monitors: lazy(() => import("./views/MonitorsView")),
   engines: lazy(() => import("./views/EnginesView")),
+  game: lazy(() => import("./views/GameView")),
   lifter: lazy(() => import("./views/LifterView")),
   graph: lazy(() => import("./views/GraphView")),
   dotnet: lazy(() => import("./views/DotnetView")),

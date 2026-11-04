@@ -64,6 +64,7 @@ import { guessEngine, il2cppDump, sourceNetvars, unrealOpen, unrealSdk, type Unr
 import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
 import { dumpScriptBindings, findClientClass, findCtorVtables, findRipLeas, harvestOffsets, kRespawnPresetFields } from "./analysis/engines/respawn";
+import { enumerateNetvars, findEntityList, findViewMatrix, offsetMap } from "./analysis/engines/apex";
 import { vtableReport } from "./analysis/vtablereport";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
@@ -641,6 +642,48 @@ provide("ui_script_bindings", async (args) => {
     return { index: e.index, name: e.name, handler: fmtAddr(e.handler), registered_at: sites };
   });
   return { module: m.name, table: fmtAddr(table), stride: dump.stride, count: dump.count, complete: dump.complete, entries };
+});
+
+// Game scan (Apex/Respawn one-click offset recovery) ------------------------------------------
+
+provide("ui_game_scan", async (args) => {
+  const step = typeof args.step === "string" ? args.step : "all";
+  const { m, img } = await moduleImage(args);
+  const pe = parsePe(img);
+  const base = toBig(m.base);
+  const read = (addr: bigint, size: number) => readBytes(addr, size);
+  const batch: (reads: { addr: bigint; size: number }[]) => Promise<(Uint8Array | null)[]> = (reads) =>
+    readMany(reads.map((r) => ({ address: fmtAddr(r.addr), size: r.size })));
+  const wsects = pe.sections.filter((s) => s.w && !s.x && s.vsize > 0).map((s) => ({ addr: base + BigInt(s.rva), size: s.vsize }));
+  const rsects = pe.sections.filter((s) => !s.x && !s.w && s.vsize > 0).map((s) => ({ addr: base + BigInt(s.rva), size: s.vsize }));
+  const budgetMb = num(args, "budget_mb", 32, 512);
+  const out: Record<string, unknown> = { module: m.name, base: m.base, build_size: m.size, step };
+  if (step === "netvars" || step === "all") {
+    const scan = enumerateNetvars(img, base, pe);
+    const map = offsetMap(scan);
+    out.netvars = {
+      tables: scan.tables.length,
+      entries: scan.entries,
+      confirmed: scan.confirmed,
+      canaries: Object.fromEntries(kRespawnPresetFields.map((n) => [n, map.has(n) ? `0x${map.get(n)!.toString(16)}` : null])),
+      list: scan.tables.slice(0, num(args, "limit", 100, 5000)).map((t) => ({
+        address: fmtAddr(t.address),
+        entries: t.entries.length,
+        confirmed: t.entries.filter((e) => e.confirmed).length,
+        anchors: t.anchors,
+        names: t.entries.slice(0, 32).map((e) => `${e.name}=0x${e.offset.toString(16)}${e.confirmed ? " [confirmed]" : ""}${e.type === 1 ? " [nested]" : ""}`),
+      })),
+    };
+  }
+  if (step === "entitylist" || step === "all") {
+    const hits = await findEntityList(read, batch, wsects, rsects, { budgetBytes: budgetMb * 1024 * 1024 });
+    out.entity_list = hits.map((h) => ({ address: fmtAddr(h.address), score: h.score }));
+  }
+  if (step === "viewmatrix" || step === "all") {
+    const hit = await findViewMatrix(read, wsects, { budgetBytes: Math.min(budgetMb, 64) * 1024 * 1024 });
+    out.view_matrix = hit ? fmtAddr(hit.address) : null;
+  }
+  return out;
 });
 
 provide("ui_vtable_report", async (args) => {
