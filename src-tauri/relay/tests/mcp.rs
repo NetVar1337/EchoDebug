@@ -394,6 +394,61 @@ async fn structured_output_and_resource_links() {
     answer.await.unwrap();
 }
 
+#[tokio::test]
+async fn batch_runs_read_only_calls_concurrently_and_list_modules_filters() {
+    let (addr, relay) = start().await;
+    let mut agent = ws(addr, "/agent").await;
+    let mut c = ws(addr, "/client").await;
+    for _ in 0..50 {
+        send(&mut c, json!({ "type": "status", "id": 1 })).await;
+        if recv_until(&mut c, |v| v["id"] == 1).await["agent"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // the agent answers only once both reads arrived: a sequential batch would time out
+    let answer = tokio::spawn(async move {
+        let a = recv_until(&mut agent, |v| v["type"] == "read").await;
+        let b = recv_until(&mut agent, |v| v["type"] == "read").await;
+        for req in [b, a] {
+            let data = if req["address"] == "0x1000" { "01" } else { "02" };
+            send(&mut agent, json!({ "type": "read_result", "id": req["id"], "success": true, "data": data })).await;
+        }
+        let m = recv_until(&mut agent, |v| v["type"] == "modules").await;
+        assert!(m.get("filter").is_none(), "{m}");
+        let modules = json!([{ "name": "game.exe", "base": "0x1000", "size": 1 }, { "name": "KERNEL32.dll", "base": "0x2000", "size": 1 }, { "name": "client.dll", "base": "0x3000", "size": 1 }]);
+        send(&mut agent, json!({ "type": "modules_result", "id": m["id"], "success": true, "modules": modules })).await;
+    });
+    let calls = json!({ "calls": [
+        { "tool": "read_memory", "arguments": { "address": "0x1000", "size": 1 } },
+        { "tool": "read_memory", "arguments": { "address": "0x2000", "size": 1 } },
+        { "tool": "write_memory", "arguments": { "address": "0x1000", "data": "00" } },
+        { "tool": "batch", "arguments": { "calls": [] } },
+        { "tool": "read_memory", "arguments": { "address": "0x1000" } },
+    ] });
+    let r = modern_call(&relay, 1, "tools/call", json!({ "name": "batch", "arguments": calls }), json!({})).await.json();
+    let sc = &r["result"]["structuredContent"];
+    assert_eq!(sc["count"], 5, "{r}");
+    assert_eq!(sc["failed"], 3);
+    let res = sc["results"].as_array().unwrap();
+    assert_eq!(res[0]["result"]["data"], "01");
+    assert_eq!(res[1]["result"]["data"], "02");
+    assert!(res[2]["error"].as_str().unwrap().contains("on its own"));
+    assert!(res[3]["error"].as_str().unwrap().contains("on its own"));
+    assert!(res[4]["error"].as_str().unwrap().contains("size"));
+    // compact JSON text
+    assert!(!r["result"]["content"][0]["text"].as_str().unwrap().contains('\n'));
+    // too many calls
+    let many: Vec<Value> = (0..33).map(|_| json!({ "tool": "status" })).collect();
+    let r = modern_call(&relay, 2, "tools/call", json!({ "name": "batch", "arguments": { "calls": many } }), json!({})).await.json();
+    assert_eq!(r["result"]["isError"], true, "{r}");
+
+    let r = modern_call(&relay, 3, "tools/call", json!({ "name": "list_modules", "arguments": { "filter": "DLL" } }), json!({})).await.json();
+    let names: Vec<&str> = r["result"]["structuredContent"]["modules"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["KERNEL32.dll", "client.dll"]);
+    answer.await.unwrap();
+}
+
 /// Reads an SSE body until `want` shows up; returns everything read.
 async fn read_until(stream: &mut axum::body::BodyDataStream, want: &str) -> String {
     let mut text = String::new();

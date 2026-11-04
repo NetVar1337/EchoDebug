@@ -467,7 +467,11 @@ fn resource_entry(r: &Value, ver: Ver) -> Value {
     r
 }
 
-pub(crate) const INSTRUCTIONS: &str = "EchoDebug: reverse-engineering and memory-debugging tools for a live process (Echo's hypervisor-backed memory API on Windows, a local ptrace//proc backend on Linux). Call `status` first, then `attach` to a process (see `list_processes`) before reading or writing memory. Addresses are 0x-prefixed hex strings or module+0xRVA; byte payloads are lowercase hex. Tools whose annotations say readOnlyHint=false change EchoDebug's state or the target; writes may need the user's approval. `ui_*`-backed tools run in the EchoDebug app window and are listed only while it is open. See prompts/list for canned workflows and the echodebug:// resources for live status.";
+/// The relay-local verb of the `batch` tool and how many calls one batch may hold.
+pub(crate) const BATCH_VERB: &str = "mcp_batch";
+pub(crate) const BATCH_MAX: usize = 32;
+
+pub(crate) const INSTRUCTIONS: &str = "EchoDebug: reverse-engineering and memory-debugging tools for a live process (Echo's hypervisor-backed memory API on Windows, a local ptrace//proc backend on Linux). Call `status` first, then `attach` to a process (see `list_processes`) before reading or writing memory. Addresses are 0x-prefixed hex strings or module+0xRVA; byte payloads are lowercase hex. Tools whose annotations say readOnlyHint=false change EchoDebug's state or the target; writes may need the user's approval. `ui_*`-backed tools run in the EchoDebug app window and are listed only while it is open. See prompts/list for canned workflows and the echodebug:// resources for live status. Efficiency: put independent read-only calls in one `batch` call (they run concurrently) instead of one call per turn; use `sig_scan_batch` for several patterns, `read_memory_batch` for several ranges and `read_fields` for typed struct fields; find code and data references with `xref_scan` (pointers true for absolute pointers) rather than scanning for little-endian address bytes; pass `filter` to `list_modules`; and check `engine_detect` and the engine tools (`source_netvars`, `unreal_objects`, `il2cpp_dump`) before reconstructing engine data by hand.";
 
 fn capabilities() -> Value {
     json!({
@@ -911,6 +915,7 @@ impl Relay {
             crate::error(Value::Null, 3002, &format!("missing required argument(s) for {name}: {}", missing.join(", ")))
         } else {
             match mcp::decide(&policy, name, verb) {
+                mcp::Decision::Allow if verb == BATCH_VERB => self.run_batch(&args, ctx, &policy).await,
                 mcp::Decision::Allow => self.run_tool(verb, &args, ctx, &progress).await,
                 mcp::Decision::Deny(why) => {
                     outcome = "denied";
@@ -934,12 +939,19 @@ impl Relay {
         if is_error && outcome == "ok" {
             outcome = "error";
         }
+        self.log_call(name, verb, &args, outcome, t0, ctx, via, &policy);
+        Ok(tool_result(reply, verb, &args, ctx.ver))
+    }
+
+    /// One tools/call in the in-app MCP log, the session's counters and (policy.audit) the audit file.
+    #[allow(clippy::too_many_arguments)]
+    fn log_call(&self, name: &str, verb: &str, args: &Map<String, Value>, outcome: &str, t0: Instant, ctx: &Ctx, via: Option<&str>, policy: &mcp::Policy) {
         let entry = json!({
             "ts": now_ms(),
             "tool": name,
             "verb": verb,
-            "args": crate::truncate_str(&serde_json::to_string(&args).unwrap_or_default(), 400),
-            "ok": !is_error,
+            "args": crate::truncate_str(&serde_json::to_string(args).unwrap_or_default(), 400),
+            "ok": outcome == "ok",
             "outcome": outcome,
             "ms": t0.elapsed().as_millis() as u64,
             "client": ctx.client["name"],
@@ -952,14 +964,61 @@ impl Relay {
             let e = entry.clone();
             tokio::task::spawn_blocking(move || mcp::append_audit(&e));
         }
-        {
-            let mut log = lock(&self.0.mcp_log);
-            if log.len() >= crate::MCP_LOG_CAP {
-                log.pop_front();
-            }
-            log.push_back(entry);
+        let mut log = lock(&self.0.mcp_log);
+        if log.len() >= crate::MCP_LOG_CAP {
+            log.pop_front();
         }
-        Ok(tool_result(reply, verb, &args, ctx.ver))
+        log.push_back(entry);
+    }
+
+    /// The `batch` tool: up to `BATCH_MAX` read-only tool calls run concurrently in one round trip.
+    /// Each call is checked against the policy on its own and logged like a separate call; calls
+    /// that change state or the target (or that the policy would ask about) are refused so the
+    /// approval flow stays one call at a time.
+    async fn run_batch(&self, args: &Map<String, Value>, ctx: &Ctx, policy: &mcp::Policy) -> Value {
+        let Some(calls) = args.get("calls").and_then(Value::as_array) else {
+            return crate::error(Value::Null, 3002, "batch: 'calls' must be an array of {tool, arguments}");
+        };
+        if calls.is_empty() || calls.len() > BATCH_MAX {
+            return crate::error(Value::Null, 3002, &format!("batch: between 1 and {BATCH_MAX} calls"));
+        }
+        let results = futures_util::future::join_all(calls.iter().map(|call| async move {
+            let t0 = Instant::now();
+            let name = call["tool"].as_str().unwrap_or_default();
+            let a = match call.get("arguments") {
+                None | Some(Value::Null) => Map::new(),
+                Some(Value::Object(m)) => m.clone(),
+                Some(_) => return json!({ "tool": name, "ok": false, "error": "arguments must be an object" }),
+            };
+            let refuse = |why: String| json!({ "tool": name, "ok": false, "error": why });
+            let Some(tool) = TOOLS.iter().find(|t| t["name"] == name) else { return refuse(format!("unknown tool: {name}")) };
+            let verb = tool["verb"].as_str().unwrap_or_default();
+            if verb == BATCH_VERB || !mcp::is_read_only(verb) || mcp::is_gated(verb) {
+                return refuse(format!("{name} changes state; call it on its own"));
+            }
+            let missing: Vec<&str> = tool["input_schema"]["required"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|k| a.get(*k).is_none_or(Value::is_null)).collect();
+            if !missing.is_empty() {
+                return refuse(format!("missing required argument(s): {}", missing.join(", ")));
+            }
+            let (mut reply, outcome) = match mcp::decide(policy, name, verb) {
+                mcp::Decision::Allow => {
+                    let r = self.run_tool(verb, &a, ctx, &Value::Null).await;
+                    let o = if r["type"] == "error" { "error" } else { "ok" };
+                    (r, o)
+                }
+                mcp::Decision::Deny(why) => (crate::error(Value::Null, 4003, &why), "denied"),
+                mcp::Decision::Ask => (crate::error(Value::Null, 4003, &format!("{name} needs approval; call it on its own")), "denied"),
+            };
+            self.log_call(name, verb, &a, outcome, t0, ctx, None, policy);
+            if let Some(m) = reply.as_object_mut() {
+                m.remove("type");
+                m.remove("id");
+            }
+            json!({ "tool": name, "ok": outcome == "ok", "result": reply })
+        }))
+        .await;
+        let failed = results.iter().filter(|r| r["ok"] != true).count();
+        json!({ "type": "batch_result", "success": failed < results.len(), "count": results.len(), "failed": failed, "results": results })
     }
 
     /// Runs a verb for a tool call; while it runs, backend progress and events go to the call's
@@ -1010,8 +1069,13 @@ impl Relay {
             }
             _ => None,
         };
+        // list_modules' `filter` is applied here: a game process loads 100+ modules
+        let module_filter = if verb == "modules" { req.remove("filter").and_then(|f| f.as_str().map(str::to_lowercase)).filter(|f| !f.is_empty()) } else { None };
         ctx.log("debug", "echodebug", json!(format!("{verb}: request sent")));
-        let r = self.request(Value::Object(req)).await;
+        let mut r = self.request(Value::Object(req)).await;
+        if let (Some(f), Some(list)) = (module_filter, r.get_mut("modules").and_then(Value::as_array_mut)) {
+            list.retain(|m| m["name"].as_str().is_some_and(|n| n.to_lowercase().contains(&f)));
+        }
         if let Some(f) = fwd {
             f.abort();
         }
@@ -1343,7 +1407,8 @@ pub(crate) fn tool_result(mut reply: Value, verb: &str, args: &Map<String, Value
         m.remove("type");
         m.remove("id");
     }
-    let text = serde_json::to_string_pretty(&reply).unwrap_or_default();
+    // compact JSON: pretty-printing roughly doubles the tokens a model spends on large replies
+    let text = serde_json::to_string(&reply).unwrap_or_default();
     let mut content = vec![json!({ "type": "text", "text": text })];
     let mut out = json!({ "isError": is_error });
     if ver.rich() {
