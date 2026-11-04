@@ -19,12 +19,13 @@ use std::path::PathBuf;
 
 use axum::http::{header, HeaderMap};
 
-/// Per-user config directory: `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` or `~/.config` elsewhere.
+/// Per-user config directory: `$XDG_CONFIG_HOME` when set (on any OS — it is also the
+/// test hook), else `%APPDATA%` on Windows, else `~/.config`.
 pub fn config_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("APPDATA").filter(|_| cfg!(windows)) {
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
         return PathBuf::from(d).join("EchoDebug");
     }
-    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
+    if let Some(d) = std::env::var_os("APPDATA").filter(|_| cfg!(windows)) {
         return PathBuf::from(d).join("EchoDebug");
     }
     let home = std::env::var_os("HOME")

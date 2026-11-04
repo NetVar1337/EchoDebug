@@ -14,6 +14,7 @@
 //                       a camera matrix (zero projection row, unit-ish basis).
 // Readers are injected (live readBytes in the app/tests, plain arrays in unit tests).
 import type { PeInfo, Section } from "../pe";
+import { extractStrings } from "../strings";
 import { kRespawnPresetFields } from "./respawn";
 
 export type MemReader = (addr: bigint, size: number) => Promise<Uint8Array | null>;
@@ -45,6 +46,17 @@ export type NetvarScan = { tables: ApexTable[]; entries: number; confirmed: numb
 
 const kMemberName = /^[a-zA-Z_][A-Za-z0-9_]{2,47}$/;
 
+/**
+ * A pointer-sized qword in an image is either an absolute address (live memory dumps, where
+ * descriptor tables hold real char- and code-pointers) or a bare RVA (disk files, tests). Map both
+ * to an image offset; -1 when it points nowhere in the image.
+ */
+export function ptrToRva(v: bigint, base: bigint, len: number): number {
+  if (v >= base && v < base + BigInt(len)) return Number(v - base);
+  if (v >= 8n && v < BigInt(len)) return Number(v);
+  return -1;
+}
+
 function asciiAt(img: Uint8Array, rva: number, max = 48): string {
   if (rva < 0 || rva >= img.length) return "";
   let s = "";
@@ -61,42 +73,53 @@ export function dataSections(pe: PeInfo): Section[] {
   return pe.sections.filter((s) => !s.x && s.vsize > 0);
 }
 
-/**
- * Enumerate every descriptor entry in the module image. One pass over the data sections finds
- * all qwords pointing at identifier strings; each is validated against both descriptor layouts.
- * Entries closer than 0x40 bytes form a table; runs of ≥4 entries are kept (smaller runs are
- * indistinguishable from coincidences).
- */
-export function enumerateNetvars(img: Uint8Array, base: bigint, pe: PeInfo, minCluster = 4): NetvarScan {
-  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
-  const found: ApexNetvarEntry[] = [];
-  let strings = 0;
-  for (const s of dataSections(pe)) {
-    const end = Math.min(img.length, s.rva + s.vsize) & ~7;
-    for (let o = s.rva & ~7; o + 8 <= end; o += 8) {
-      const v = dv.getBigUint64(o, true);
-      if (v < 8n || v >= BigInt(img.length)) continue;
-      const name = asciiAt(img, Number(v));
-      if (!kMemberName.test(name)) continue;
-      strings++;
-      // DataDesc: [type:i32][offset:i32]…[string@+0x28|+0x38]
-      for (const delta of [0x28, 0x38]) {
-        const b = o - delta;
-        if (b < 0) continue;
-        const type = dv.getUint32(b, true);
-        if (type !== 0 && type !== 1 && type !== 0x0a) continue;
-        const off = dv.getInt32(b + 4, true);
-        if (off <= 0 || off >= 0x20000) continue;
-        found.push({ name, offset: off, type, layout: "table2", site: base + BigInt(o), confirmed: false });
-        break;
-      }
-      // compact RecvProp-style: [string_ptr:8][offset:i32][flags:i32]
-      const off1 = dv.getInt32(o + 8, true);
-      if (off1 > 0 && off1 < 0x20000) {
-        found.push({ name, offset: off1, type: -1, layout: "table1", site: base + BigInt(o), confirmed: false });
-      }
-    }
+/** Member-name-like strings (and their rvas) anywhere in the image — the live descriptor scan
+ *  anchors on these addresses, so strings with no in-image pointer must be found too. */
+export function collectMemberNames(img: Uint8Array, cap = 400000): Map<string, number[]> {
+  const names = new Map<string, number[]>();
+  for (const s of extractStrings(img, 3, 8_000_000)) {
+    if (s.wide || !kMemberName.test(s.text)) continue;
+    const list = names.get(s.text);
+    if (list) list.push(s.rva);
+    else if (names.size < cap) names.set(s.text, [s.rva]);
   }
+  // the canaries must never fall off the cap
+  for (const n of kRespawnPresetFields) if (!names.has(n)) {
+    const rvas: number[] = [];
+    const needle = new TextEncoder().encode(n + "\0");
+    outer: for (let i = 0; i + needle.length <= img.length; i++) {
+      for (let j = 0; j < needle.length; j++) if (img[i + j] !== needle[j]) continue outer;
+      rvas.push(i);
+    }
+    if (rvas.length) names.set(n, rvas);
+  }
+  return names;
+}
+
+/** Validate the descriptor layouts at a site (qword `o` inside `buf` points at `name`). */
+function descriptorEntriesAt(dv: DataView, buf: Uint8Array, o: number, site: bigint, name: string): ApexNetvarEntry[] {
+  const out: ApexNetvarEntry[] = [];
+  // DataDesc: [type:i32][offset:i32]…[string@+0x28|+0x38]
+  for (const delta of [0x28, 0x38]) {
+    const b = o - delta;
+    if (b < 0) continue;
+    const type = dv.getUint32(b, true);
+    if (type !== 0 && type !== 1 && type !== 0x0a) continue;
+    const off = dv.getInt32(b + 4, true);
+    if (off <= 0 || off >= 0x20000) continue;
+    out.push({ name, offset: off, type, layout: "table2", site, confirmed: false });
+    break;
+  }
+  // compact RecvProp-style: [string_ptr:8][offset:i32][flags:i32]
+  if (o + 12 <= buf.length) {
+    const off1 = dv.getInt32(o + 8, true);
+    if (off1 > 0 && off1 < 0x20000) out.push({ name, offset: off1, type: -1, layout: "table1", site, confirmed: false });
+  }
+  return out;
+}
+
+/** Cross-layout confirmation and proximity clustering into tables. */
+export function clusterAndConfirm(found: ApexNetvarEntry[], minCluster = 4): NetvarScan {
   // cross-layout confirmation: same name + same offset via both layouts
   const t2 = new Set(found.filter((e) => e.layout === "table2").map((e) => `${e.name}=${e.offset}`));
   for (const e of found) if (e.layout === "table1" && t2.has(`${e.name}=${e.offset}`)) e.confirmed = true;
@@ -121,8 +144,86 @@ export function enumerateNetvars(img: Uint8Array, base: bigint, pe: PeInfo, minC
     tables,
     entries: tables.reduce((a, t) => a + t.entries.length, 0),
     confirmed: tables.reduce((a, t) => a + t.entries.filter((e) => e.confirmed).length, 0),
-    strings,
+    strings: 0,
   };
+}
+
+/** Raw descriptor entries found in the module image (cluster with `clusterAndConfirm`). */
+export function collectImageEntries(img: Uint8Array, base: bigint, pe: PeInfo): { found: ApexNetvarEntry[]; strings: number } {
+  const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+  const found: ApexNetvarEntry[] = [];
+  let strings = 0;
+  for (const s of dataSections(pe)) {
+    const end = Math.min(img.length, s.rva + s.vsize) & ~7;
+    for (let o = s.rva & ~7; o + 8 <= end; o += 8) {
+      const strRva = ptrToRva(dv.getBigUint64(o, true), base, img.length);
+      if (strRva < 0) continue;
+      const name = asciiAt(img, strRva);
+      if (!kMemberName.test(name)) continue;
+      strings++;
+      found.push(...descriptorEntriesAt(dv, img, o, base + BigInt(o), name));
+    }
+  }
+  return { found, strings };
+}
+
+/**
+ * Enumerate every descriptor entry in the module image. One pass over the data sections finds
+ * all qwords pointing at identifier strings; each is validated against both descriptor layouts.
+ * Entries closer than 0x40 bytes form a table; runs of ≥4 entries are kept (smaller runs are
+ * indistinguishable from coincidences).
+ */
+export function enumerateNetvars(img: Uint8Array, base: bigint, pe: PeInfo, minCluster = 4): NetvarScan {
+  const { found, strings } = collectImageEntries(img, base, pe);
+  const scan = clusterAndConfirm(found, minCluster);
+  scan.strings = strings;
+  return scan;
+}
+
+/**
+ * The complement to the image scan for builds that construct their descriptor tables at
+ * runtime: scan the process's writable memory for qwords pointing at the module's member-name
+ * strings (tables hold absolute pointers into the module) and validate the same layouts.
+ * Spans are read lowest-address-first — early engine allocations come first — and the scan
+ * stops once `enoughNames` distinct members validated.
+ */
+export async function enumerateLiveNetvars(
+  read: MemReader,
+  spans: readonly { addr: bigint; size: number }[],
+  base: bigint,
+  names: ReadonlyMap<string, readonly number[]>,
+  opts: { budgetBytes?: number; chunkBytes?: number; onProgress?: (scanned: number, total: number) => void; enoughNames?: number } = {},
+): Promise<{ found: ApexNetvarEntry[]; scanned: number }> {
+  const budget = opts.budgetBytes ?? 512 * 1024 * 1024;
+  const chunk = Math.max(0x1000, (opts.chunkBytes ?? 4 * 1024 * 1024) + 0x40); // +0x40 overlap so -0x28 fields read at chunk edges
+  const addrs = new Map<bigint, string>();
+  for (const [n, rvas] of names) for (const r of rvas) addrs.set(base + BigInt(r), n);
+  const found: ApexNetvarEntry[] = [];
+  const seenNames = new Set<string>();
+  let scanned = 0;
+  const ordered = [...spans].filter((s) => s.size > 0).sort((a, b) => (a.addr < b.addr ? -1 : 1));
+  const total = Math.min(budget, ordered.reduce((a, s) => a + s.size, 0));
+  outer: for (const span of ordered) {
+    for (let off = 0; off < span.size && scanned < budget; off += chunk - 0x40) {
+      const size = Math.min(chunk, span.size - off);
+      const buf = await read(span.addr + BigInt(off), size);
+      scanned += size - 0x40;
+      opts.onProgress?.(Math.min(scanned, total), total);
+      if (!buf) continue;
+      const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      const stepEnd = Math.min(buf.length, size - 0x40);
+      for (let o = 0; o + 8 <= stepEnd; o += 8) {
+        const name = addrs.get(dv.getBigUint64(o, true));
+        if (name === undefined) continue;
+        for (const e of descriptorEntriesAt(dv, buf, o, span.addr + BigInt(off) + BigInt(o), name)) {
+          found.push(e);
+          seenNames.add(e.name);
+        }
+        if (opts.enoughNames && seenNames.size >= opts.enoughNames) break outer;
+      }
+    }
+  }
+  return { found, scanned };
 }
 
 /** Flat {name: best offset} map: confirmed entries win, then table2, then table1. */

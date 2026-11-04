@@ -45,16 +45,26 @@ function asciiAt(d: D, rva: number, max = 128): string {
 
 const ident = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * A pointer-sized qword in an image is either an absolute address (live memory dumps, where
+ * descriptor tables hold real char- and code-pointers) or a bare RVA (disk files, tests). Map both
+ * to an image offset; -1 when it points nowhere in the image.
+ */
+export function ptrToRva(v: bigint, base: bigint, len: number): number {
+  if (v >= base && v < base + BigInt(len)) return Number(v - base);
+  if (v >= 8n && v < BigInt(len)) return Number(v);
+  return -1;
+}
+
 /** Every (targetRva -> site rvas) pair for qwords in `ranges` that hold an in-image pointer. */
-export function buildDataPtrIndex(img: Uint8Array, ranges: readonly RvaRange[]): Map<number, number[]> {
+export function buildDataPtrIndex(img: Uint8Array, ranges: readonly RvaRange[], base: bigint): Map<number, number[]> {
   const d = helpers(img);
   const to = new Map<number, number[]>();
   for (const r of ranges) {
     const end = Math.min(img.length, r.rva + r.size) & ~7;
     for (let o = r.rva & ~7; o + 8 <= end; o += 8) {
-      const v = d.dv.getBigUint64(o, true);
-      if (v < 8n || v >= BigInt(img.length)) continue;
-      const t = Number(v);
+      const t = ptrToRva(d.dv.getBigUint64(o, true), base, img.length);
+      if (t < 0) continue;
       const list = to.get(t);
       if (list) list.push(o);
       else to.set(t, [o]);
@@ -136,7 +146,7 @@ export function harvestOffsets(img: Uint8Array, base: bigint, names: string[], d
     if (list) list.push(s.rva);
     else byText.set(s.text, [s.rva]);
   }
-  const ptrIdx = buildDataPtrIndex(img, dataRanges);
+  const ptrIdx = buildDataPtrIndex(img, dataRanges, base);
   const fields: FieldOffsets[] = [];
   for (const name of names) {
     const nameRvas = byText.get(name) ?? [];
@@ -192,7 +202,7 @@ export function findClientClass(img: Uint8Array, base: bigint, networkName: stri
   const nameRvas: number[] = [];
   for (const s of extractStrings(img, 3, 4_000_000)) if (!s.wide && s.text === networkName) nameRvas.push(s.rva);
   if (!nameRvas.length) return null;
-  const ptrIdx = buildDataPtrIndex(img, dataRanges);
+  const ptrIdx = buildDataPtrIndex(img, dataRanges, base);
   let best: ClientClassHit | null = null;
   let bestScore = -1;
   for (const rva of nameRvas) {
@@ -208,19 +218,24 @@ export function findClientClass(img: Uint8Array, base: bigint, networkName: stri
         let id = -1;
         let score = 0;
         for (let f = 0; f < 0x40; f += 8) {
-          const p = d.dv.getBigUint64(b + f, true);
-          if (p < 8n || p >= BigInt(img.length)) continue;
-          const t = asciiAt(d, Number(p));
+          const p = ptrToRva(d.dv.getBigUint64(b + f, true), base, img.length);
+          if (p < 0) continue;
+          const t = asciiAt(d, p);
           if (ident.test(t) && t !== networkName && !className) { className = t; score += 2; }
         }
         // classic x64 Source ClientClass: table @ +0x18, next @ +0x20, id @ +0x28
-        const tp = d.dv.getBigUint64(b + 0x18, true);
-        if (tp > 7n && tp < BigInt(img.length)) {
-          const tn = asciiAt(d, Number(d.dv.getBigUint64(Number(tp) + 0x18, true)));
-          if (tn.startsWith("DT_")) { table = base + tp; tableName = tn; score += 4; }
+        const tpRva = ptrToRva(d.dv.getBigUint64(b + 0x18, true), base, img.length);
+        if (tpRva >= 0) {
+          const tnRva = ptrToRva(d.dv.getBigUint64(tpRva + 0x18, true), base, img.length);
+          const tn = tnRva >= 0 ? asciiAt(d, tnRva) : "";
+          if (tn.startsWith("DT_")) { table = base + BigInt(tpRva); tableName = tn; score += 4; }
         }
-        const np = d.dv.getBigUint64(b + 0x20, true);
-        if (np === 0n || (np > 7n && np < BigInt(img.length))) { next = base + np; score += 1; }
+        const npRaw = d.dv.getBigUint64(b + 0x20, true);
+        if (npRaw === 0n) { next = 0n; score += 1; }
+        else {
+          const npRva = ptrToRva(npRaw, base, img.length);
+          if (npRva >= 0) { next = base + BigInt(npRva); score += 1; }
+        }
         const cid = d.dv.getInt32(b + 0x28, true);
         if (cid >= 0 && cid < 8192) { id = cid; score += 1; }
         if (score < 3) continue;
@@ -262,14 +277,12 @@ export function dumpScriptBindings(img: Uint8Array, base: bigint, table: bigint,
   if (tRva < 0 || tRva >= img.length) return null;
   const valid = (o: number): ScriptBinding | null => {
     if (o + 16 > img.length) return null;
-    const nameP = d.dv.getBigUint64(o, true);
-    const fn = d.dv.getBigUint64(o + 8, true);
-    if (nameP < 8n || nameP >= BigInt(img.length)) return null;
-    const nameRva = Number(nameP);
+    const nameRva = ptrToRva(d.dv.getBigUint64(o, true), base, img.length);
+    if (nameRva < 0) return null;
     const name = asciiAt(d, nameRva, 96);
     if (!ident.test(name)) return null;
-    const fnRva = Number(fn - base);
-    if (!inRanges(fnRva, execRanges)) return null;
+    const fnRva = ptrToRva(d.dv.getBigUint64(o + 8, true), base, img.length);
+    if (fnRva < 0 || !inRanges(fnRva, execRanges)) return null;
     return { index: 0, name, name_rva: nameRva, handler: base + BigInt(fnRva) };
   };
   let best: { stride: number; entries: ScriptBinding[]; complete: boolean } | null = null;

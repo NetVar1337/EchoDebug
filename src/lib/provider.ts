@@ -64,7 +64,7 @@ import { guessEngine, il2cppDump, sourceNetvars, unrealOpen, unrealSdk, type Unr
 import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
 import { dumpScriptBindings, findClientClass, findCtorVtables, findRipLeas, harvestOffsets, kRespawnPresetFields } from "./analysis/engines/respawn";
-import { enumerateNetvars, findEntityList, findViewMatrix, offsetMap } from "./analysis/engines/apex";
+import { clusterAndConfirm, collectImageEntries, collectMemberNames, enumerateLiveNetvars, findEntityList, findViewMatrix, offsetMap, type ApexNetvarEntry } from "./analysis/engines/apex";
 import { vtableReport } from "./analysis/vtablereport";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
@@ -659,12 +659,30 @@ provide("ui_game_scan", async (args) => {
   const budgetMb = num(args, "budget_mb", 32, 512);
   const out: Record<string, unknown> = { module: m.name, base: m.base, build_size: m.size, step };
   if (step === "netvars" || step === "all") {
-    const scan = enumerateNetvars(img, base, pe);
+    // image pass (static tables) + live pass (runtime-built tables in heap/writable memory,
+    // which is where current Apex builds keep their descriptors)
+    const names = collectMemberNames(img);
+    const { found, strings } = collectImageEntries(img, base, pe);
+    const regs = await request<{ regions: { base: string; size: number; writable?: boolean; present?: boolean }[] }>("regions", { max: 100000 }).catch(() => null);
+    let liveFound: ApexNetvarEntry[] = [];
+    let liveScanned = 0;
+    if (regs?.regions) {
+      const spans = regs.regions.filter((r) => r.writable && r.present !== false && r.size > 0).map((r) => ({ addr: toBig(r.base), size: r.size }));
+      const lr = await enumerateLiveNetvars(read, spans, base, names, {
+        budgetBytes: Math.max(num(args, "budget_mb", 256, 2048), 256) * 1024 * 1024,
+        enoughNames: kRespawnPresetFields.length,
+      });
+      liveFound = lr.found;
+      liveScanned = lr.scanned;
+    }
+    const scan = clusterAndConfirm([...found, ...liveFound]);
+    scan.strings = strings;
     const map = offsetMap(scan);
     out.netvars = {
       tables: scan.tables.length,
       entries: scan.entries,
       confirmed: scan.confirmed,
+      live_scanned_mib: Math.round(liveScanned / 1024 / 1024),
       canaries: Object.fromEntries(kRespawnPresetFields.map((n) => [n, map.has(n) ? `0x${map.get(n)!.toString(16)}` : null])),
       list: scan.tables.slice(0, num(args, "limit", 100, 5000)).map((t) => ({
         address: fmtAddr(t.address),

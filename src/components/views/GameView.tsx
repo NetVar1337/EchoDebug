@@ -10,7 +10,8 @@ import { fmtAddr, toBig, type Module } from "@/lib/hex";
 import { loadImage, readBytes } from "@/lib/memory";
 import { readMany } from "@/lib/batch";
 import { parsePe } from "@/lib/analysis/pe";
-import { enumerateNetvars, findEntityList, findViewMatrix, offsetMap, type ApexTable, type EntityListHit } from "@/lib/analysis/engines/apex";
+import { enumerateLiveNetvars, findEntityList, findViewMatrix, clusterAndConfirm, collectImageEntries, collectMemberNames, offsetMap, type ApexTable, type EntityListHit } from "@/lib/analysis/engines/apex";
+import { regions } from "@/lib/dumplive";
 import { kRespawnPresetFields } from "@/lib/analysis/engines/respawn";
 import { saveText } from "@/lib/save";
 import { useConn } from "@/store/conn";
@@ -81,13 +82,27 @@ export default function GameView() {
         viewMatrix: scan?.viewMatrix ?? null,
       };
       if (what === "netvars" || what === "all") {
-        const s = enumerateNetvars(img, base, pe);
+        setProgress(0.05);
+        // static tables live in the module image; current builds construct their descriptor
+        // tables at runtime, so a second pass scans the process's writable memory for
+        // pointers to the module's member-name strings
+        const names = collectMemberNames(img);
+        const { found, strings } = collectImageEntries(img, base, pe);
+        const regs = await regions().catch(() => [] as Awaited<ReturnType<typeof regions>>);
+        const spans = regs.filter((r) => r.writable && r.present !== false && r.size > 0).map((r) => ({ addr: toBig(r.base), size: r.size }));
+        const lr = await enumerateLiveNetvars(read, spans, base, names, {
+          budgetBytes: Math.max(Number(budget) || 32, 256) * 1024 * 1024,
+          enoughNames: kRespawnPresetFields.length,
+          onProgress: (d, t) => setProgress(0.05 + 0.45 * (d / t)),
+        });
+        const s = clusterAndConfirm([...found, ...lr.found]);
+        s.strings = strings;
         const map = offsetMap(s);
         next.tables = s.tables;
         next.entries = s.entries;
         next.confirmed = s.confirmed;
         next.canaries = Object.fromEntries(kRespawnPresetFields.map((n) => [n, map.get(n) ?? null]));
-        log("info", "game", `${s.tables.length} tables, ${s.entries} entries (${s.confirmed} confirmed) in ${main.name}`);
+        log("info", "game", `${s.tables.length} tables, ${s.entries} entries (${s.confirmed} confirmed, ${Math.round(lr.scanned / 1048576)} MiB live-scanned) in ${main.name}`);
       }
       const wsects = pe.sections.filter((s) => s.w && !s.x && s.vsize > 0).map((s) => ({ addr: base + BigInt(s.rva), size: s.vsize }));
       const rsects = pe.sections.filter((s) => !s.x && !s.w && s.vsize > 0).map((s) => ({ addr: base + BigInt(s.rva), size: s.vsize }));
