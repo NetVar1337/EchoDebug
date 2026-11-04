@@ -25,7 +25,7 @@ import { assemble } from "./analysis/asm";
 import { buildNeedle, formatAs, inspect, type CopyFormat, type NeedleMode } from "./analysis/bytes";
 import { floatScanFields, groupMatches, groupSpan, parseGroup } from "./analysis/scancmp";
 import { searchMemory } from "./memsearch";
-import { readManyChunked } from "./batch";
+import { readMany, readManyChunked } from "./batch";
 import { parseYara, scanYara } from "./analysis/yara";
 import { toPatEntry, toPatFile } from "./analysis/flirtgen";
 import { health } from "./analysis/sigrepair";
@@ -63,6 +63,8 @@ import { defaultFormat, dumpImage, dumpMany, dumpTarget, fileSink, findHiddenIma
 import { guessEngine, il2cppDump, sourceNetvars, unrealOpen, unrealSdk, type UnrealSession } from "./enginelive";
 import { dumpCs } from "./analysis/engines/il2cpp";
 import { flatten, netvarText } from "./analysis/engines/source";
+import { dumpScriptBindings, findClientClass, findCtorVtables, findRipLeas, harvestOffsets, kRespawnPresetFields } from "./analysis/engines/respawn";
+import { vtableReport } from "./analysis/vtablereport";
 import { fullName } from "./analysis/engines/unreal";
 import { annotationHandlers } from "./annotations";
 import { analyzeCallees, directCallees, liveOptions, loadFunction, notDecompilable, type LiveFunction } from "./decomplive";
@@ -562,6 +564,125 @@ provide("ui_source_netvars", async (args) => {
   const want = typeof args.table === "string" ? args.table : "";
   if (want) return { module: d.module, table: want, netvars: flatten(d, want).map((p) => ({ ...p, offset: `0x${p.offset.toString(16)}` })) };
   return { module: d.module, head: fmtAddr(d.head), classes: d.classes.map((c) => ({ name: c.name, id: c.id, table: c.table })), tables: Object.keys(d.tables).length, text: args.text ? netvarText(d).slice(0, 400_000) : undefined };
+});
+
+// Respawn-Source class reports --------------------------------------------------------------
+
+const dataRangesOf = (pe: ReturnType<typeof parsePe>) => pe.sections.filter((s) => !s.x && s.vsize > 0).map((s) => ({ rva: s.rva, size: s.vsize }));
+const execRangesOf = (pe: ReturnType<typeof parsePe>) => pe.sections.filter((s) => s.x && s.vsize > 0).map((s) => ({ rva: s.rva, size: s.vsize }));
+
+provide("ui_source_offsets", async (args) => {
+  const { m, img } = await moduleImage(args);
+  const pe = parsePe(img);
+  const names = Array.isArray(args.fields) ? args.fields.filter((x): x is string => typeof x === "string") : kRespawnPresetFields;
+  const h = harvestOffsets(img, toBig(m.base), names, dataRangesOf(pe));
+  return {
+    module: m.name, base: m.base,
+    fields: h.fields.map((f) => ({
+      name: f.name,
+      confirmed: f.confirmed ? `0x${f.confirmed.toString(16)}` : null,
+      composite: f.composite,
+      strings: f.strings,
+      hits: f.hits.map((x) => ({ layout: x.layout, site: fmtAddr(x.site), offset: `0x${x.offset.toString(16)}`, type: x.type })),
+    })),
+    cpp: h.cpp,
+  };
+});
+
+provide("ui_source_clientclass", async (args) => {
+  const { m, img } = await moduleImage(args);
+  const name = typeof args.name === "string" ? args.name : "";
+  if (!name) throw new Error("missing 'name' (the network class name, e.g. CWeaponX)");
+  const hit = findClientClass(img, toBig(m.base), name, dataRangesOf(parsePe(img)));
+  if (!hit) return { module: m.name, name, found: false };
+  return {
+    module: m.name, found: true, address: fmtAddr(hit.address), network_name: hit.network_name,
+    class_name: hit.class_name, table: hit.table ? fmtAddr(hit.table) : null, table_name: hit.table_name || null,
+    next: hit.next ? fmtAddr(hit.next) : null, id: hit.id, kind: hit.kind,
+  };
+});
+
+provide("ui_script_bindings", async (args) => {
+  const mods = modules();
+  let table: bigint | null = null;
+  const given = typeof args.table === "string" ? parseAddress(args.table, mods) : null;
+  if (given !== null) table = given;
+  else if (typeof args.vtable === "string") {
+    // find the table behind a vfunc: disassemble the function and take the rip-relative lea
+    const vt = parseAddress(args.vtable, mods);
+    if (vt === null) throw new Error(`cannot parse vtable: ${args.vtable}`);
+    const slot = num(args, "slot", 16, 512);
+    const fnBytes = await readBytes(vt + BigInt(slot * 8), 8);
+    if (!fnBytes) throw new Error("vtable slot is not readable");
+    const fn = new DataView(fnBytes.buffer, fnBytes.byteOffset, fnBytes.byteLength).getBigUint64(0, true);
+    if (fn < 0x1000n) throw new Error("vtable slot does not hold a function pointer");
+    const code = await readBytes(fn, 64);
+    if (!code) throw new Error("the vfunc is not readable");
+    for (let i = 0; i + 7 <= code.length; i++) {
+      if (code[i] !== 0x48 || code[i + 1] !== 0x8d || code[i + 2] !== 0x05) continue; // lea rax,[rip+disp32]
+      const disp = new DataView(code.buffer, code.byteOffset, code.byteLength).getInt32(i + 3, true);
+      table = fn + BigInt(i + 7 + disp);
+      break;
+    }
+    if (table === null) throw new Error("no rip-relative lea in the vfunc (pass the table address directly)");
+  } else {
+    throw new Error("pass 'table' (binding table address) or 'vtable' (a class vtable; slot 16 = GetScriptBindingTable)");
+  }
+  const m = moduleOf(table, mods);
+  if (!m) throw new Error("the table is outside every module");
+  const img = await loadImage(m);
+  const pe = parsePe(img);
+  const base = toBig(m.base);
+  const dump = dumpScriptBindings(img, base, table, execRangesOf(pe));
+  if (!dump) throw new Error(`no binding-table entries at ${fmtAddr(table)} (16/24/32-byte strides tried)`);
+  const leas = findRipLeas(img, execRangesOf(pe));
+  const entries = dump.entries.map((e) => {
+    const sites = (leas.get(e.name_rva) ?? []).map((r) => fmtAddr(base + BigInt(r)));
+    return { index: e.index, name: e.name, handler: fmtAddr(e.handler), registered_at: sites };
+  });
+  return { module: m.name, table: fmtAddr(table), stride: dump.stride, count: dump.count, complete: dump.complete, entries };
+});
+
+provide("ui_vtable_report", async (args) => {
+  const a = addrArg(args);
+  const mods = modules();
+  const baseArg = typeof args.base === "string" ? parseAddress(args.base, mods) : null;
+  const r = await vtableReport((addr, size) => readBytes(addr, size), a, {
+    fromObject: args.object === true,
+    slots: typeof args.slots === "number" ? num(args, "slots", 0, 4096) : undefined,
+    base: baseArg ?? undefined,
+    prefixBytes: num(args, "prefix_bytes", 16, 64),
+    code: (t) => moduleOf(t, mods) !== undefined,
+    batch: (reads) => readMany(reads.map((x) => ({ address: fmtAddr(x.addr), size: x.size }))),
+  });
+  const out: Record<string, unknown> = {
+    vtable: fmtAddr(r.vtable),
+    class: r.class,
+    base_class: r.base_class,
+    slots: r.slots,
+    complete: r.complete,
+    overrides: r.overrides,
+    rows: r.rows.map((row) => ({
+      index: row.index,
+      offset: row.offset,
+      function: row.function ? fmtAddr(row.function) : "0x0",
+      base: row.base ? fmtAddr(row.base) : undefined,
+      status: row.status,
+      ...(row.prefix ? { prefix: row.prefix } : {}),
+      ...(row.duplicate ? { duplicate: true } : {}),
+    })),
+  };
+  if (typeof args.constructor === "string") {
+    const ctor = parseAddress(args.constructor, mods);
+    const m = ctor !== null ? moduleOf(ctor, mods) : undefined;
+    if (ctor !== null && m) {
+      const img = await loadImage(m);
+      const pe = parsePe(img);
+      out.constructor_vtables = findCtorVtables(img, toBig(m.base), execRangesOf(pe), dataRangesOf(pe))
+        .map((s) => ({ site: fmtAddr(s.site), vtable: fmtAddr(s.vtable), object_offset: `0x${s.object_offset.toString(16)}` }));
+    }
+  }
+  return out;
 });
 
 provide("ui_load_symbols", async (args) => {
