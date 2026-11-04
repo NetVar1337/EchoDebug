@@ -1,6 +1,6 @@
 [package]
 name = "echo-debug"
-version = "0.9.12"
+version = "0.9.13"
 description = "Windows reverse-engineering desktop app backed by Echo"
 edition = "2021"
 publish = false
