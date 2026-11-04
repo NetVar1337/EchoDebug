@@ -48,13 +48,15 @@ export default function GameView() {
   const [scan, setScan] = useState<Scan | null>(main ? loadStored(main) : null);
   const [filter, setFilter] = useState("");
   const [budget, setBudget] = useState("32");
+  /** the scan that was stored before the current one — the baseline for "what moved" */
+  const [prevScan, setPrevScan] = useState<Scan | null>(null);
 
   useEffect(() => {
     setScan(main ? loadStored(main) : null);
+    setPrevScan(null);
   }, [main?.name, main?.size]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const stored = main ? loadStored(main) : null;
-  const buildChanged = !!main && stored !== null && scan !== null && stored.build !== main.size;
+  const buildChanged = prevScan !== null && scan !== null && prevScan.build !== scan.build;
   const read = (addr: bigint, size: number) => readBytes(addr, size);
   const batch = (reads: { addr: bigint; size: number }[]) => readMany(reads.map((r) => ({ address: fmtAddr(r.addr), size: r.size })));
 
@@ -63,6 +65,7 @@ export default function GameView() {
     setBusy(what);
     setProgress(0);
     const prev = loadStored(main);
+    setPrevScan(prev);
     const result = await attempt(`game ${what}`, (async () => {
       const img = await loadImage(main);
       const pe = parsePe(img);
@@ -137,7 +140,7 @@ export default function GameView() {
   };
 
   const shownTables = scan ? scan.tables.filter((t) => !filter || t.entries.some((e) => e.name.toLowerCase().includes(filter.toLowerCase())) || t.anchors.some((a) => a.toLowerCase().includes(filter.toLowerCase()))) : [];
-  const canaryMoved = (n: string) => stored !== null && scan !== null && stored.build !== scan.build && stored.canaries[n] !== undefined && scan.canaries[n] !== stored.canaries[n];
+  const canaryMoved = (n: string) => prevScan !== null && scan !== null && prevScan.canaries[n] !== undefined && scan.canaries[n] !== prevScan.canaries[n];
 
   return (
     <NeedsAgent>
@@ -151,7 +154,7 @@ export default function GameView() {
           </div>
           {buildChanged && scan && main && (
             <div className="faint" style={{ color: "var(--warn, #d8a657)" }}>
-              Build changed since the stored scan ({stored!.build.toLocaleString()} → {main.size.toLocaleString()}). Canary offsets that moved:
+              Build changed since the previous scan ({prevScan!.build.toLocaleString()} → {scan!.build.toLocaleString()}). Canary offsets that moved:
               {" "}{kRespawnPresetFields.filter(canaryMoved).join(", ") || "none in the preset"}
             </div>
           )}
@@ -179,7 +182,7 @@ export default function GameView() {
                     <td style={{ width: 90 }} className={scan.canaries[n] === null ? "faint" : canaryMoved(n) ? "" : "dim"}>
                       {scan.canaries[n] !== null ? `0x${scan.canaries[n]!.toString(16).toUpperCase()}` : "—"}
                     </td>
-                    <td className="faint">{canaryMoved(n) ? `was 0x${stored!.canaries[n]!.toString(16)}` : ""}</td>
+                    <td className="faint">{canaryMoved(n) ? `was 0x${prevScan!.canaries[n]!.toString(16)}` : ""}</td>
                   </tr>
                 ))}
               </tbody>

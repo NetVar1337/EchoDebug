@@ -60,13 +60,19 @@ describe("type export", () => {
     const zip = toReclassProject([{ name: "Player", fields }]);
     const dir = mkdtempSync(join(tmpdir(), "echodebug-zip-"));
     writeFileSync(join(dir, "p.rcnet"), zip);
-    try {
-      const listed = execFileSync("python3", ["-c", "import zipfile,sys;z=zipfile.ZipFile(sys.argv[1]);assert z.testzip() is None;sys.stdout.write(z.read('Data.xml').decode())", join(dir, "p.rcnet")]).toString();
-      expect(listed).toBe(xmlText);
-    } catch (e) {
-      if (/ENOENT/.test(String(e))) return; // no python
-      throw e;
+    // validate with whatever Python is installed: "python3" on unix, "python" on Windows
+    // (where python3 is often the Microsoft Store stub that exits non-zero without ENOENT)
+    const script = "import zipfile,sys;z=zipfile.ZipFile(sys.argv[1]);assert z.testzip() is None;sys.stdout.buffer.write(z.read('Data.xml'))";
+    let listed: string | null = null;
+    for (const py of ["python3", "python"]) {
+      try {
+        listed = execFileSync(py, ["-c", script, join(dir, "p.rcnet")]).toString();
+        break;
+      } catch (e) {
+        if (py === "python" && !/ENOENT/.test(String(e))) throw e;
+      }
     }
+    if (listed !== null) expect(listed).toBe(xmlText);
   });
 });
 

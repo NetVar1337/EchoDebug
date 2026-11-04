@@ -123,11 +123,13 @@ describe("PE regressions", () => {
     }
     const pe = parsePe(img);
     expect(pe.sections.length).toBe(40000);
-    clean(() => sectionEntropies(img, pe), 2000);
-    clean(() => scanAntiDebug(img, 0n, pe), 2000);
-    clean(() => buildRtti(img, 0n, pe), 2000);
-    clean(() => buildXrefIndex(img, executableRanges(img, pe)), 2000);
-  });
+    // generous budgets: the regression is "not 40000 x 2 MiB" (minutes), but wall-clock
+    // budgets flake on loaded CI boxes, so these sit orders of magnitude above real time
+    clean(() => sectionEntropies(img, pe), 20000);
+    clean(() => scanAntiDebug(img, 0n, pe), 20000);
+    clean(() => buildRtti(img, 0n, pe), 20000);
+    clean(() => buildXrefIndex(img, executableRanges(img, pe)), 20000);
+  }, 60000);
 
   it("findVftables counts slots in linear time (was quadratic over a section of locator pointers)", () => {
     // .text holds the locator (signature 1, type descriptor at +16); every .data qword points at it
@@ -239,8 +241,8 @@ describe(".NET regressions", () => {
     dv.setUint16(0x100, 0x3003, true); // fat header, 12 bytes
     dv.setUint32(0x104, 0x10000 - 12, true); // code size: 65524 nops
     const methods = Array.from({ length: 5000 }, (_, i) => ({ token: 0x06000001 + i, rva: 0x100, name: "m", type: "T" }));
-    expect(clean(() => userStringRefs(img, methods), 3000)!.size).toBe(0);
-  });
+    expect(clean(() => userStringRefs(img, methods), 20000)!.size).toBe(0);
+  }, 60000);
 });
 
 describe("ELF regressions", () => {

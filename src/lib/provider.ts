@@ -692,7 +692,7 @@ provide("ui_vtable_report", async (args) => {
   const baseArg = typeof args.base === "string" ? parseAddress(args.base, mods) : null;
   const r = await vtableReport((addr, size) => readBytes(addr, size), a, {
     fromObject: args.object === true,
-    slots: typeof args.slots === "number" ? num(args, "slots", 0, 4096) : undefined,
+    slots: typeof args.slots === "number" && args.slots > 0 ? num(args, "slots", 0, 4096) : undefined,
     base: baseArg ?? undefined,
     prefixBytes: num(args, "prefix_bytes", 16, 64),
     code: (t) => moduleOf(t, mods) !== undefined,
