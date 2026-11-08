@@ -33,13 +33,13 @@ jobs:
     outputs:
       version: ${{ steps.next.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           # Latest main, not the triggering sha: runs are serialised, so a newer push may
           # already be on main and the bump commit must fast-forward onto it
           ref: main
           fetch-depth: 0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
       - id: next
@@ -60,7 +60,7 @@ jobs:
           git commit -am "chore(release): v$v [skip ci]" || echo "version already at $v"
           git tag -a "v$v" -F "$RUNNER_TEMP/notes.md"
           git push origin HEAD:main "v$v"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         if: steps.next.outputs.version != ''
         with:
           name: notes
@@ -73,14 +73,14 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           ref: v${{ needs.version.outputs.version }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: notes
           path: notes
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
@@ -129,10 +129,10 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           ref: v${{ needs.version.outputs.version }}
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
