@@ -14,7 +14,7 @@ iced-x86 = "1"
 # AArch64 decoder (pure Rust) for arm64 modules on Linux and Windows-on-ARM
 yaxpeax-arm = { version = "0.5", default-features = false, features = ["std", "alloc", "fmt"] }
 yaxpeax-arch = { version = "0.3", default-features = false, features = ["std", "alloc"] }
-object = { version = "0.40", features = ["read", "elf", "std"] }
+object = { version = "0.41", features = ["read", "elf", "std"] }
 getrandom = "0.4"
 pdb = "0.8"
 cab = "0.6"
@@ -22,7 +22,7 @@ ureq = "3"
 
 [dev-dependencies]
 proptest = "1"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
